@@ -2,10 +2,39 @@
 // Buffer implementation using Kompute
 
 #include "mlx/backend/vulkan/buffer.h"
+#include "mlx/allocator.h"
 #include <cstring>
-#include <iostream>
 
 namespace mlx::core::vulkan {
+
+namespace {
+
+kp::Tensor::TensorDataTypes to_kompute_dtype(Dtype dtype) {
+  switch (dtype) {
+    case bool_:
+      return kp::Tensor::TensorDataTypes::eBool;
+    case uint8:
+    case uint16:
+    case uint32:
+    case uint64:
+      return kp::Tensor::TensorDataTypes::eUnsignedInt;
+    case int8:
+    case int16:
+    case int32:
+    case int64:
+      return kp::Tensor::TensorDataTypes::eInt;
+    case float16:
+    case float32:
+    case bfloat16:
+    case complex64:
+      return kp::Tensor::TensorDataTypes::eFloat;
+    case float64:
+      return kp::Tensor::TensorDataTypes::eDouble;
+  }
+  return kp::Tensor::TensorDataTypes::eFloat;
+}
+
+} // namespace
 
 // ============================================================================
 // Buffer Implementation
@@ -18,16 +47,17 @@ std::shared_ptr<Buffer> Buffer::from_array(
   if (!manager) {
     throw std::runtime_error("Manager is null in Buffer::from_array");
   }
-  
-  // Create tensor from array data
-  // Note: This assumes the array data is float32 for now
-  size_t num_elements = arr.size();
-  
-  // Create tensor with initial data
-  const float* data = arr.data<float>();
-  std::vector<float> vec(data, data + num_elements);
-  
-  auto tensor = manager->tensor(vec);
+
+  auto& mutable_arr = const_cast<array&>(arr);
+  if (!mutable_arr.data_shared_ptr()) {
+    mutable_arr.set_data(allocator::malloc(mutable_arr.nbytes()));
+  }
+
+  auto tensor = manager->tensor(
+      const_cast<void*>(arr.data<void>()),
+      static_cast<uint32_t>(arr.size()),
+      static_cast<uint32_t>(arr.itemsize()),
+      to_kompute_dtype(arr.dtype()));
   
   return std::shared_ptr<Buffer>(new Buffer(tensor, arr.nbytes()));
 }
@@ -57,9 +87,7 @@ Buffer::Buffer(std::shared_ptr<kp::Tensor> tensor, size_t size)
       dirty_(false) {
   
   if (tensor_) {
-    // Get raw data pointer from tensor
-    // Note: This is only valid after sync_to_host
-    mapped_ptr_ = tensor_->data<float>();
+    mapped_ptr_ = tensor_->rawData();
   }
 }
 
@@ -72,9 +100,9 @@ void Buffer::upload(const void* data, size_t size, size_t offset) {
   if (!tensor_) return;
   
   // Copy data to tensor
-  float* tensor_data = tensor_->data<float>();
+  auto* tensor_data = static_cast<char*>(tensor_->rawData());
   if (tensor_data) {
-    std::memcpy(tensor_data + offset / sizeof(float), data, size);
+    std::memcpy(tensor_data + offset, data, size);
     dirty_ = true;
   }
 }
@@ -83,9 +111,9 @@ void Buffer::download(void* data, size_t size, size_t offset) {
   if (!tensor_) return;
   
   // Copy data from tensor
-  float* tensor_data = tensor_->data<float>();
+  auto* tensor_data = static_cast<char*>(tensor_->rawData());
   if (tensor_data) {
-    std::memcpy(data, tensor_data + offset / sizeof(float), size);
+    std::memcpy(data, tensor_data + offset, size);
   }
 }
 
@@ -121,12 +149,12 @@ void Buffer::sync_to_host(std::shared_ptr<kp::Sequence> seq) {
     }
   }
   // Update mapped_ptr after sync
-  mapped_ptr_ = tensor_->data<float>();
+  mapped_ptr_ = tensor_->rawData();
 }
 
 float* Buffer::data() {
   if (tensor_) {
-    return tensor_->data<float>();
+    return static_cast<float*>(tensor_->rawData());
   }
   return nullptr;
 }

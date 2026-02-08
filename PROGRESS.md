@@ -26,24 +26,37 @@
 - 保留 CPU fallback 的同步语义（`synchronize(default_stream(Device::cpu))`），消除竞态崩溃。
 - 调整 `scheduler.cpp` 判断顺序，仅在 GPU 分支触发 `gpu::is_available()`。
 - 清理测试枚举阶段的 Kompute 日志副作用，`ctest -N` 测试列表恢复干净。
+- 为后续 Vulkan kernel 接入预埋 `CommandEncoder::record_algo_dispatch` push constants 通路（不改变现有 fallback 行为）。
+- 修复 `Buffer::from_array` 数据桥接:
+  - 从“复制到 `std::vector<float>`”改为直接基于 array 原始内存创建 Kompute tensor。
+  - 补齐 dtype 到 Kompute 数据类型映射。
+  - `Buffer::upload/download/sync` 改为基于 raw bytes 指针处理，避免 float-only 假设。
 
-4. 测试里程碑:
+4. 原生算子尝试与结论（本轮）:
+- 尝试接入 `Add` 的 Vulkan 原生路径（float32/contiguous 条件分支）。
+- 结果: `test arithmetic binary ops` 出现结果错误（输出为 0），说明当前 tensor/array 内存桥接仍不满足正确性要求。
+- 处理: 已回退 `Add` 到稳定 CPU fallback，保持全量测试通过。
+
+5. 测试里程碑:
 - `test quantize dequantize` 通过。
 - `test scheduler races` 在 Vulkan 下恢复稳定，通过 20 次连续复测。
 - `ctest --test-dir build --stop-on-failure --output-on-failure` 全量通过:
   - `223/223` Passed
-  - Total Test time (real) = `19.24 sec`
+  - Total Test time (real) = `19.12 sec`
 
 ## 当前阻塞
 
 - 功能性阻塞: 暂无（当前全量测试通过）。
 - 工程性阻塞:
   - 核心算子仍大量依赖 CPU fallback，Vulkan 原生算子覆盖率不足，尚未达到最终目标的能力对齐。
+- Vulkan tensor 与 MLX array 的共享/同步模型尚未对齐，阻碍原生算子稳定落地。
+  - 虽已修复基础桥接，但原生 kernel 路径在算子级正确性（特别是 Add）上仍需逐项验证与收敛。
 
 ## 下一步计划
 
 1. 优先替换基础高频 fallback:
-- 在 `binary/unary` 中优先落地高频算子原生路径（如 `Add` / `Multiply` / `Exp`）。
+- 先补齐 Vulkan tensor ↔ MLX array 的正确数据桥接（生命周期、同步、可见性）。
+- 在桥接稳定后再落地 `binary/unary` 高频算子原生路径（`Add` / `Multiply` / `Exp`）。
 - 对 `Copy` 路径进行清理：移除未接入编译链的 Vulkan placeholder 实现，避免机制歧义。
 
 2. 保持机制对齐:

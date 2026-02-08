@@ -146,7 +146,8 @@ void CommandEncoder::record_tensor_sync_local(const std::vector<std::shared_ptr<
 void CommandEncoder::record_algo_dispatch(
     const std::string& kernel_name,
     const std::vector<std::shared_ptr<kp::Tensor>>& tensors,
-    const std::vector<uint32_t>& workgroup) {
+    const std::vector<uint32_t>& workgroup,
+    const std::vector<float>& push_consts) {
   if (!encoding_begun_) begin_encoding();
   
   // Insert barrier if needed
@@ -159,7 +160,8 @@ void CommandEncoder::record_algo_dispatch(
       kernel_name, 
       *stream_.manager, 
       tensors, 
-      wg);
+      wg,
+      push_consts);
   
   // Record algorithm execution
   stream_.sequence->record<kp::OpAlgoDispatch>(algo);
