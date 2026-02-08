@@ -21,17 +21,18 @@
 - 为 `array::unsafe_weak_copy` 增加防御性检查，避免空 data 指针直接段错误。
 
 3. 本轮稳定性与性能修复:
-- `vulkan::is_available()` 改为进程级一次探测缓存，避免高频重复创建/销毁 `kp::Manager`。
+- `vulkan::is_available()` 改为原生 Vulkan 物理设备探测 + 进程级缓存，避免高频重复创建/销毁 `kp::Manager`。
 - 清理 Vulkan runtime 高频调试输出（`device/gpu_interface/binary/placeholder`），移除 I/O 干扰。
 - 保留 CPU fallback 的同步语义（`synchronize(default_stream(Device::cpu))`），消除竞态崩溃。
 - 调整 `scheduler.cpp` 判断顺序，仅在 GPU 分支触发 `gpu::is_available()`。
+- 清理测试枚举阶段的 Kompute 日志副作用，`ctest -N` 测试列表恢复干净。
 
 4. 测试里程碑:
 - `test quantize dequantize` 通过。
 - `test scheduler races` 在 Vulkan 下恢复稳定，通过 20 次连续复测。
 - `ctest --test-dir build --stop-on-failure --output-on-failure` 全量通过:
-  - `226/226` Passed
-  - Total Test time (real) = `23.28 sec`
+  - `223/223` Passed
+  - Total Test time (real) = `19.24 sec`
 
 ## 当前阻塞
 
@@ -42,8 +43,8 @@
 ## 下一步计划
 
 1. 优先替换基础高频 fallback:
-- 从 `Copy` 开始提供 Vulkan 原生实现，替换 placeholder CPU fallback。
 - 在 `binary/unary` 中优先落地高频算子原生路径（如 `Add` / `Multiply` / `Exp`）。
+- 对 `Copy` 路径进行清理：移除未接入编译链的 Vulkan placeholder 实现，避免机制歧义。
 
 2. 保持机制对齐:
 - 持续验证 `stream/eval/finalize/synchronize` 行为与 Metal 一致。

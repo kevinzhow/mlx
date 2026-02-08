@@ -3,6 +3,7 @@
 
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernel_registry.h"
+#include <vulkan/vulkan.h>
 
 namespace mlx::core::vulkan {
 
@@ -13,14 +14,33 @@ struct VulkanAvailabilityProbe {
   int count{0};
 
   VulkanAvailabilityProbe() {
-    try {
-      auto manager = std::make_shared<kp::Manager>();
-      available = true;
-      count = 1;
-    } catch (...) {
-      available = false;
-      count = 0;
+    VkInstance instance = VK_NULL_HANDLE;
+
+    VkApplicationInfo app_info{};
+    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pApplicationName = "mlx_vulkan_probe";
+    app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    app_info.pEngineName = "mlx";
+    app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    app_info.apiVersion = VK_API_VERSION_1_1;
+
+    VkInstanceCreateInfo create_info{};
+    create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    create_info.pApplicationInfo = &app_info;
+
+    if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS) {
+      return;
     }
+
+    uint32_t device_count = 0;
+    if (vkEnumeratePhysicalDevices(instance, &device_count, nullptr) ==
+            VK_SUCCESS &&
+        device_count > 0) {
+      available = true;
+      count = static_cast<int>(device_count);
+    }
+
+    vkDestroyInstance(instance, nullptr);
   }
 };
 
