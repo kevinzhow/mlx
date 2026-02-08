@@ -181,21 +181,9 @@ void BufferManager::shutdown() {
 std::shared_ptr<Buffer> BufferManager::get_buffer(const array& arr) {
   std::lock_guard<std::mutex> lock(mutex_);
   
-  auto it = array_buffers_.find(arr.data<void>());
-  if (it != array_buffers_.end()) {
-    if (auto buffer = it->second.lock()) {
-      return buffer;
-    }
-  }
-  
-  // Create new buffer from array
-  auto buffer = Buffer::from_array(arr, manager_);
-  if (buffer) {
-    array_buffers_[arr.data<void>()] = buffer;
-    tensor_buffers_[buffer->tensor()] = buffer;
-  }
-  
-  return buffer;
+  // Create new buffer from array. 
+  // Caching by raw data pointer is unsafe because MLX reuses memory addresses.
+  return Buffer::from_array(arr, manager_);
 }
 
 std::shared_ptr<Buffer> BufferManager::create_temp_buffer(size_t size) {

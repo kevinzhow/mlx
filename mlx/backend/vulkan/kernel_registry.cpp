@@ -4,6 +4,8 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <sstream>
+#include <iomanip>
 
 // 嵌入的 SPIR-V shader
 #include "shaders/add_spv.h"
@@ -58,7 +60,7 @@ std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
     const std::vector<float>& push_consts) {
   
   // 构建 cache key
-  std::string cache_key = build_algorithm_key(kernel_name, params.size(), workgroup);
+  std::string cache_key = build_algorithm_key(kernel_name, params.size(), workgroup, push_consts);
   
   {
     std::lock_guard<std::mutex> lock(algorithms_mutex_);
@@ -128,11 +130,17 @@ std::vector<uint32_t> KernelRegistry::load_spirv_from_file(const std::string& pa
 std::string build_algorithm_key(
     const std::string& kernel_name,
     size_t num_params,
-    const kp::Workgroup& workgroup) {
-  return kernel_name + "_" + std::to_string(num_params) + "_" +
-         std::to_string(workgroup[0]) + "_" + 
-         std::to_string(workgroup[1]) + "_" + 
-         std::to_string(workgroup[2]);
+    const kp::Workgroup& workgroup,
+    const std::vector<float>& push_consts) {
+  std::stringstream ss;
+  ss << kernel_name << "_" << num_params << "_"
+     << workgroup[0] << "_" << workgroup[1] << "_" << workgroup[2];
+  for (float f : push_consts) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof(uint32_t));
+    ss << "_" << std::hex << std::setw(8) << std::setfill('0') << u;
+  }
+  return ss.str();
 }
 
 } // namespace mlx::core::vulkan

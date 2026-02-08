@@ -74,6 +74,7 @@ class KernelRegistry {
 std::string build_algorithm_key(
     const std::string& kernel_name,
     size_t num_params,
-    const kp::Workgroup& workgroup);
+    const kp::Workgroup& workgroup,
+    const std::vector<float>& push_consts = {});
 
 } // namespace mlx::core::vulkan
