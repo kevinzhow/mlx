@@ -1,8 +1,8 @@
 // Copyright © 2026 MLX Vulkan Backend
 // GPU interface - Aligned with metal/eval.cpp
 
-#include <iostream>
 #include <memory>
+#include <sstream>
 
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/vulkan/device.h"
@@ -14,7 +14,6 @@ namespace mlx::core::gpu {
 void new_stream(Stream stream) {
   if (stream.device == mlx::core::Device::gpu) {
     vulkan::device(stream.device).new_queue(stream.index);
-    std::cerr << "[gpu::new_stream] index=" << stream.index << std::endl;
   }
 }
 
@@ -30,9 +29,6 @@ void eval(array& arr) {
   auto s = arr.primitive().stream();
   auto& d = vulkan::device(s.device);
   auto sequence = d.get_sequence(s.index);
-  
-  std::cerr << "[gpu::eval] array_size=" << arr.size() 
-            << ", stream=" << s.index << std::endl;
 
   auto outputs = arr.outputs();
   {
@@ -71,13 +67,9 @@ void eval(array& arr) {
     // Get new sequence
     d.get_sequence(s.index);
   }
-  
-  std::cerr << "[gpu::eval] completed" << std::endl;
 }
 
 void finalize(Stream s) {
-  std::cerr << "[gpu::finalize] stream=" << s.index << std::endl;
-  
   if (s.device == mlx::core::Device::gpu) {
     auto& d = vulkan::device(s.device);
     d.end_encoding(s.index);
@@ -87,8 +79,6 @@ void finalize(Stream s) {
 }
 
 void synchronize(Stream s) {
-  std::cerr << "[gpu::synchronize] stream=" << s.index << std::endl;
-  
   if (s.device == mlx::core::Device::gpu) {
     auto& d = vulkan::device(s.device);
     d.end_encoding(s.index);

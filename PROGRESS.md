@@ -20,38 +20,40 @@
 - 修复二元算子 fallback 的 0-size 早退问题（避免输出未 materialize 导致崩溃）。
 - 为 `array::unsafe_weak_copy` 增加防御性检查，避免空 data 指针直接段错误。
 
-3. 测试推进结果:
-- `test arithmetic unary ops` 已从稳定崩溃修复为通过。
-- `ctest --stop-on-failure --output-on-failure` 可稳定推进到 `174/235` 通过。
+3. 本轮稳定性与性能修复:
+- `vulkan::is_available()` 改为进程级一次探测缓存，避免高频重复创建/销毁 `kp::Manager`。
+- 清理 Vulkan runtime 高频调试输出（`device/gpu_interface/binary/placeholder`），移除 I/O 干扰。
+- 保留 CPU fallback 的同步语义（`synchronize(default_stream(Device::cpu))`），消除竞态崩溃。
+- 调整 `scheduler.cpp` 判断顺序，仅在 GPU 分支触发 `gpu::is_available()`。
+
+4. 测试里程碑:
+- `test quantize dequantize` 通过。
+- `test scheduler races` 在 Vulkan 下恢复稳定，通过 20 次连续复测。
+- `ctest --test-dir build --stop-on-failure --output-on-failure` 全量通过:
+  - `226/226` Passed
+  - Total Test time (real) = `23.28 sec`
 
 ## 当前阻塞
 
-- 首个失败测试:
-  - `test quantize dequantize` (`CTest #175`)
-  - 现象: `SIGSEGV`
-- 关键栈信息（最近一次 gdb）:
-  - `mlx::core::array::size() const`
-  - `mlx::core::array::nbytes() const`
-  - `mlx::core::fast::Quantize::eval_cpu(...)`
-  - `mlx::core::fast::Quantize::eval_gpu(...)`
-- 结论:
-  - 崩溃发生在 fast::Quantize 多输出路径，当前 Vulkan fallback 在该路径仍存在输出对象未正确对齐/物化的问题。
+- 功能性阻塞: 暂无（当前全量测试通过）。
+- 工程性阻塞:
+  - 核心算子仍大量依赖 CPU fallback，Vulkan 原生算子覆盖率不足，尚未达到最终目标的能力对齐。
 
 ## 下一步计划
 
-1. 定点修复 `fast::Quantize::eval_gpu` 的 Vulkan fallback:
-- 明确多输出（特别是 dequantize 与非 dequantize 模式）在 fallback 中的输出契约。
-- 确保 `outputs[i]` 在进入 CPU eval 或 fallback 结果复制前形状/数据状态合法。
+1. 优先替换基础高频 fallback:
+- 从 `Copy` 开始提供 Vulkan 原生实现，替换 placeholder CPU fallback。
+- 在 `binary/unary` 中优先落地高频算子原生路径（如 `Add` / `Multiply` / `Exp`）。
 
-2. 复现与验证:
-- 单测: `ctest --test-dir build -R "test quantize dequantize" --output-on-failure`
-- 必要时 gdb:
-  - `gdb -q -batch -ex "run --test-case=\"test quantize dequantize\"" -ex "bt" --args build/tests/tests`
+2. 保持机制对齐:
+- 持续验证 `stream/eval/finalize/synchronize` 行为与 Metal 一致。
+- 每引入一个原生算子后，执行单项回归 + 全量回归。
 
-3. 回归推进:
-- 修复后重新跑:
+3. 验证门禁:
+- 单项:
+  - `ctest --test-dir build -R "test scheduler races" --output-on-failure --timeout 120`
+- 全量:
   - `ctest --test-dir build --stop-on-failure --output-on-failure`
-- 记录新的首个失败点并继续迭代。
 
 ## 维护规则
 

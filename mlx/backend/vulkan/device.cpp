@@ -3,11 +3,33 @@
 
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernel_registry.h"
-#include <iostream>
-#include <set>
-#include <sstream>
 
 namespace mlx::core::vulkan {
+
+namespace {
+
+struct VulkanAvailabilityProbe {
+  bool available{false};
+  int count{0};
+
+  VulkanAvailabilityProbe() {
+    try {
+      auto manager = std::make_shared<kp::Manager>();
+      available = true;
+      count = 1;
+    } catch (...) {
+      available = false;
+      count = 0;
+    }
+  }
+};
+
+const VulkanAvailabilityProbe& vulkan_availability() {
+  static const VulkanAvailabilityProbe kProbe{};
+  return kProbe;
+}
+
+} // namespace
 
 // ============================================================================
 // CommandEncoder Implementation
@@ -212,20 +234,12 @@ void DeviceStream::reset_sequence() {
 // ============================================================================
 
 Device::Device() {
-  std::cerr << "[Vulkan Device] Initializing with Kompute..." << std::endl;
-  
   // Create Kompute manager with default GPU
   manager_ = std::make_shared<kp::Manager>();
-  
-  std::cerr << "[Vulkan Device] Kompute Manager created" << std::endl;
-  
+
   // Initialize buffer manager
   BufferManager::instance().initialize(manager_);
   initialized_buffer_manager_ = true;
-  
-  std::cerr << "[Vulkan Device] Initialized successfully" << std::endl;
-  std::cerr << "[Vulkan Device] Unified memory support: " 
-            << (supports_unified_memory() ? "yes" : "no") << std::endl;
 }
 
 Device::~Device() {
@@ -286,8 +300,6 @@ void Device::new_queue(int index) {
   // Create DeviceStream with Kompute manager
   auto stream = std::make_unique<DeviceStream>(manager_, 0);  // Use queue 0
   stream_map_[index] = std::move(stream);
-  
-  std::cerr << "[Vulkan Device] new_queue: index=" << index << std::endl;
 }
 
 std::shared_ptr<kp::Sequence> Device::get_sequence(int index) {
@@ -317,8 +329,6 @@ void Device::commit_command_buffer(int index) {
   
   // Reset sequence for new operations
   stream.reset_sequence();
-  
-  std::cerr << "[Vulkan Device] commit_command_buffer: index=" << index << std::endl;
 }
 
 CommandEncoder& Device::get_command_encoder(int index) {
@@ -417,19 +427,11 @@ Device& device(mlx::core::Device) {
 }
 
 bool is_available() {
-  try {
-    // Try to create a temporary manager
-    auto manager = std::make_shared<kp::Manager>();
-    return true;
-  } catch (...) {
-    return false;
-  }
+  return vulkan_availability().available;
 }
 
 int device_count() {
-  // Kompute doesn't expose device count directly
-  // For now, return 1 if available, 0 otherwise
-  return is_available() ? 1 : 0;
+  return vulkan_availability().count;
 }
 
 } // namespace mlx::core::vulkan

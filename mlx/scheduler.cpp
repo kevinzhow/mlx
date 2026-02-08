@@ -7,7 +7,7 @@
 namespace mlx::core {
 
 Stream default_stream(Device d) {
-  if (!gpu::is_available() && d == Device::gpu) {
+  if (d == Device::gpu && !gpu::is_available()) {
     throw std::invalid_argument(
         "[default_stream] Cannot get gpu stream without gpu backend.");
   }
@@ -15,7 +15,7 @@ Stream default_stream(Device d) {
 }
 
 void set_default_stream(Stream s) {
-  if (!gpu::is_available() && s.device == Device::gpu) {
+  if (s.device == Device::gpu && !gpu::is_available()) {
     throw std::invalid_argument(
         "[set_default_stream] Cannot set gpu stream without gpu backend.");
   }
@@ -27,7 +27,7 @@ Stream get_stream(int index) {
 }
 
 Stream new_stream(Device d) {
-  if (!gpu::is_available() && d == Device::gpu) {
+  if (d == Device::gpu && !gpu::is_available()) {
     throw std::invalid_argument(
         "[new_stream] Cannot make gpu stream without gpu backend.");
   }
