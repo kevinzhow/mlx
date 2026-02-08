@@ -5,6 +5,9 @@
 namespace mlx::core::cpu {
 
 CommandEncoder& get_command_encoder(Stream stream) {
+  if (stream.device == Device::gpu) {
+    stream = default_stream(Device::cpu);
+  }
   static std::unordered_map<int, CommandEncoder> encoder_map;
   auto it = encoder_map.find(stream.index);
   if (it == encoder_map.end()) {

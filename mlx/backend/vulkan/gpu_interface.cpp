@@ -115,10 +115,3 @@ void register_output(array& arr, int idx, int64_t offset) {
 }
 
 } // namespace mlx::core::gpu
-
-namespace mlx::core::vulkan {
-  // Expose get_stream for internal use
-  DeviceStream& Device::get_stream_(int index) {
-    return this->get_stream_(index);
-  }
-}

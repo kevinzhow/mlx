@@ -4,6 +4,21 @@
 
 Build and harden the Vulkan backend with Kompute, aligned to Metal backend mechanisms and runtime contracts.
 
+## Progress-Driven Workflow (Mandatory)
+
+- Before starting any new work, read `PROGRESS.md`.
+- Decide what to do next primarily from:
+  - current blockers
+  - next-step plan
+  - latest verification results
+- If `PROGRESS.md` and code reality diverge, update `PROGRESS.md` first, then continue.
+- After each meaningful progress point (fix, new failure found, verification milestone), append/update `PROGRESS.md` in the same working cycle.
+- Before finishing a cycle, ensure `PROGRESS.md` records:
+  - what changed
+  - current status
+  - exact next actions
+- Keep `PROGRESS.md` as the single source of truth for handoff and continuation.
+
 ## Target State
 
 - Vulkan backend is selected through the existing GPU path, not a side path.

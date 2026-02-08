@@ -58,6 +58,18 @@ std::vector<array> array::make_arrays(
 }
 
 array array::unsafe_weak_copy(const array& other) {
+  if (!other.array_desc_->data) {
+    auto& mutable_other = const_cast<array&>(other);
+    if (mutable_other.status() == array::Status::unscheduled) {
+      mutable_other.eval();
+    } else {
+      mutable_other.wait();
+    }
+  }
+  if (!other.array_desc_->data) {
+    throw std::runtime_error(
+        "[array::unsafe_weak_copy] Source array has no data buffer.");
+  }
   auto cpy = array(other.shape(), other.dtype(), nullptr, {});
   cpy.set_data(
       other.buffer(),

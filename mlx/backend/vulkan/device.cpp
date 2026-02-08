@@ -86,6 +86,8 @@ void CommandEncoder::record_tensor_sync_device(const std::vector<std::shared_ptr
   
   for (auto& tensor : tensors) {
     stream_.sequence->record<kp::OpTensorSyncDevice>({tensor});
+    buffer_ops_++;
+    stream_.buffer_ops++;
   }
 }
 
@@ -94,6 +96,8 @@ void CommandEncoder::record_tensor_sync_local(const std::vector<std::shared_ptr<
   
   for (auto& tensor : tensors) {
     stream_.sequence->record<kp::OpTensorSyncLocal>({tensor});
+    buffer_ops_++;
+    stream_.buffer_ops++;
   }
 }
 
@@ -192,15 +196,12 @@ DeviceStream::DeviceStream(std::shared_ptr<kp::Manager> manager, uint32_t queue_
 
 DeviceStream::~DeviceStream() {
   // Ensure all operations complete
-  if (sequence) {
+  if (sequence && buffer_ops > 0) {
     sequence->eval();
   }
 }
 
 void DeviceStream::reset_sequence() {
-  if (sequence) {
-    sequence->eval();
-  }
   sequence = manager->sequence();
   buffer_ops = 0;
   buffer_sizes = 0;
@@ -309,8 +310,8 @@ void Device::commit_command_buffer(int index) {
     stream.encoder.reset();
   }
   
-  // Evaluate sequence (submit to GPU)
-  if (stream.sequence) {
+  // Evaluate sequence (submit to GPU) only when there is recorded work.
+  if (stream.sequence && stream.buffer_ops > 0) {
     stream.sequence->eval();
   }
   

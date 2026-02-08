@@ -104,12 +104,17 @@ add_custom_target(vulkan_shaders DEPENDS ${SHADER_BINARIES})
 # Source Files
 # ============================================================================
 set(VULKAN_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/../no_gpu/allocator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/buffer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/device.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gpu_fallback.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gpu_interface.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/kernel_registry.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/primitives/binary.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/primitives/placeholder.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/primitives/fallback.cpp
 )
 
 target_sources(mlx PRIVATE ${VULKAN_SOURCES})
