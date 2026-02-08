@@ -1,0 +1,31 @@
+// add.comp - 向量加法计算 shader
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// 输入输出 buffer
+layout(set = 0, binding = 0) readonly buffer BufferA {
+    float data[];
+} buffer_a;
+
+layout(set = 0, binding = 1) readonly buffer BufferB {
+    float data[];
+} buffer_b;
+
+layout(set = 0, binding = 2) writeonly buffer BufferC {
+    float data[];
+} buffer_c;
+
+// Push constants 用于传递数组大小
+layout(push_constant) uniform PushConstants {
+    uint size;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.size) {
+        return;
+    }
+    
+    buffer_c.data[idx] = buffer_a.data[idx] + buffer_b.data[idx];
+}

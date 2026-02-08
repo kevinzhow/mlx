@@ -1,0 +1,138 @@
+// Copyright © 2026 MLX Vulkan Backend
+#include "mlx/backend/vulkan/kernel_registry.h"
+
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+
+// 嵌入的 SPIR-V shader
+#include "shaders/add_spv.h"
+
+namespace mlx::core::vulkan {
+
+// 静态 kernel 名称定义
+const char* KernelRegistry::ADD_F32 = "add_f32";
+const char* KernelRegistry::ADD_F16 = "add_f16";
+const char* KernelRegistry::MUL_F32 = "mul_f32";
+const char* KernelRegistry::SUB_F32 = "sub_f32";
+const char* KernelRegistry::DIV_F32 = "div_f32";
+
+KernelRegistry& KernelRegistry::instance() {
+  static KernelRegistry registry;
+  registry.initialize();
+  return registry;
+}
+
+void KernelRegistry::initialize() {
+  // 只初始化一次
+  static bool initialized = false;
+  if (initialized) return;
+  
+  // 注册内置 shader
+  register_builtin_shaders();
+  
+  initialized = true;
+}
+
+void KernelRegistry::register_builtin_shaders() {
+  // 将嵌入的 add_spv 转换为 vector<uint32_t>
+  std::vector<uint32_t> add_spirv((add_spv_len + 3) / 4);
+  std::memcpy(add_spirv.data(), add_spv, add_spv_len);
+  
+  shaders_[ADD_F32] = std::move(add_spirv);
+}
+
+const std::vector<uint32_t>& KernelRegistry::get_shader(const std::string& name) {
+  auto it = shaders_.find(name);
+  if (it == shaders_.end()) {
+    throw std::runtime_error("Shader not found: " + name);
+  }
+  return it->second;
+}
+
+std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
+    const std::string& kernel_name,
+    kp::Manager& manager,
+    const std::vector<std::shared_ptr<kp::Tensor>>& params,
+    const kp::Workgroup& workgroup,
+    const std::vector<float>& push_consts) {
+  
+  // 构建 cache key
+  std::string cache_key = build_algorithm_key(kernel_name, params.size(), workgroup);
+  
+  {
+    std::lock_guard<std::mutex> lock(algorithms_mutex_);
+    
+    // 检查缓存
+    auto it = algorithms_.find(cache_key);
+    if (it != algorithms_.end()) {
+      if (auto algo = it->second.lock()) {
+        return algo;
+      }
+      // 已过期，从缓存中移除
+      algorithms_.erase(it);
+    }
+  }
+  
+  // 获取 shader
+  const auto& spirv = get_shader(kernel_name);
+  
+  // 创建新的 Algorithm
+  std::shared_ptr<kp::Algorithm> algo;
+  if (push_consts.empty()) {
+    algo = manager.algorithm(params, spirv, workgroup);
+  } else {
+    algo = manager.algorithm(params, spirv, workgroup, {}, push_consts);
+  }
+  
+  // 缓存 algorithm
+  {
+    std::lock_guard<std::mutex> lock(algorithms_mutex_);
+    algorithms_[cache_key] = algo;
+  }
+  
+  return algo;
+}
+
+void KernelRegistry::clear_cache() {
+  std::lock_guard<std::mutex> lock(algorithms_mutex_);
+  algorithms_.clear();
+}
+
+std::vector<uint32_t> KernelRegistry::load_spirv_from_file(const std::string& path) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    throw std::runtime_error("Cannot open SPIR-V file: " + path);
+  }
+  
+  // 获取文件大小
+  file.seekg(0, std::ios::end);
+  size_t size = file.tellg();
+  file.seekg(0, std::ios::beg);
+  
+  // 读取数据
+  std::vector<char> buffer(size);
+  file.read(buffer.data(), size);
+  
+  // 转换为 uint32_t 数组
+  std::vector<uint32_t> spirv(size / 4);
+  std::memcpy(spirv.data(), buffer.data(), size);
+  
+  return spirv;
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+std::string build_algorithm_key(
+    const std::string& kernel_name,
+    size_t num_params,
+    const kp::Workgroup& workgroup) {
+  return kernel_name + "_" + std::to_string(num_params) + "_" +
+         std::to_string(workgroup[0]) + "_" + 
+         std::to_string(workgroup[1]) + "_" + 
+         std::to_string(workgroup[2]);
+}
+
+} // namespace mlx::core::vulkan

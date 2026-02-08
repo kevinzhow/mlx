@@ -36,6 +36,7 @@ option(MLX_BUILD_PYTHON_BINDINGS "Build python bindings for mlx" OFF)
 option(MLX_BUILD_METAL "Build metal backend" ON)
 option(MLX_BUILD_CPU "Build cpu backend" ON)
 option(MLX_BUILD_CUDA "Build cuda backend" OFF)
+option(MLX_BUILD_VULKAN "Build vulkan backend" OFF)
 option(MLX_METAL_DEBUG "Enhance metal debug workflow" OFF)
 option(MLX_ENABLE_X64_MAC "Enable building for x64 macOS" OFF)
 option(MLX_BUILD_GGUF "Include support for GGUF format" ON)
@@ -323,17 +324,26 @@ target_include_directories(
   mlx PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}>
              $<INSTALL_INTERFACE:include>)
 
-if(USE_SYSTEM_FMT)
-  find_package(fmt REQUIRED)
-else()
-  FetchContent_Declare(
-    fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG 12.1.0
-    EXCLUDE_FROM_ALL)
-  FetchContent_MakeAvailable(fmt)
+# Check if fmt is already provided (e.g., by Kompute)
+if(NOT TARGET fmt::fmt AND NOT TARGET fmt::fmt-header-only)
+  if(USE_SYSTEM_FMT)
+    find_package(fmt REQUIRED)
+  else()
+    FetchContent_Declare(
+      fmt
+      GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+      GIT_TAG 12.1.0
+      EXCLUDE_FROM_ALL)
+    FetchContent_MakeAvailable(fmt)
+  endif()
 endif()
-target_link_libraries(mlx PRIVATE $<BUILD_INTERFACE:fmt::fmt-header-only>)
+
+# Use fmt-header-only if available, otherwise use regular fmt
+if(TARGET fmt::fmt-header-only)
+  target_link_libraries(mlx PRIVATE $<BUILD_INTERFACE:fmt::fmt-header-only>)
+else()
+  target_link_libraries(mlx PRIVATE $<BUILD_INTERFACE:fmt::fmt>)
+endif()
 
 if(MLX_BUILD_PYTHON_BINDINGS)
   message(STATUS "Building Python bindings.")
