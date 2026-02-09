@@ -14,12 +14,18 @@ layout(set = 0, binding = 2) readonly buffer FreqsBuffer {
   float values[];
 } freqs_buffer;
 
+layout(set = 0, binding = 3) readonly buffer OffsetsBuffer {
+  int values[];
+} offsets_buffer;
+
 layout(push_constant) uniform PushConstants {
   uint n_rows;
   uint half_dims;
   uint row_stride;
-  uint offset_bits;
   uint t_size;
+  uint rows_per_batch;
+  uint offset_is_vector;
+  uint traditional;
   float scale;
   uint forward;
 } params;
@@ -60,7 +66,9 @@ void main() {
     return;
   }
 
-  int offset = int(params.offset_bits);
+  uint offset_index =
+      (params.offset_is_vector != 0u) ? (row / params.rows_per_batch) : 0u;
+  int offset = offsets_buffer.values[offset_index];
   uint time_index = (params.t_size > 1u) ? (row % params.t_size) : 0u;
   float L = params.scale * float(offset + int(time_index));
   uint row_base = row * params.row_stride;
@@ -71,8 +79,15 @@ void main() {
     float c = cos(theta);
     float s = sin(theta);
 
-    uint idx1 = row_base + p;
-    uint idx2 = idx1 + params.half_dims;
+    uint idx1;
+    uint idx2;
+    if (params.traditional != 0u) {
+      idx1 = row_base + (p << 1u);
+      idx2 = idx1 + 1u;
+    } else {
+      idx1 = row_base + p;
+      idx2 = idx1 + params.half_dims;
+    }
 
     float x1 = load_elem(idx1);
     float x2 = load_elem(idx2);

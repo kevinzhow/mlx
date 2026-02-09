@@ -480,6 +480,7 @@ public:
 - `fast::RMSNorm`：`KernelRegistry::RMSNORM_BF16`
 - `fast::RoPE`：`KernelRegistry::ROPE_BF16_T1`（名称沿用，实际已支持 `T>=1`）
 - `fast::RoPE (freqs)`：`KernelRegistry::ROPE_BF16_FREQS`
+- `fast::ScaledDotProductAttention`（首版）：`KernelRegistry::SDPA_BF16_DECODE_Q1`
 
 ### 10.2 覆盖条件
 - `RMSNorm`
@@ -489,15 +490,20 @@ public:
   - `w` 为标量或 1D 连续向量
 - `RoPE`
   - `bfloat16`
-  - `traditional=false`
   - `dims == D`，`T >= 1`
-  - `offset` 为标量（`int32/int64`）
+  - `base` 路径支持 `traditional=true/false`
+  - `offset` 支持标量与长度为 `B` 的 1D 向量（`int32` 连续）
   - `base` 路径：按 `exp2(-p/half_dims * log2(base))` 计算频率
-  - `freqs` 路径：`freqs=float32` 且 1D 连续（长度 `dims/2`）
+  - `freqs` 路径：`traditional=true/false`，`freqs=float32` 且 1D 连续（长度 `dims/2`），`offset` 支持标量/向量
   - 位置索引按 `offset + (row % T)` 计算，覆盖 decode 与 prefill 常见形态
+- `ScaledDotProductAttention`（当前首版）
+  - `dtype=bfloat16`
+  - `q/k/v` 均为 4D 行连续
+  - `Q_len=1`
+  - 无 mask / 无 sinks / 非训练
+  - `k_len<=8`（当前回归保护门限）
+  - `qk_dim<=256`，`v_dim<=256`
 
 ### 10.3 仍走 fallback 的场景
-- `RoPE` 的 `traditional=true`
-- `RoPE` 向量 offset
 - `RoPE` 的非连续/非 1D `freqs` 布局
-- `fast::ScaledDotProductAttention`（当前仍未原生化）
+- `ScaledDotProductAttention` 的主流场景（`k_len>8`、causal/mask、training、sinks）

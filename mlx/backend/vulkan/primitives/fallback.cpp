@@ -218,12 +218,11 @@ inline bool can_use_native_rope_bf16(
     uint32_t& n_rows,
     uint32_t& half_dims,
     uint32_t& row_stride,
-    uint32_t& t_size) {
+    uint32_t& t_size,
+    uint32_t& rows_per_batch,
+    uint32_t& offset_is_vector) {
   if ((inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1 ||
       outputs[0].size() == 0) {
-    return false;
-  }
-  if (traditional) {
     return false;
   }
   with_freqs = inputs.size() == 3;
@@ -253,14 +252,17 @@ inline bool can_use_native_rope_bf16(
     return false;
   }
 
-  int32_t offset_value = 0;
-  if (!read_scalar_offset_i32(offset, offset_value)) {
+  const int64_t batch = in.shape(0);
+  if (batch <= 0 || batch > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
     return false;
   }
-  (void)offset_value;
 
   row_stride = static_cast<uint32_t>(d);
   half_dims = static_cast<uint32_t>(dims / 2);
+  n_rows = static_cast<uint32_t>(in.size() / static_cast<size_t>(d));
+  if (n_rows == 0) {
+    return false;
+  }
   if (with_freqs) {
     const auto& freqs = inputs[2];
     if (freqs.dtype() != mlx::core::float32 || freqs.ndim() != 1 ||
@@ -269,9 +271,118 @@ inline bool can_use_native_rope_bf16(
       return false;
     }
   }
-  n_rows = static_cast<uint32_t>(in.size() / static_cast<size_t>(d));
+
+  if (offset.size() == 1) {
+    int32_t offset_value = 0;
+    if (!read_scalar_offset_i32(offset, offset_value) ||
+        !is_row_contiguous_materialized(offset)) {
+      return false;
+    }
+    (void)offset_value;
+    rows_per_batch = 1u;
+    offset_is_vector = 0u;
+  } else {
+    if (offset.dtype() != mlx::core::int32 || offset.ndim() != 1 ||
+        offset.shape(0) != batch || !is_row_contiguous_materialized(offset) ||
+        offset.strides()[0] != 1) {
+      return false;
+    }
+    const uint32_t batch_u32 = static_cast<uint32_t>(batch);
+    if (batch_u32 == 0 || (n_rows % batch_u32) != 0) {
+      return false;
+    }
+    rows_per_batch = n_rows / batch_u32;
+    if (rows_per_batch == 0) {
+      return false;
+    }
+    offset_is_vector = 1u;
+  }
+
   t_size = static_cast<uint32_t>(t);
   return n_rows > 0;
+}
+
+inline bool can_use_native_sdpa_bf16_decode_q1(
+    const std::vector<mlx::core::array>& inputs,
+    const std::vector<mlx::core::array>& outputs,
+    bool do_causal,
+    bool has_sinks,
+    bool output_logsumexp,
+    uint32_t& batch_size,
+    uint32_t& n_q_heads,
+    uint32_t& n_kv_heads,
+    uint32_t& k_len,
+    uint32_t& qk_dim,
+    uint32_t& v_dim) {
+  if (has_sinks || output_logsumexp || inputs.size() != 3 ||
+      outputs.size() != 1 || outputs[0].size() == 0) {
+    return false;
+  }
+
+  const auto& q = inputs[0];
+  const auto& k = inputs[1];
+  const auto& v = inputs[2];
+  const auto& out = outputs[0];
+  if (q.dtype() != mlx::core::bfloat16 || k.dtype() != mlx::core::bfloat16 ||
+      v.dtype() != mlx::core::bfloat16 || out.dtype() != mlx::core::bfloat16) {
+    return false;
+  }
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 ||
+      !is_row_contiguous_materialized(q) || !is_row_contiguous_materialized(k) ||
+      !is_row_contiguous_materialized(v) || !out.flags().row_contiguous) {
+    return false;
+  }
+
+  if (q.shape(0) != k.shape(0) || k.shape(0) != v.shape(0) ||
+      q.shape(3) != k.shape(3) || k.shape(1) != v.shape(1) ||
+      k.shape(2) != v.shape(2) || q.shape(2) != 1) {
+    return false;
+  }
+  if (do_causal && q.shape(2) != 1) {
+    return false;
+  }
+
+  const int64_t b = q.shape(0);
+  const int64_t hq = q.shape(1);
+  const int64_t hkv = k.shape(1);
+  const int64_t lk = k.shape(2);
+  const int64_t dq = q.shape(3);
+  const int64_t dv = v.shape(3);
+  if (b <= 0 || hq <= 0 || hkv <= 0 || lk <= 0 || dq <= 0 || dv <= 0 ||
+      (hq % hkv) != 0) {
+    return false;
+  }
+  if (lk > 8) {
+    return false;
+  }
+  if (dq > 256 || dv > 256) {
+    return false;
+  }
+  if ((q.size() % 2) != 0 || (k.size() % 2) != 0 || (v.size() % 2) != 0 ||
+      (out.size() % 2) != 0) {
+    return false;
+  }
+  if (b > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+      hq > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+      hkv > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+      lk > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+      dq > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+      dv > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+    return false;
+  }
+
+  if (out.ndim() != 4 || out.shape(0) != b || out.shape(1) != hq ||
+      out.shape(2) != 1 || out.shape(3) != dv) {
+    return false;
+  }
+
+  batch_size = static_cast<uint32_t>(b);
+  n_q_heads = static_cast<uint32_t>(hq);
+  n_kv_heads = static_cast<uint32_t>(hkv);
+  k_len = static_cast<uint32_t>(lk);
+  qk_dim = static_cast<uint32_t>(dq);
+  v_dim = static_cast<uint32_t>(dv);
+  return true;
 }
 
 inline void materialize_and_share_fast_outputs(
@@ -532,20 +643,53 @@ bool fast::RoPE::use_fallback(Stream stream) {
 }
 
 bool fast::ScaledDotProductAttention::use_fallback(
-    const array&,
-    const array&,
-    const array&,
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_mask,
     bool,
-    bool,
-    bool,
-    bool,
-    bool,
-    Stream) {
-  return true;
+    bool do_causal,
+    bool is_training,
+    bool output_logsumexp,
+    Stream stream) {
+  if (stream.device == Device::cpu || detail::in_tracing() || has_mask ||
+      do_causal || is_training || output_logsumexp) {
+    return true;
+  }
+
+  if (q.dtype() != mlx::core::bfloat16 || k.dtype() != mlx::core::bfloat16 ||
+      v.dtype() != mlx::core::bfloat16) {
+    return true;
+  }
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+    return true;
+  }
+  if (!q.flags().row_contiguous || !k.flags().row_contiguous ||
+      !v.flags().row_contiguous) {
+    return true;
+  }
+
+  if (q.shape(0) != k.shape(0) || k.shape(0) != v.shape(0) ||
+      q.shape(3) != k.shape(3) || k.shape(1) != v.shape(1) ||
+      k.shape(2) != v.shape(2) || q.shape(2) != 1) {
+    return true;
+  }
+  if (k.shape(1) <= 0 || (q.shape(1) % k.shape(1)) != 0) {
+    return true;
+  }
+  if (k.shape(2) <= 0 || k.shape(2) > 8 || q.shape(3) <= 0 || q.shape(3) > 256 ||
+      v.shape(3) <= 0 || v.shape(3) > 256) {
+    return true;
+  }
+  if ((q.size() % 2) != 0 || (k.size() % 2) != 0 || (v.size() % 2) != 0) {
+    return true;
+  }
+
+  return false;
 }
 
 bool fast::ScaledDotProductAttention::supports_bool_mask() {
-  return false;
+  return true;
 }
 
 bool fast::ScaledDotProductAttentionVJP::use_fallback(const array&, Stream) {
@@ -626,6 +770,8 @@ void fast::RoPE::eval_gpu(
   uint32_t half_dims = 0;
   uint32_t row_stride = 0;
   uint32_t t_size = 0;
+  uint32_t rows_per_batch = 0;
+  uint32_t offset_is_vector = 0;
   bool with_freqs = false;
   if (can_use_native_rope_bf16(
           inputs,
@@ -637,74 +783,148 @@ void fast::RoPE::eval_gpu(
           n_rows,
           half_dims,
           row_stride,
-          t_size)) {
-    int32_t offset_value = 0;
-    if (read_scalar_offset_i32(inputs[1], offset_value)) {
-      try {
-        auto& out = outputs[0];
-        if (!out.data_shared_ptr()) {
-          out.set_data(allocator::malloc(out.nbytes()));
-        }
-
-        auto& device = vulkan::device(stream.device);
-        auto& encoder = device.get_command_encoder(stream.index);
-        encoder.begin_encoding();
-
-        auto in_tensor = device.get_tensor(inputs[0]);
-        auto out_tensor = device.get_tensor(out);
-
-        const uint32_t offset_bits = static_cast<uint32_t>(offset_value);
-        const uint32_t forward_flag = forward_ ? 1u : 0u;
-        if (with_freqs) {
-          auto freqs_tensor = device.get_tensor(inputs[2]);
-          const std::vector<float> push_consts{
-              encode_push_constant_u32(n_rows),
-              encode_push_constant_u32(half_dims),
-              encode_push_constant_u32(row_stride),
-              encode_push_constant_u32(offset_bits),
-              encode_push_constant_u32(t_size),
-              scale_,
-              encode_push_constant_u32(forward_flag)};
-
-          encoder.record_tensor_sync_device({in_tensor, out_tensor, freqs_tensor});
-          encoder.record_algo_dispatch(
-              vulkan::KernelRegistry::ROPE_BF16_FREQS,
-              {in_tensor, out_tensor, freqs_tensor},
-              {n_rows, 1, 1},
-              push_consts);
-        } else {
-          const std::vector<float> push_consts{
-              encode_push_constant_u32(n_rows),
-              encode_push_constant_u32(half_dims),
-              encode_push_constant_u32(row_stride),
-              encode_push_constant_u32(offset_bits),
-              encode_push_constant_u32(t_size),
-              scale_,
-              std::log2(base_),
-              encode_push_constant_u32(forward_flag)};
-
-          encoder.record_tensor_sync_device({in_tensor, out_tensor});
-          encoder.record_algo_dispatch(
-              vulkan::KernelRegistry::ROPE_BF16_T1,
-              {in_tensor, out_tensor},
-              {n_rows, 1, 1},
-              push_consts);
-        }
-        encoder.record_tensor_sync_local({out_tensor});
-        synchronize(stream);
-
-        std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
-        return;
-      } catch (const std::exception&) {
-        // Fall through to fallback path.
+          t_size,
+          rows_per_batch,
+          offset_is_vector)) {
+    try {
+      auto& out = outputs[0];
+      if (!out.data_shared_ptr()) {
+        out.set_data(allocator::malloc(out.nbytes()));
       }
+
+      auto& device = vulkan::device(stream.device);
+      auto& encoder = device.get_command_encoder(stream.index);
+      encoder.begin_encoding();
+
+      auto in_tensor = device.get_tensor(inputs[0]);
+      auto out_tensor = device.get_tensor(out);
+      auto offset_tensor = device.get_tensor(inputs[1]);
+
+      const uint32_t forward_flag = forward_ ? 1u : 0u;
+      const uint32_t traditional_flag = traditional_ ? 1u : 0u;
+      if (with_freqs) {
+        auto freqs_tensor = device.get_tensor(inputs[2]);
+        const std::vector<float> push_consts{
+            encode_push_constant_u32(n_rows),
+            encode_push_constant_u32(half_dims),
+            encode_push_constant_u32(row_stride),
+            encode_push_constant_u32(t_size),
+            encode_push_constant_u32(rows_per_batch),
+            encode_push_constant_u32(offset_is_vector),
+            encode_push_constant_u32(traditional_flag),
+            scale_,
+            encode_push_constant_u32(forward_flag)};
+
+        encoder.record_tensor_sync_device(
+            {in_tensor, out_tensor, freqs_tensor, offset_tensor});
+        encoder.record_algo_dispatch(
+            vulkan::KernelRegistry::ROPE_BF16_FREQS,
+            {in_tensor, out_tensor, freqs_tensor, offset_tensor},
+            {n_rows, 1, 1},
+            push_consts);
+      } else {
+        const std::vector<float> push_consts{
+            encode_push_constant_u32(n_rows),
+            encode_push_constant_u32(half_dims),
+            encode_push_constant_u32(row_stride),
+            encode_push_constant_u32(t_size),
+            encode_push_constant_u32(rows_per_batch),
+            encode_push_constant_u32(offset_is_vector),
+            encode_push_constant_u32(traditional_flag),
+            scale_,
+            std::log2(base_),
+            encode_push_constant_u32(forward_flag)};
+
+        encoder.record_tensor_sync_device(
+            {in_tensor, out_tensor, offset_tensor});
+        encoder.record_algo_dispatch(
+            vulkan::KernelRegistry::ROPE_BF16_T1,
+            {in_tensor, out_tensor, offset_tensor},
+            {n_rows, 1, 1},
+            push_consts);
+      }
+      encoder.record_tensor_sync_local({out_tensor});
+      synchronize(stream);
+
+      std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+      return;
+    } catch (const std::exception&) {
+      // Fall through to fallback path.
     }
   }
 
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 
-VULKAN_NO_GPU_MULTI(fast::ScaledDotProductAttention)
+void fast::ScaledDotProductAttention::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto stream = outputs.empty() ? default_stream(default_device())
+                                : outputs.front().primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+
+  uint32_t batch_size = 0;
+  uint32_t n_q_heads = 0;
+  uint32_t n_kv_heads = 0;
+  uint32_t k_len = 0;
+  uint32_t qk_dim = 0;
+  uint32_t v_dim = 0;
+  if (can_use_native_sdpa_bf16_decode_q1(
+          inputs,
+          outputs,
+          do_causal_,
+          has_sinks_,
+          output_logsumexp_,
+          batch_size,
+          n_q_heads,
+          n_kv_heads,
+          k_len,
+          qk_dim,
+          v_dim)) {
+    try {
+      auto& out = outputs[0];
+      if (!out.data_shared_ptr()) {
+        out.set_data(allocator::malloc(out.nbytes()));
+      }
+
+      auto& device = vulkan::device(stream.device);
+      auto& encoder = device.get_command_encoder(stream.index);
+      encoder.begin_encoding();
+
+      auto q_tensor = device.get_tensor(inputs[0]);
+      auto k_tensor = device.get_tensor(inputs[1]);
+      auto v_tensor = device.get_tensor(inputs[2]);
+      auto out_tensor = device.get_tensor(out);
+
+      const uint32_t n_work = batch_size * n_q_heads;
+      const std::vector<float> push_consts{
+          encode_push_constant_u32(batch_size),
+          encode_push_constant_u32(n_q_heads),
+          encode_push_constant_u32(n_kv_heads),
+          encode_push_constant_u32(k_len),
+          encode_push_constant_u32(qk_dim),
+          encode_push_constant_u32(v_dim),
+          scale_};
+
+      encoder.record_tensor_sync_device({q_tensor, k_tensor, v_tensor, out_tensor});
+      encoder.record_algo_dispatch(
+          vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1,
+          {q_tensor, k_tensor, v_tensor, out_tensor},
+          {n_work, 1, 1},
+          push_consts);
+      encoder.record_tensor_sync_local({out_tensor});
+      synchronize(stream);
+
+      std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+      return;
+    } catch (const std::exception&) {
+      // Fall through to fallback path.
+    }
+  }
+
+  materialize_and_share_fast_outputs(fallback_(inputs), outputs);
+}
+
 VULKAN_NO_GPU_MULTI(fast::ScaledDotProductAttentionVJP)
 VULKAN_CPU_FALLBACK_MULTI(fast::ConvertFP8)
 VULKAN_NO_GPU_MULTI(fast::CustomKernel)

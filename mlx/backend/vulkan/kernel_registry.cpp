@@ -17,6 +17,7 @@
 #include "shaders/rmsnorm_bf16_spv.h"
 #include "shaders/rope_bf16_t1_spv.h"
 #include "shaders/rope_bf16_freqs_spv.h"
+#include "shaders/sdpa_bf16_decode_q1_spv.h"
 
 namespace mlx::core::vulkan {
 
@@ -35,6 +36,7 @@ const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128 =
 const char* KernelRegistry::RMSNORM_BF16 = "rmsnorm_bf16";
 const char* KernelRegistry::ROPE_BF16_T1 = "rope_bf16_t1";
 const char* KernelRegistry::ROPE_BF16_FREQS = "rope_bf16_freqs";
+const char* KernelRegistry::SDPA_BF16_DECODE_Q1 = "sdpa_bf16_decode_q1";
 
 KernelRegistry& KernelRegistry::instance() {
   static KernelRegistry registry;
@@ -98,6 +100,13 @@ void KernelRegistry::register_builtin_shaders() {
   std::memcpy(
       rope_freqs_spirv.data(), rope_bf16_freqs_spv, rope_bf16_freqs_spv_len);
   shaders_[ROPE_BF16_FREQS] = std::move(rope_freqs_spirv);
+
+  std::vector<uint32_t> sdpa_spirv((sdpa_bf16_decode_q1_spv_len + 3) / 4);
+  std::memcpy(
+      sdpa_spirv.data(),
+      sdpa_bf16_decode_q1_spv,
+      sdpa_bf16_decode_q1_spv_len);
+  shaders_[SDPA_BF16_DECODE_Q1] = std::move(sdpa_spirv);
 }
 
 const std::vector<uint32_t>& KernelRegistry::get_shader(const std::string& name) {

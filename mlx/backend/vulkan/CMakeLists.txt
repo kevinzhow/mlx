@@ -89,6 +89,7 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rmsnorm_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope_bf16_t1.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope_bf16_freqs.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_q1.comp
 )
 
 # Compile shaders to SPIR-V

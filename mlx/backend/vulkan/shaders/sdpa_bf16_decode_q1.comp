@@ -1,0 +1,134 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuffer {
+  uint words[];
+} q_buffer;
+
+layout(set = 0, binding = 1) readonly buffer KBuffer {
+  uint words[];
+} k_buffer;
+
+layout(set = 0, binding = 2) readonly buffer VBuffer {
+  uint words[];
+} v_buffer;
+
+layout(set = 0, binding = 3) buffer OutBuffer {
+  uint words[];
+} out_buffer;
+
+layout(push_constant) uniform PushConstants {
+  uint batch_size;
+  uint n_q_heads;
+  uint n_kv_heads;
+  uint k_len;
+  uint qk_dim;
+  uint v_dim;
+  float scale;
+} params;
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float load_q(uint elem_idx) {
+  uint packed = q_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float load_k(uint elem_idx) {
+  uint packed = k_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float load_v(uint elem_idx) {
+  uint packed = v_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+void store_out(uint elem_idx, float value) {
+  uint word_idx = elem_idx >> 1u;
+  uint packed = out_buffer.words[word_idx];
+  uint bf16_val = f32_to_bf16(value) & 0xFFFFu;
+  if ((elem_idx & 1u) == 0u) {
+    packed = (packed & 0xFFFF0000u) | bf16_val;
+  } else {
+    packed = (packed & 0x0000FFFFu) | (bf16_val << 16u);
+  }
+  out_buffer.words[word_idx] = packed;
+}
+
+void main() {
+  uint bh = gl_GlobalInvocationID.x;
+  uint total = params.batch_size * params.n_q_heads;
+  if (bh >= total || params.v_dim == 0u || params.v_dim > 256u ||
+      params.qk_dim == 0u || params.k_len == 0u || params.n_kv_heads == 0u) {
+    return;
+  }
+
+  uint b = bh / params.n_q_heads;
+  uint hq = bh % params.n_q_heads;
+  uint repeats = params.n_q_heads / params.n_kv_heads;
+  uint hkv = hq / repeats;
+
+  uint q_base = ((b * params.n_q_heads) + hq) * params.qk_dim;
+  uint k_head_base =
+      (((b * params.n_kv_heads) + hkv) * params.k_len) * params.qk_dim;
+  uint v_head_base =
+      (((b * params.n_kv_heads) + hkv) * params.k_len) * params.v_dim;
+
+  float max_logit = -3.4028235e38;
+  for (uint t = 0u; t < params.k_len; ++t) {
+    uint k_base = k_head_base + t * params.qk_dim;
+    float dot = 0.0;
+    for (uint d = 0u; d < params.qk_dim; ++d) {
+      dot += load_q(q_base + d) * load_k(k_base + d);
+    }
+    dot *= params.scale;
+    max_logit = max(max_logit, dot);
+  }
+
+  float denom = 0.0;
+  float accum[256];
+  for (uint i = 0u; i < params.v_dim; ++i) {
+    accum[i] = 0.0;
+  }
+
+  for (uint t = 0u; t < params.k_len; ++t) {
+    uint k_base = k_head_base + t * params.qk_dim;
+    float dot = 0.0;
+    for (uint d = 0u; d < params.qk_dim; ++d) {
+      dot += load_q(q_base + d) * load_k(k_base + d);
+    }
+    float w = exp(dot * params.scale - max_logit);
+    denom += w;
+
+    uint v_base = v_head_base + t * params.v_dim;
+    for (uint dv = 0u; dv < params.v_dim; ++dv) {
+      accum[dv] += w * load_v(v_base + dv);
+    }
+  }
+
+  if (denom == 0.0) {
+    return;
+  }
+  float inv_denom = 1.0 / denom;
+  uint out_base = ((b * params.n_q_heads) + hq) * params.v_dim;
+  for (uint dv = 0u; dv < params.v_dim; ++dv) {
+    store_out(out_base + dv, accum[dv] * inv_denom);
+  }
+}

@@ -60,6 +60,7 @@ class KernelRegistry {
   static const char* RMSNORM_BF16;
   static const char* ROPE_BF16_T1;
   static const char* ROPE_BF16_FREQS;
+  static const char* SDPA_BF16_DECODE_Q1;
   
  private:
   KernelRegistry() = default;
