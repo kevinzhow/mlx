@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 
 namespace mlx::core {
@@ -79,6 +80,15 @@ inline uint32_t encode_push_constant_u32(uint32_t value) {
   return value;
 }
 
+inline bool native_add_f32_enabled() {
+  const char* env = std::getenv("MLX_VK_ENABLE_ADD_F32");
+  if (!env) {
+    return false;
+  }
+  return std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
+      std::strcmp(env, "on") == 0;
+}
+
 inline bool dispatch_native_binary(
     Stream stream,
     const array& a,
@@ -135,8 +145,20 @@ void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto s = out.primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, s);
 
-  // TODO(vulkan): Re-enable native ADD_F32 once host/device sync and descriptor
-  // binding semantics are fully validated across fallback boundaries.
+  if (native_add_f32_enabled() && can_use_native_binary_f32(inputs[0], inputs[1], out) &&
+      out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    const uint32_t n = static_cast<uint32_t>(out.size());
+    if (dispatch_native_binary(
+            s,
+            inputs[0],
+            inputs[1],
+            out,
+            vulkan::KernelRegistry::ADD_F32,
+            n,
+            &profile)) {
+      return;
+    }
+  }
 
   if (can_use_native_binary_bf16(inputs[0], inputs[1], out) &&
       out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {

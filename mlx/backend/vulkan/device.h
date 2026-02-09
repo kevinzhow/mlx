@@ -204,6 +204,7 @@ class MLX_API Device {
 
   struct TensorCacheEntry {
     std::weak_ptr<kp::Tensor> tensor;
+    std::shared_ptr<kp::Tensor> pinned_tensor;
     std::weak_ptr<array::Data> data_ref;
     const void* data_ptr{nullptr};
     size_t nbytes{0};

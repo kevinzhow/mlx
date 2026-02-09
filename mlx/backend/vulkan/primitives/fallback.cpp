@@ -59,9 +59,36 @@ inline bool is_row_contiguous_materialized(const mlx::core::array& arr) {
   return arr.flags().row_contiguous && arr.data_size() == arr.size();
 }
 
+inline bool is_rope_head_seq_transposed_layout(const mlx::core::array& arr) {
+  if (arr.ndim() != 4) {
+    return false;
+  }
+  const int64_t heads = arr.shape(1);
+  const int64_t t_size = arr.shape(2);
+  const int64_t d_size = arr.shape(3);
+  if (heads <= 0 || t_size <= 0 || d_size <= 0) {
+    return false;
+  }
+  const auto& st = arr.strides();
+  return st[0] == t_size * heads * d_size && st[1] == d_size &&
+      st[2] == heads * d_size && st[3] == 1;
+}
+
 inline bool rope_debug_reject_enabled() {
   static const bool enabled = []() {
     const char* v = std::getenv("MLX_VK_DEBUG_ROPE_REJECT");
+    if (!v) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
+inline bool sdpa_debug_reject_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_DEBUG_SDPA_REJECT");
     if (!v) {
       return false;
     }
@@ -131,6 +158,60 @@ inline void log_rope_reject(
     std::cerr << " out.row=" << (outputs[0].flags().row_contiguous ? 1 : 0);
   }
   std::cerr << "\n";
+}
+
+inline void log_sdpa_reject(
+    const mlx::core::array& q,
+    const mlx::core::array& k,
+    const mlx::core::array& v,
+    const char* reason,
+    bool has_mask,
+    bool do_causal,
+    bool is_training,
+    bool output_logsumexp) {
+  if (!sdpa_debug_reject_enabled()) {
+    return;
+  }
+
+  auto shape_string = [](const mlx::core::array& a) {
+    std::string s = "[";
+    for (int i = 0; i < a.ndim(); ++i) {
+      if (i > 0) {
+        s += ",";
+      }
+      s += std::to_string(a.shape(i));
+    }
+    s += "]";
+    return s;
+  };
+  auto strides_string = [](const mlx::core::array& a) {
+    std::string s = "[";
+    const auto& st = a.strides();
+    for (size_t i = 0; i < st.size(); ++i) {
+      if (i > 0) {
+        s += ",";
+      }
+      s += std::to_string(st[i]);
+    }
+    s += "]";
+    return s;
+  };
+
+  std::cerr << "[VulkanSDPAReject] reason=" << (reason ? reason : "unknown")
+            << " has_mask=" << (has_mask ? 1 : 0)
+            << " do_causal=" << (do_causal ? 1 : 0)
+            << " training=" << (is_training ? 1 : 0)
+            << " logsumexp=" << (output_logsumexp ? 1 : 0)
+            << " q.dtype=" << q.dtype() << " q.shape=" << shape_string(q)
+            << " q.strides=" << strides_string(q)
+            << " q.row=" << (q.flags().row_contiguous ? 1 : 0)
+            << " k.dtype=" << k.dtype() << " k.shape=" << shape_string(k)
+            << " k.strides=" << strides_string(k)
+            << " k.row=" << (k.flags().row_contiguous ? 1 : 0)
+            << " v.dtype=" << v.dtype() << " v.shape=" << shape_string(v)
+            << " v.strides=" << strides_string(v)
+            << " v.row=" << (v.flags().row_contiguous ? 1 : 0)
+            << "\n";
 }
 
 inline kp::Tensor::TensorDataTypes to_kompute_dtype(mlx::core::Dtype dtype) {
@@ -416,6 +497,11 @@ inline bool can_use_native_rope_bf16(
     uint32_t& t_size,
     uint32_t& rows_per_batch,
     uint32_t& offset_is_vector,
+    uint32_t& input_hs_transposed,
+    uint32_t& input_batch_stride,
+    uint32_t& input_head_stride,
+    uint32_t& input_t_stride,
+    uint32_t& n_heads,
     const char** reject_reason = nullptr) {
   auto reject = [&](const char* reason) {
     if (reject_reason) {
@@ -440,7 +526,11 @@ inline bool can_use_native_rope_bf16(
       in.shape() != out.shape()) {
     return reject("dtype_or_shape_mismatch");
   }
-  if (!is_row_contiguous_materialized(in) || !out.flags().row_contiguous ||
+  const bool in_row_contiguous = is_row_contiguous_materialized(in);
+  const bool in_hs_transposed =
+      !in_row_contiguous && in.data_size() == in.size() &&
+      is_rope_head_seq_transposed_layout(in);
+  if ((!in_row_contiguous && !in_hs_transposed) || !out.flags().row_contiguous ||
       in.ndim() < 2) {
     return reject("in_or_out_layout");
   }
@@ -459,6 +549,7 @@ inline bool can_use_native_rope_bf16(
   if (batch <= 0 || batch > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
     return reject("batch_constraints");
   }
+  const uint32_t batch_u32 = static_cast<uint32_t>(batch);
 
   row_stride = static_cast<uint32_t>(d);
   half_dims = static_cast<uint32_t>(dims / 2);
@@ -466,6 +557,38 @@ inline bool can_use_native_rope_bf16(
   if (n_rows == 0) {
     return reject("zero_rows");
   }
+  if (batch_u32 == 0 || (n_rows % batch_u32) != 0) {
+    return reject("rows_per_batch_divisibility");
+  }
+  rows_per_batch = n_rows / batch_u32;
+  if (rows_per_batch == 0) {
+    return reject("zero_rows_per_batch");
+  }
+
+  input_hs_transposed = in_hs_transposed ? 1u : 0u;
+  input_batch_stride = 0u;
+  input_head_stride = 0u;
+  input_t_stride = 0u;
+  n_heads = 1u;
+  if (input_hs_transposed != 0u) {
+    const auto& st = in.strides();
+    if (in.shape(1) <= 0 ||
+        in.shape(1) > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+        st[0] <= 0 || st[1] <= 0 || st[2] <= 0 ||
+        st[0] > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+        st[1] > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+        st[2] > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+      return reject("hs_transpose_strides_or_heads");
+    }
+    n_heads = static_cast<uint32_t>(in.shape(1));
+    input_batch_stride = static_cast<uint32_t>(st[0]);
+    input_head_stride = static_cast<uint32_t>(st[1]);
+    input_t_stride = static_cast<uint32_t>(st[2]);
+    if (rows_per_batch != n_heads * static_cast<uint32_t>(t)) {
+      return reject("hs_transpose_rows_shape_mismatch");
+    }
+  }
+
   if (with_freqs) {
     const auto& freqs = inputs[2];
     if (freqs.dtype() != mlx::core::float32 || freqs.ndim() != 1 ||
@@ -482,21 +605,12 @@ inline bool can_use_native_rope_bf16(
       return reject("scalar_offset_constraints");
     }
     (void)offset_value;
-    rows_per_batch = 1u;
     offset_is_vector = 0u;
   } else {
     if (offset.dtype() != mlx::core::int32 || offset.ndim() != 1 ||
         offset.shape(0) != batch || !is_row_contiguous_materialized(offset) ||
         offset.strides()[0] != 1) {
       return reject("vector_offset_constraints");
-    }
-    const uint32_t batch_u32 = static_cast<uint32_t>(batch);
-    if (batch_u32 == 0 || (n_rows % batch_u32) != 0) {
-      return reject("rows_per_batch_divisibility");
-    }
-    rows_per_batch = n_rows / batch_u32;
-    if (rows_per_batch == 0) {
-      return reject("zero_rows_per_batch");
     }
     offset_is_vector = 1u;
   }
@@ -904,37 +1018,43 @@ bool fast::ScaledDotProductAttention::use_fallback(
     bool is_training,
     bool output_logsumexp,
     Stream stream) {
+  auto reject = [&](const char* reason) {
+    log_sdpa_reject(
+        q, k, v, reason, has_mask, do_causal, is_training, output_logsumexp);
+    return true;
+  };
+
   if (stream.device == Device::cpu || detail::in_tracing() || has_mask ||
       do_causal || is_training || output_logsumexp) {
-    return true;
+    return reject("global_gate");
   }
 
   if (q.dtype() != mlx::core::bfloat16 || k.dtype() != mlx::core::bfloat16 ||
       v.dtype() != mlx::core::bfloat16) {
-    return true;
+    return reject("dtype");
   }
   if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
-    return true;
+    return reject("ndim");
   }
   if (!q.flags().row_contiguous || !k.flags().row_contiguous ||
       !v.flags().row_contiguous) {
-    return true;
+    return reject("row_contiguous");
   }
 
   if (q.shape(0) != k.shape(0) || k.shape(0) != v.shape(0) ||
       q.shape(3) != k.shape(3) || k.shape(1) != v.shape(1) ||
       k.shape(2) != v.shape(2) || q.shape(2) != 1) {
-    return true;
+    return reject("shape_contract");
   }
   if (k.shape(1) <= 0 || (q.shape(1) % k.shape(1)) != 0) {
-    return true;
+    return reject("head_repeat");
   }
   if (k.shape(2) <= 0 || k.shape(2) > 8 || q.shape(3) <= 0 || q.shape(3) > 256 ||
       v.shape(3) <= 0 || v.shape(3) > 256) {
-    return true;
+    return reject("dim_bounds");
   }
   if ((q.size() % 2) != 0 || (k.size() % 2) != 0 || (v.size() % 2) != 0) {
-    return true;
+    return reject("bf16_pack");
   }
 
   return false;
@@ -1029,6 +1149,11 @@ void fast::RoPE::eval_gpu(
   uint32_t t_size = 0;
   uint32_t rows_per_batch = 0;
   uint32_t offset_is_vector = 0;
+  uint32_t input_hs_transposed = 0;
+  uint32_t input_batch_stride = 0;
+  uint32_t input_head_stride = 0;
+  uint32_t input_t_stride = 0;
+  uint32_t n_heads = 0;
   bool with_freqs = false;
   const char* rope_reject_reason = nullptr;
   if (can_use_native_rope_bf16(
@@ -1044,6 +1169,11 @@ void fast::RoPE::eval_gpu(
           t_size,
           rows_per_batch,
           offset_is_vector,
+          input_hs_transposed,
+          input_batch_stride,
+          input_head_stride,
+          input_t_stride,
+          n_heads,
           &rope_reject_reason)) {
     try {
       auto& out = outputs[0];
@@ -1071,6 +1201,11 @@ void fast::RoPE::eval_gpu(
             encode_push_constant_u32(rows_per_batch),
             encode_push_constant_u32(offset_is_vector),
             encode_push_constant_u32(traditional_flag),
+            encode_push_constant_u32(input_hs_transposed),
+            encode_push_constant_u32(input_batch_stride),
+            encode_push_constant_u32(input_head_stride),
+            encode_push_constant_u32(input_t_stride),
+            encode_push_constant_u32(n_heads),
             encode_push_constant_f32(scale_),
             encode_push_constant_u32(forward_flag)};
 
@@ -1091,6 +1226,11 @@ void fast::RoPE::eval_gpu(
             encode_push_constant_u32(rows_per_batch),
             encode_push_constant_u32(offset_is_vector),
             encode_push_constant_u32(traditional_flag),
+            encode_push_constant_u32(input_hs_transposed),
+            encode_push_constant_u32(input_batch_stride),
+            encode_push_constant_u32(input_head_stride),
+            encode_push_constant_u32(input_t_stride),
+            encode_push_constant_u32(n_heads),
             encode_push_constant_f32(scale_),
             encode_push_constant_f32(std::log2(base_)),
             encode_push_constant_u32(forward_flag)};

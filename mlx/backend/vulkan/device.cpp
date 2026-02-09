@@ -350,7 +350,7 @@ std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
     tensor_cache_[key] = TensorCacheEntry{
-        tensor, data_ref, data_ptr, nbytes, dtype, false, -1};
+        tensor, nullptr, data_ref, data_ptr, nbytes, dtype, false, -1};
   }
 
   return tensor;
@@ -382,12 +382,15 @@ void Device::mark_tensor_host_dirty(const array& arr, int stream_index) {
       it->second.data_ptr == data_ptr && it->second.nbytes == nbytes &&
       it->second.dtype == dtype && !it->second.data_ref.expired() &&
       it->second.data_ref.lock() == data_ref;
-  if (!same_meta || it->second.tensor.expired()) {
+  auto tensor = it->second.tensor.lock();
+  if (!same_meta || !tensor) {
     tensor_cache_.erase(it);
     return;
   }
   it->second.host_dirty = true;
   it->second.dirty_stream_index = stream_index;
+  // Keep tensor alive until host sync copies back dirty data.
+  it->second.pinned_tensor = std::move(tensor);
 }
 
 void Device::sync_array_to_host_if_needed(const array& arr) {
@@ -417,7 +420,8 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
       return;
     }
     dirty_stream_index = it->second.dirty_stream_index;
-    tensor = it->second.tensor.lock();
+    tensor = it->second.pinned_tensor ? it->second.pinned_tensor
+                                      : it->second.tensor.lock();
     if (!tensor) {
       tensor_cache_.erase(it);
       return;
@@ -444,6 +448,7 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
     if (auto cur = it->second.tensor.lock(); cur && cur == tensor) {
       it->second.host_dirty = false;
       it->second.dirty_stream_index = -1;
+      it->second.pinned_tensor.reset();
     }
   }
 }
@@ -467,7 +472,7 @@ void Device::sync_dirty_tensors_for_stream(int stream_index) {
         continue;
       }
 
-      auto tensor = entry.tensor.lock();
+      auto tensor = entry.pinned_tensor ? entry.pinned_tensor : entry.tensor.lock();
       auto data_ref = entry.data_ref.lock();
       if (!tensor || !data_ref) {
         it = tensor_cache_.erase(it);
@@ -506,6 +511,7 @@ void Device::sync_dirty_tensors_for_stream(int stream_index) {
     if (auto cur = it->second.tensor.lock(); cur && cur == item.tensor) {
       it->second.host_dirty = false;
       it->second.dirty_stream_index = -1;
+      it->second.pinned_tensor.reset();
     }
   }
 }

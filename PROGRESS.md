@@ -601,3 +601,124 @@ python -m unittest discover -v
 1. 为 `ADD_F32` 建立最小 C++/Python 回归基准，定位 descriptor 绑定或 host/device 同步交互问题，修复后再放开原生路径。  
 2. 按 Metal 对照推进 `fast::RoPE` transposed layout（`[B,H,T,D]` + 特定 strides）正确寻址实现。  
 3. 继续用 `MLX_VK_PROFILE=1` 复盘热点，优先压缩 `fast::RoPE` / `fast::SDPA` fallback 占比。  
+
+---
+
+## 2026-02-09 深夜增量（Host 可见性 + RoPE transposed 落地）✅
+
+### 本轮变更
+1. 修复 Vulkan tensor-cache 的 host 回写生命周期缺口（避免 dirty tensor 过早释放）：  
+   - `TensorCacheEntry` 新增 `pinned_tensor`，在 `mark_tensor_host_dirty` 时 pin 住 `kp::Tensor`；  
+   - 在 `sync_array_to_host_if_needed` / `sync_dirty_tensors_for_stream` 成功回写后清理 pin。  
+   - 文件：`mlx/backend/vulkan/device.h`、`mlx/backend/vulkan/device.cpp`。
+
+2. 强化 Python host conversion 的同步语义：  
+   - `python/src/buffer.h:getbuffer` 在 `a.eval()` 后增加 `mx::synchronize()`；  
+   - `python/src/convert.cpp` 的 ndarray/scalar/tolist 转换统一改为 `eval + synchronize`。  
+   - 文件：`python/src/buffer.h`、`python/src/convert.cpp`。
+
+3. `ADD_F32` 保持安全默认关闭，但恢复可控实验开关：  
+   - 新增环境变量 `MLX_VK_ENABLE_ADD_F32`（`1/true/on`）开启原生 `ADD_F32`；默认仍走 fallback。  
+   - 文件：`mlx/backend/vulkan/primitives/binary.cpp`。
+
+4. 完成 RoPE head/seq-transposed 布局原生支持（对齐 Metal 思路）：  
+   - `can_use_native_rope_bf16` 接受 `ndim=4` 且 `strides=[T*H*D, D, H*D, 1]` 的输入；  
+   - 新增 transposed 索引 push constants（`input_*_stride`、`n_heads`、`input_hs_transposed`）；  
+   - `rope_bf16_t1.comp` / `rope_bf16_freqs.comp` 增加“输入按 transposed 寻址、输出按 contiguous 写回”的分支；  
+   - 同步重生 `rope_bf16_t1_spv.h` 与 `rope_bf16_freqs_spv.h`。  
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`、`mlx/backend/vulkan/shaders/rope_bf16_t1.comp`、`mlx/backend/vulkan/shaders/rope_bf16_freqs.comp`、对应 `*_spv.h`。
+
+### 关键验证结果
+1. RoPE 回归：  
+   - `DEVICE=gpu python/tests/test_fast.py` 子集  
+     `test_rope/test_rope_batch/test_rope_with_freqs/test_rope_grad`：`4/4` 通过。
+2. 实卡 C++ 回归：  
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过（`8.65 sec`）。
+3. 模型冒烟（实卡 Vulkan，Qwen3-0.6B-MLX-4bit，10 token）：  
+   - `Generation: 10 tokens, 3.304 tokens-per-sec`，`Peak memory: 0.347 GB`。
+4. 同口径 profile（`MLX_VK_PROFILE_PRINT_EACH=1`，10 token）聚合：  
+   - `fast::RoPE: calls=671, fallback=0`（此前该热点存在 transposed-layout fallback）。
+
+---
+
+## 2026-02-09 深夜增量（SDPA gate 放宽试验并回滚）↩️
+
+### 试验内容
+- 尝试将 `fast::ScaledDotProductAttention` gate 放宽到：  
+  - 允许 `do_causal`（`Q_len==1`）  
+  - 将 `k_len` 上限从 `8` 提升到 `512`。
+
+### 结果
+- 模型端出现明显回归：  
+  - `timeout 120s ... mlx_lm generate --max-tokens 10` => `exit_code=124`（超时）。  
+- 因不满足稳定性门禁，**本轮已完整回滚上述 SDPA gate 改动**，恢复此前保守策略。
+
+### 回滚后复测
+1. 模型生成恢复：  
+   - `Generation: 10 tokens, 3.304 tokens-per-sec`（`exit_code=0`）。
+2. C++ 全量回归：  
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+3. `python/tests/test_fast_sdpa.py -v`：`16` 项通过，`1` skip。
+
+### 当前状态（最新）
+- ✅ RoPE transposed-layout 关键缺口已补齐且 correctness 门禁通过。  
+- ✅ Host 可见性（dirty tensor 生命周期 + Python conversion 同步）已加固。  
+- ⚠️ SDPA 主路径仍保持窄覆盖（避免回归），`Compiled/Matmul/Softmax` 仍是模型热点。  
+- ⚠️ `ADD_F32` 仍默认关闭，仅保留 env gate 实验入口。
+
+### 下一步（最新执行入口）
+1. 为 `ADD_F32` 建最小稳定回归（host read / scalar / tolist / chained ops），修复后再考虑默认开启。  
+2. 针对 `Compiled/Matmul/Softmax` 热点补充“触发来源”诊断（定位是否来自 `fast::SDPA` 未命中、或 compile 图内替代路径）。  
+3. 在不放宽全局 gate 的前提下，对 SDPA 做更细粒度门禁试验（按形状/头数/`k_len` 分桶），每桶单独 correctness + 10-token 超时门禁。  
+
+---
+
+## 2026-02-09 深夜增量（SDPA fallback 来源定位）🔍
+
+### 本轮变更
+1. 为 `fast::ScaledDotProductAttention::use_fallback` 增加可控拒绝日志：  
+   - 新增环境变量：`MLX_VK_DEBUG_SDPA_REJECT=1`  
+   - 打印字段：`reason`、`has_mask/do_causal/training/logsumexp`、`q/k/v` 的 `dtype/shape/strides/row_contiguous`。  
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`。
+
+### 诊断结果（Qwen3-0.6B-MLX-4bit，实卡 Vulkan，`max-tokens=1`）
+- 拒绝统计：`84` 次  
+  - `global_gate`: `28`（典型为 prefill，`has_mask=1`、`do_causal=1`、`q.shape=[1,16,8,128]`）  
+  - `dim_bounds`: `56`（典型为 decode，`has_mask=0`、`do_causal=0`、`q.shape=[1,16,1,128]`，`k.shape=[1,8,9,128]`，被 `k_len>8` 门禁拦截）
+- 结论：当前 `Matmul/Softmax` 热点的主要触发并非随机布局问题，而是：
+  1. prefill 的 `mask+causal` 全局门禁；
+  2. decode 阶段 `k_len` 超过 `8` 的范围门禁。
+
+### 稳定性复核
+- 回滚后的保守 SDPA gate 保持不变；新增日志仅在 debug env 下生效。  
+- 模型冒烟（`prompt=\"Hi what is your name\"`, `max-tokens=10`）：
+  - `Generation: 10 tokens, 3.288 tokens-per-sec`，`exit_code=0`。
+
+### 下一步（更新）
+1. 先做 **小步 SDPA 分桶试验**：仅针对 decode 且 `has_mask=0` 的路径，按 `k_len` 分段放宽（如 `<=12/<=16`），逐桶跑超时门禁。  
+2. prefill (`has_mask=1`/`do_causal=1`) 暂不直接放开，先设计单独 kernel/门禁，避免再次触发长时回归。  
+3. 继续保持 `ctest 223/223` + `mlx_lm 10-token` 双门禁作为每次放量前提。  
+
+---
+
+## 2026-02-09 深夜增量（SDPA `k_len<=12` 分桶试验回滚）↩️
+
+### 试验内容
+- 在保持 `has_mask/do_causal` 全局 gate 不变前提下，仅将 decode 路径 `k_len` 上限从 `8` 放宽到 `12`（`use_fallback` + `can_use_native_sdpa_bf16_decode_q1` 同步）。
+
+### 结果
+- 该小步放量依然触发卡住：  
+  - `MLX_VK_DEBUG_SDPA_REJECT=1` + `prompt="Hi"` + `max-tokens=1` 进程停滞（需外部终止）。  
+- 因不满足稳定门禁，**本轮已回滚到 `k_len<=8`**。
+
+### 回滚后确认
+- SDPA 拒绝分布恢复到试验前：`global_gate=28`, `dim_bounds=56`（`/tmp/vk_sdpa_reject_1tok_after_revertk.log`）。  
+- 模型冒烟恢复稳定：  
+  - `prompt="Hi what is your name"`, `max-tokens=10` => `Generation: 3.287 tokens-per-sec`, `exit_code=0`。  
+- 测试门禁保持通过：  
+  - `python/tests/test_fast_sdpa.py -v`：`16` 通过，`1` skip；  
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过（`Total Test time (real) = 8.99 sec`）。
+
+### 结论
+- 现阶段仅放宽 `k_len` 上限（即使是 `<=12`）仍有较高回归风险，不能直接进入主线。  
+- 后续 SDPA 优化需先补“为什么 decode native path 会卡住”的机制诊断（例如 dispatch/同步/descriptor 生命周期），再谈门禁放量。  

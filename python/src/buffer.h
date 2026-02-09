@@ -5,6 +5,7 @@
 #include <nanobind/nanobind.h>
 
 #include "mlx/array.h"
+#include "mlx/stream.h"
 #include "mlx/utils.h"
 
 // Only defined in >= Python 3.9
@@ -91,6 +92,7 @@ extern "C" inline int getbuffer(PyObject* obj, Py_buffer* view, int flags) {
   {
     nb::gil_scoped_release nogil;
     a.eval();
+    mx::synchronize();
   }
 
   std::vector<Py_ssize_t> shape(a.shape().begin(), a.shape().end());

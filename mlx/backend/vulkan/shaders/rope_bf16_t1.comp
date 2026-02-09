@@ -22,6 +22,11 @@ layout(push_constant) uniform PushConstants {
   uint rows_per_batch;
   uint offset_is_vector;
   uint traditional;
+  uint input_hs_transposed;
+  uint input_batch_stride;
+  uint input_head_stride;
+  uint input_t_stride;
+  uint n_heads;
   float scale;
   float log2_base;
   uint forward;
@@ -68,7 +73,15 @@ void main() {
   int offset = offsets_buffer.values[offset_index];
   uint time_index = (params.t_size > 1u) ? (row % params.t_size) : 0u;
   float L = params.scale * float(offset + int(time_index));
-  uint row_base = row * params.row_stride;
+  uint out_row_base = row * params.row_stride;
+  uint in_row_base = out_row_base;
+  if (params.input_hs_transposed != 0u) {
+    uint batch_index = row / params.rows_per_batch;
+    uint head_index = (row / params.t_size) % params.n_heads;
+    in_row_base = batch_index * params.input_batch_stride +
+        head_index * params.input_head_stride +
+        time_index * params.input_t_stride;
+  }
 
   for (uint p = 0u; p < params.half_dims; ++p) {
     float d = float(p) / float(params.half_dims);
@@ -77,18 +90,25 @@ void main() {
     float c = cos(theta);
     float s = sin(theta);
 
-    uint idx1;
-    uint idx2;
+    uint in_idx1;
+    uint in_idx2;
+    uint out_idx1;
+    uint out_idx2;
     if (params.traditional != 0u) {
-      idx1 = row_base + (p << 1u);
-      idx2 = idx1 + 1u;
+      uint elem_off = p << 1u;
+      in_idx1 = in_row_base + elem_off;
+      in_idx2 = in_idx1 + 1u;
+      out_idx1 = out_row_base + elem_off;
+      out_idx2 = out_idx1 + 1u;
     } else {
-      idx1 = row_base + p;
-      idx2 = idx1 + params.half_dims;
+      in_idx1 = in_row_base + p;
+      in_idx2 = in_idx1 + params.half_dims;
+      out_idx1 = out_row_base + p;
+      out_idx2 = out_idx1 + params.half_dims;
     }
 
-    float x1 = load_elem(idx1);
-    float x2 = load_elem(idx2);
+    float x1 = load_elem(in_idx1);
+    float x2 = load_elem(in_idx2);
 
     float y1;
     float y2;
@@ -100,7 +120,7 @@ void main() {
       y2 = x2 * c - x1 * s;
     }
 
-    store_elem(idx1, y1);
-    store_elem(idx2, y2);
+    store_elem(out_idx1, y1);
+    store_elem(out_idx2, y2);
   }
 }

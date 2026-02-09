@@ -5,6 +5,7 @@
 #include "python/src/convert.h"
 #include "python/src/utils.h"
 
+#include "mlx/stream.h"
 #include "mlx/utils.h"
 
 enum PyScalarT {
@@ -13,6 +14,15 @@ enum PyScalarT {
   pyfloat = 2,
   pycomplex = 3,
 };
+
+namespace {
+
+inline void eval_and_sync_host_visible(mx::array& a) {
+  a.eval();
+  mx::synchronize();
+}
+
+} // namespace
 
 namespace nanobind {
 template <>
@@ -112,7 +122,7 @@ nb::ndarray<NDParams...> mlx_to_nd_array_impl(
     std::optional<nb::dlpack::dtype> t = {}) {
   {
     nb::gil_scoped_release nogil;
-    a.eval();
+    eval_and_sync_host_visible(a);
   }
   std::vector<size_t> shape(a.shape().begin(), a.shape().end());
   return nb::ndarray<NDParams...>(
@@ -175,7 +185,7 @@ nb::object to_scalar(mx::array& a) {
   }
   {
     nb::gil_scoped_release nogil;
-    a.eval();
+    eval_and_sync_host_visible(a);
   }
   switch (a.dtype()) {
     case mx::bool_:
@@ -232,7 +242,7 @@ nb::object tolist(mx::array& a) {
   }
   {
     nb::gil_scoped_release nogil;
-    a.eval();
+    eval_and_sync_host_visible(a);
   }
   switch (a.dtype()) {
     case mx::bool_:
