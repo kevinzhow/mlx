@@ -74,6 +74,13 @@
   `set(KOMPUTE_OPT_LOG_LEVEL "Off" CACHE STRING "" FORCE)`。
 - ✅ 基于 gdb 栈采样命中 `cpu/quantized.cpp::_qmm_t<...>` 热点后，完成 CPU 量化 matmul 转置路径并行化：  
   在 `mlx/backend/cpu/quantized.cpp` 为 `_qmm_t` / `_qmm_t_simd` / `fp_qmm_t` / `fp_qmm_t_simd` 增加按输出列切分的多线程执行（`std::thread`，带最小工作量阈值）。
+- ✅ 启动 `QuantizedMatmul` 原生 Vulkan 路径（首个可用 kernel）：  
+  新增 `qmm_affine_bf16_t4_g128` shader 与调度路径，当前覆盖：
+  - `mode=Affine`
+  - `dtype=bfloat16`（`x/scales/biases/out`），`w=uint32`
+  - `bits=4`，`group_size=128`，`transpose=true`
+  - `w/scales/biases` 为 2D 且行连续（主推理权重布局）
+  对不满足条件的 case 仍走原 CPU fallback，保证正确性。
 
 ### 新性能验证（实卡 Vulkan + Release）
 - 命令（1 token 诊断）：
@@ -88,6 +95,8 @@
 - 结果：
   - 变更前（Release 未并行 qmm）：`Generation: 0.339 tokens-per-sec`
   - 变更后（并行 qmm）：`Generation: 1.700 tokens-per-sec`（约 5.0x）
+  - 变更后（并行 qmm + 原生 Vulkan QuantizedMatmul 首版）：`Generation: 2.624 tokens-per-sec`（较 1.700 再提升约 54%）
+  - 对应首 token：`first_token_sec=0.941`（此前约 `1.866`）
 
 ### 验证结果
 - ✅ C++ 全量通过：`223/223`（`ctest --test-dir build --output-on-failure --timeout 120`）
@@ -105,6 +114,9 @@
 - ✅ 外部模型 40-token 速度冒烟通过（`2026-02-09`）  
   命令：`PYTHONPATH=python python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi" --max-tokens 40 --temp 0`  
   结果：`Generation: 40 tokens, 0.395 tokens-per-sec`（Prompt: `9 tokens, 0.465 tokens-per-sec`，Peak memory: `0.347 GB`）。
+- ✅ 外部模型 Vulkan 10-token 复测通过（`2026-02-09`）  
+  命令：`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 PYTHONPATH=python python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi what is your name" --max-tokens 10 --temp 0`。  
+  结果：成功输出 `10` token（首段为 `<think> ...`），`Prompt: 13 tokens, 8.013 tokens-per-sec`，`Generation: 10 tokens, 2.841 tokens-per-sec`，`Peak memory: 0.347 GB`。
 - ✅ 强制 Vulkan Python 构建链路验证（`2026-02-09`）  
   命令：`cmake -S . -B build -DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF -DMLX_BUILD_PYTHON_BINDINGS=ON`，随后 `cmake --build build --target core -j`。  
   运行时：`mx.default_device() == Device(gpu, 0)`，`mx.device_info(mx.Device(mx.gpu,0)) == {'architecture': 'vulkan', 'device_name': 'Vulkan GPU (Kompute)'}`。  
@@ -120,6 +132,11 @@
 - ✅ Release 构建 + 并行 qmm 版本 C++ 全量通过（`2026-02-09`）  
   命令：`ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`（实卡 Vulkan 环境）。  
   结果：`223/223` 通过，`Total Test time (real) = 9.46 sec`。
+- ✅ QuantizedMatmul 首版改动后复测通过（`2026-02-09`）  
+  命令：`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`。  
+  结果：`223/223` 通过，`Total Test time (real) = 9.56 sec`。  
+  命令：`DEVICE=gpu PYTHONPATH=python python3 python/tests/test_quantized.py -v`。  
+  结果：执行用例 `10/10` 通过，其余用例按测试文件内条件跳过（`skip`），无新增失败。
 - ✅ Python `async_eval` GPU 挂起修复（`2026-02-09`）  
   复现定位：`DEVICE=gpu` 下 `test_eval.TestEval.test_async_eval` 卡在 `mx.async_eval(x)`；`gdb` 栈指向 `prepare_inputs_for_cpu_fallback -> Add::eval_gpu -> async_eval`。  
   根因：Vulkan fallback 在输入已绑定同 stream 未 signal event 时调用 `array::wait()`，等待同轮 `eval_impl(async)` 尾部才 signal 的 event，形成自等待死锁。  
@@ -148,7 +165,7 @@
 - 当前验证范围内暂无已复现的 correctness blocker。
 - `PROGRESS.md` 中旧的“Python 失败清单”已过时，保留为历史记录；当前以本节验证结果为准。
 - 仍存在架构层面的目标差距：部分路径仍依赖 CPU fallback（虽正确，但未达到“尽量原生 Vulkan 执行”的终态）。
-- `async_eval` GPU 死锁与首 token 超时问题已修复；当前主要 runtime blocker 转为“Vulkan 路径仍高度依赖 CPU fallback（尤其 QuantizedMatmul）”，GPU 与 CPU 首 token 速度接近（约 1.9s），说明原生 Vulkan 算子覆盖仍不足。
+- `async_eval` GPU 死锁与首 token 超时问题已修复；`QuantizedMatmul` 已有首个原生 Vulkan 覆盖，但仍是**窄覆盖**（Affine+bf16+4bit+g128+transpose），其余组合仍依赖 CPU fallback。
 - `pip install -e .` 在 `CMAKE_ARGS='-DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF'` 下失败：`install(EXPORT "MLXTargets" ...) includes target "mlx" which requires target "kompute" that is not in any export set`。
 - 运行环境差异已确认：沙箱内对 `/dev/dri/renderD128` 缺少 `O_RDWR` 权限会退化到 `llvmpipe`；非沙箱可见硬件 Radeon。
 - `python/tests` 在 `DEVICE=gpu` 下的 `test_quantized` 仍有历史问题（`GatherMM` float32 限制与 1 个 qmm 精度阈值失败）；`DEVICE=cpu` 下 `test_quantized` 全通过。该项需单独梳理 Vulkan fallback 与 dtype 契约。
@@ -250,6 +267,23 @@
 - `mlx/backend/vulkan/primitives/fallback.cpp`
 - `PROGRESS.md`
 
+---
+
+## 2026-02-09: 下一步优先级对齐（Qwen 真实负载）📌
+
+### 结论
+- 下一步不优先扩 `QuantizedMatmul` 组合，而是优先减少 GPU/CPU 边界切换。
+- 原因：Qwen3-0.6B-MLX-4bit 实测中 `quantized_matmul` 调用形态已大量命中当前首版 Vulkan 覆盖（`Affine + bf16 + bits=4 + group_size=128 + transpose=true`），剩余瓶颈更多来自高频 fallback 算子。
+
+### 已确认的高优先缺口
+- `fast::RMSNorm` / `fast::RoPE` / `fast::ScaledDotProductAttention` 仍为 fallback。
+- 常见 `bf16` 二元算子中 `Multiply` 仍为 CPU fallback。
+
+### 立即执行动作
+1. 先实现 Vulkan 原生 `bf16 Add + bf16 Multiply`，减少残差/MLP 路径 fallback。
+2. 随后推进 `fast::RMSNorm` 与 `fast::RoPE` 原生实现。
+3. 再扩 `QuantizedMatmul` 到 `bits=8 / group_size=64 / transpose=false` 等组合，并回收 `test_qmm` 历史失败。
+
 ## 下一步（执行入口）
 
 1. 统一其它非宏 fallback 路径到同一契约  
@@ -263,7 +297,7 @@
 在 `-DMLX_BUILD_VULKAN=ON` + 实卡环境下，对 `Qwen3-0.6B-MLX-4bit` 做首 token profiling，定位高耗时 fallback/同步热点并优先替换。
 已完成首轮定位与缓解：`qmm` CPU 热点并行化后吞吐显著提升。  
 下一阶段聚焦：
-- 优先推进 `QuantizedMatmul` 原生 Vulkan 实现（或等价高性能路径），降低 CPU fallback 占比；
+- 扩展 `QuantizedMatmul` 原生 Vulkan 覆盖（更多 bits/group_size/quant mode 与非 2D 权重布局），持续降低 CPU fallback 占比；
 - 梳理 `DEVICE=gpu` 下 `test_quantized` 失败项（`GatherMM` dtype 限制、qmm 精度阈值）并分离“历史问题”与“新回归”；
 - 统一使用 Release 构建基线做性能对比，避免无优化构建造成误判。
 

@@ -434,3 +434,28 @@ public:
 - [ ] `gpu::synchronize()` 等待完成
 - [ ] 占位符算子输出调试信息
 - [ ] Lazy Evaluation 工作（操作延迟到 eval 执行）
+
+## 8. QuantizedMatmul（当前 Vulkan 首版覆盖）
+
+### 8.1 入口与调度
+- 入口：`mlx/backend/vulkan/primitives/fallback.cpp` 中 `QuantizedMatmul::eval_gpu(...)`。
+- 先执行 stream-aware 输入就绪（避免 `async_eval` 同轮 event 自等待），再走分支：
+  - 命中原生 Vulkan 条件：调度 `KernelRegistry::QMM_AFFINE_BF16_T4_G128`。
+  - 未命中：显式回退到 CPU fallback（保持正确性与 stream 安全）。
+
+### 8.2 首版原生覆盖条件
+- `mode=Affine`
+- `bits=4`
+- `group_size=128`
+- `transpose=true`
+- `x/scales/biases/out` 为 `bfloat16`，`w` 为 `uint32`
+- `w/scales/biases` 为 2D 且行连续
+
+### 8.3 Shader 与注册
+- Shader：`mlx/backend/vulkan/shaders/qmm_affine_bf16_t4_g128.comp`
+- Registry 常量：`KernelRegistry::QMM_AFFINE_BF16_T4_G128`
+- 注册位置：`mlx/backend/vulkan/kernel_registry.cpp`
+
+### 8.4 当前限制
+- 非上述量化配置（例如其他 `bits/group_size/mode`）仍走 CPU fallback。
+- 当前实现以“先可用、再扩覆盖”为策略，优先降低实际推理中的 fallback 占比。

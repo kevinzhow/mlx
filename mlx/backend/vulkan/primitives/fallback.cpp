@@ -1,10 +1,16 @@
 // Copyright © 2026 MLX Vulkan Backend
 
+#include <algorithm>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
+#include "mlx/allocator.h"
 #include "mlx/backend/cpu/encoder.h"
+#include "mlx/backend/vulkan/device.h"
+#include "mlx/backend/vulkan/kernel_registry.h"
 #include "mlx/distributed/primitives.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
@@ -32,6 +38,95 @@ inline void prepare_inputs_for_cpu_fallback(
       mutable_in.wait();
     }
   }
+}
+
+inline bool is_row_contiguous_materialized(const mlx::core::array& arr) {
+  return arr.flags().row_contiguous && arr.data_size() == arr.size();
+}
+
+inline float encode_push_constant_u32(uint32_t value) {
+  float encoded = 0.0f;
+  static_assert(sizeof(float) == sizeof(uint32_t));
+  std::memcpy(&encoded, &value, sizeof(uint32_t));
+  return encoded;
+}
+
+inline bool can_use_native_affine_bf16_quantized_matmul(
+    const std::vector<mlx::core::array>& inputs,
+    const mlx::core::array& out,
+    int group_size,
+    int bits,
+    bool transpose,
+    mlx::core::QuantizationMode mode) {
+  if (inputs.size() != 4 || out.size() == 0) {
+    return false;
+  }
+  if (mode != mlx::core::QuantizationMode::Affine || bits != 4 ||
+      group_size != 128 || !transpose) {
+    return false;
+  }
+  if (out.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+      (out.size() % 2) != 0) {
+    return false;
+  }
+
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+  const auto& scales = inputs[2];
+  const auto& biases = inputs[3];
+
+  if (x.dtype() != mlx::core::bfloat16 || w.dtype() != mlx::core::uint32 ||
+      scales.dtype() != mlx::core::bfloat16 ||
+      biases.dtype() != mlx::core::bfloat16 ||
+      out.dtype() != mlx::core::bfloat16) {
+    return false;
+  }
+
+  if (!is_row_contiguous_materialized(x) ||
+      !is_row_contiguous_materialized(w) ||
+      !is_row_contiguous_materialized(scales) ||
+      !is_row_contiguous_materialized(biases) ||
+      !out.flags().row_contiguous) {
+    return false;
+  }
+
+  if (x.ndim() < 1 || w.ndim() != 2 || scales.ndim() != 2 || biases.ndim() != 2) {
+    return false;
+  }
+
+  int k = x.shape(-1);
+  int n = out.shape(-1);
+  if (k <= 0 || n <= 0 || (k % group_size) != 0) {
+    return false;
+  }
+
+  int groups_per_col = k / group_size;
+  if (groups_per_col <= 0) {
+    return false;
+  }
+  if (w.shape(-2) != n || scales.shape(-2) != n || biases.shape(-2) != n) {
+    return false;
+  }
+  if (scales.shape(-1) != groups_per_col || biases.shape(-1) != groups_per_col) {
+    return false;
+  }
+
+  constexpr int values_per_u32 = 8; // bits=4
+  if (w.shape(-1) * values_per_u32 != k) {
+    return false;
+  }
+
+  int rows = static_cast<int>(x.size() / static_cast<size_t>(k));
+  if (rows <= 0 || static_cast<size_t>(rows) * static_cast<size_t>(n) != out.size()) {
+    return false;
+  }
+
+  // Shader reads bf16 via packed uint words, so require even element counts.
+  if ((x.size() % 2) != 0 || (scales.size() % 2) != 0 || (biases.size() % 2) != 0) {
+    return false;
+  }
+
+  return true;
 }
 
 inline void collect_keepalive_buffers(
@@ -116,6 +211,64 @@ inline void run_cpu_fallback_multi(
 
 namespace mlx::core {
 
+void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto stream = out.primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+
+  if (can_use_native_affine_bf16_quantized_matmul(
+          inputs, out, group_size_, bits_, transpose_, mode_)) {
+    try {
+      if (!out.data_shared_ptr()) {
+        out.set_data(allocator::malloc(out.nbytes()));
+      }
+
+      auto& device = vulkan::device(stream.device);
+      auto& encoder = device.get_command_encoder(stream.index);
+      encoder.begin_encoding();
+
+      auto x_tensor = device.get_tensor(inputs[0]);
+      auto w_tensor = device.get_tensor(inputs[1]);
+      auto scales_tensor = device.get_tensor(inputs[2]);
+      auto biases_tensor = device.get_tensor(inputs[3]);
+      auto out_tensor = device.get_tensor(out);
+
+      const uint32_t out_elems = static_cast<uint32_t>(out.size());
+      const uint32_t n = static_cast<uint32_t>(out.shape(-1));
+      const uint32_t k = static_cast<uint32_t>(inputs[0].shape(-1));
+      const uint32_t groups_per_col =
+          static_cast<uint32_t>(k / static_cast<uint32_t>(group_size_));
+      const uint32_t w_words_per_col =
+          static_cast<uint32_t>(inputs[1].shape(-1));
+      const uint32_t out_words = out_elems / 2u;
+      const uint32_t groups_x = std::max<uint32_t>(1, (out_words + 63u) / 64u);
+
+      const std::vector<float> push_consts{
+          encode_push_constant_u32(out_elems),
+          encode_push_constant_u32(n),
+          encode_push_constant_u32(k),
+          encode_push_constant_u32(groups_per_col),
+          encode_push_constant_u32(w_words_per_col)};
+
+      encoder.record_tensor_sync_device(
+          {x_tensor, w_tensor, scales_tensor, biases_tensor, out_tensor});
+      encoder.record_algo_dispatch(
+          vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128,
+          {x_tensor, w_tensor, scales_tensor, biases_tensor, out_tensor},
+          {groups_x, 1, 1},
+          push_consts);
+      encoder.record_tensor_sync_local({out_tensor});
+      synchronize(stream);
+
+      std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+      return;
+    } catch (const std::exception&) {
+      // Fall through to CPU fallback.
+    }
+  }
+
+  run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); });
+}
+
 VULKAN_CPU_FALLBACK(Abs)
 VULKAN_CPU_FALLBACK(AddMM)
 VULKAN_CPU_FALLBACK(Arange)
@@ -173,7 +326,6 @@ VULKAN_CPU_FALLBACK(NotEqual)
 VULKAN_CPU_FALLBACK(Partition)
 VULKAN_CPU_FALLBACK(Power)
 VULKAN_CPU_FALLBACK(QQMatmul)
-VULKAN_CPU_FALLBACK(QuantizedMatmul)
 VULKAN_CPU_FALLBACK(RandomBits)
 VULKAN_CPU_FALLBACK(Real)
 VULKAN_CPU_FALLBACK(Reduce)

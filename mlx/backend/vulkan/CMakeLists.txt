@@ -83,6 +83,7 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/binary_add.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sin.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/cos.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128.comp
 )
 
 # Compile shaders to SPIR-V

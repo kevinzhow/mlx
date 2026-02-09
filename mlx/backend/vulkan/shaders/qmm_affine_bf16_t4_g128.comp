@@ -1,0 +1,126 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuffer {
+  uint words[];
+} x_buffer;
+
+layout(set = 0, binding = 1) readonly buffer WBuffer {
+  uint words[];
+} w_buffer;
+
+layout(set = 0, binding = 2) readonly buffer ScaleBuffer {
+  uint words[];
+} scale_buffer;
+
+layout(set = 0, binding = 3) readonly buffer BiasBuffer {
+  uint words[];
+} bias_buffer;
+
+layout(set = 0, binding = 4) writeonly buffer OutBuffer {
+  uint words[];
+} out_buffer;
+
+layout(push_constant) uniform PushConstants {
+  uint out_elems;
+  uint n;
+  uint k;
+  uint groups_per_col;
+  uint w_words_per_col;
+} params;
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float load_bf16_from_packed(uint packed, uint elem_idx) {
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float load_x_bf16(uint elem_idx) {
+  uint packed = x_buffer.words[elem_idx >> 1u];
+  return load_bf16_from_packed(packed, elem_idx);
+}
+
+float load_scale_bf16(uint elem_idx) {
+  uint packed = scale_buffer.words[elem_idx >> 1u];
+  return load_bf16_from_packed(packed, elem_idx);
+}
+
+float load_bias_bf16(uint elem_idx) {
+  uint packed = bias_buffer.words[elem_idx >> 1u];
+  return load_bf16_from_packed(packed, elem_idx);
+}
+
+uint load_w_u8(uint byte_idx) {
+  uint packed = w_buffer.words[byte_idx >> 2u];
+  uint shift = (byte_idx & 3u) * 8u;
+  return (packed >> shift) & 0xFFu;
+}
+
+float compute_output_elem(uint out_elem_idx) {
+  uint row = out_elem_idx / params.n;
+  uint col = out_elem_idx - row * params.n;
+
+  uint x_row_offset = row * params.k;
+  uint scale_bias_base = col * params.groups_per_col;
+  uint w_col_word_base = col * params.w_words_per_col;
+
+  float sum = 0.0;
+
+  // Fixed to bits=4 and group_size=128 for this kernel.
+  const uint group_size = 128u;
+  const uint packed_bytes_per_group = 64u; // 128 values / 2 per byte
+  const uint w_words_per_group = 16u; // 64 bytes / 4
+
+  for (uint g = 0u; g < params.groups_per_col; ++g) {
+    float scale = load_scale_bf16(scale_bias_base + g);
+    float bias = load_bias_bf16(scale_bias_base + g);
+
+    uint x_group_offset = x_row_offset + g * group_size;
+    uint w_group_byte_base = (w_col_word_base + g * w_words_per_group) * 4u;
+
+    for (uint kw = 0u; kw < packed_bytes_per_group; ++kw) {
+      uint wi = load_w_u8(w_group_byte_base + kw);
+      float q0 = float(wi & 0xFu);
+      float q1 = float((wi >> 4u) & 0xFu);
+
+      float x0 = load_x_bf16(x_group_offset + kw * 2u);
+      float x1 = load_x_bf16(x_group_offset + kw * 2u + 1u);
+
+      sum += x0 * (scale * q0 + bias);
+      sum += x1 * (scale * q1 + bias);
+    }
+  }
+
+  return sum;
+}
+
+void main() {
+  uint out_word_idx = gl_GlobalInvocationID.x;
+  uint out_elem_0 = out_word_idx * 2u;
+  if (out_elem_0 >= params.out_elems) {
+    return;
+  }
+
+  float v0 = compute_output_elem(out_elem_0);
+  uint packed = f32_to_bf16(v0) & 0xFFFFu;
+
+  uint out_elem_1 = out_elem_0 + 1u;
+  if (out_elem_1 < params.out_elems) {
+    float v1 = compute_output_elem(out_elem_1);
+    packed |= (f32_to_bf16(v1) & 0xFFFFu) << 16u;
+  }
+
+  out_buffer.words[out_word_idx] = packed;
+}

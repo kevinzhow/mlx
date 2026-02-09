@@ -11,6 +11,7 @@
 #include "shaders/add_spv.h"
 #include "shaders/sin_spv.h"
 #include "shaders/cos_spv.h"
+#include "shaders/qmm_affine_bf16_t4_g128_spv.h"
 
 namespace mlx::core::vulkan {
 
@@ -22,6 +23,8 @@ const char* KernelRegistry::SUB_F32 = "sub_f32";
 const char* KernelRegistry::DIV_F32 = "div_f32";
 const char* KernelRegistry::SIN_F32 = "sin_f32";
 const char* KernelRegistry::COS_F32 = "cos_f32";
+const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128 =
+    "qmm_affine_bf16_t4_g128";
 
 KernelRegistry& KernelRegistry::instance() {
   static KernelRegistry registry;
@@ -55,6 +58,15 @@ void KernelRegistry::register_builtin_shaders() {
   std::vector<uint32_t> cos_spirv((cos_spv_len + 3) / 4);
   std::memcpy(cos_spirv.data(), cos_spv, cos_spv_len);
   shaders_[COS_F32] = std::move(cos_spirv);
+
+  // 注册 qmm_affine_bf16_t4_g128_spv
+  std::vector<uint32_t> qmm_spirv(
+      (qmm_affine_bf16_t4_g128_spv_len + 3) / 4);
+  std::memcpy(
+      qmm_spirv.data(),
+      qmm_affine_bf16_t4_g128_spv,
+      qmm_affine_bf16_t4_g128_spv_len);
+  shaders_[QMM_AFFINE_BF16_T4_G128] = std::move(qmm_spirv);
 }
 
 const std::vector<uint32_t>& KernelRegistry::get_shader(const std::string& name) {
