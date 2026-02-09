@@ -14,6 +14,9 @@
 #include "shaders/sin_spv.h"
 #include "shaders/cos_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_spv.h"
+#include "shaders/rmsnorm_bf16_spv.h"
+#include "shaders/rope_bf16_t1_spv.h"
+#include "shaders/rope_bf16_freqs_spv.h"
 
 namespace mlx::core::vulkan {
 
@@ -29,6 +32,9 @@ const char* KernelRegistry::SIN_F32 = "sin_f32";
 const char* KernelRegistry::COS_F32 = "cos_f32";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128 =
     "qmm_affine_bf16_t4_g128";
+const char* KernelRegistry::RMSNORM_BF16 = "rmsnorm_bf16";
+const char* KernelRegistry::ROPE_BF16_T1 = "rope_bf16_t1";
+const char* KernelRegistry::ROPE_BF16_FREQS = "rope_bf16_freqs";
 
 KernelRegistry& KernelRegistry::instance() {
   static KernelRegistry registry;
@@ -79,6 +85,19 @@ void KernelRegistry::register_builtin_shaders() {
       qmm_affine_bf16_t4_g128_spv,
       qmm_affine_bf16_t4_g128_spv_len);
   shaders_[QMM_AFFINE_BF16_T4_G128] = std::move(qmm_spirv);
+
+  std::vector<uint32_t> rmsnorm_spirv((rmsnorm_bf16_spv_len + 3) / 4);
+  std::memcpy(rmsnorm_spirv.data(), rmsnorm_bf16_spv, rmsnorm_bf16_spv_len);
+  shaders_[RMSNORM_BF16] = std::move(rmsnorm_spirv);
+
+  std::vector<uint32_t> rope_spirv((rope_bf16_t1_spv_len + 3) / 4);
+  std::memcpy(rope_spirv.data(), rope_bf16_t1_spv, rope_bf16_t1_spv_len);
+  shaders_[ROPE_BF16_T1] = std::move(rope_spirv);
+
+  std::vector<uint32_t> rope_freqs_spirv((rope_bf16_freqs_spv_len + 3) / 4);
+  std::memcpy(
+      rope_freqs_spirv.data(), rope_bf16_freqs_spv, rope_bf16_freqs_spv_len);
+  shaders_[ROPE_BF16_FREQS] = std::move(rope_freqs_spirv);
 }
 
 const std::vector<uint32_t>& KernelRegistry::get_shader(const std::string& name) {

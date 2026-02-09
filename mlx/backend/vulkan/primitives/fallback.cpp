@@ -1,6 +1,7 @@
 // Copyright © 2026 MLX Vulkan Backend
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -15,6 +16,7 @@
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 #include "mlx/stream.h"
+#include "mlx/transforms_impl.h"
 
 namespace {
 
@@ -127,6 +129,168 @@ inline bool can_use_native_affine_bf16_quantized_matmul(
   }
 
   return true;
+}
+
+inline bool can_use_native_rmsnorm_bf16(
+    const std::vector<mlx::core::array>& inputs,
+    const std::vector<mlx::core::array>& outputs,
+    uint32_t& n_rows,
+    uint32_t& axis_size,
+    uint32_t& w_stride) {
+  if (inputs.size() != 2 || outputs.size() != 1 || outputs[0].size() == 0) {
+    return false;
+  }
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+  const auto& out = outputs[0];
+
+  if (x.dtype() != mlx::core::bfloat16 || w.dtype() != mlx::core::bfloat16 ||
+      out.dtype() != mlx::core::bfloat16) {
+    return false;
+  }
+  if (!is_row_contiguous_materialized(x) || !out.flags().row_contiguous ||
+      x.shape() != out.shape()) {
+    return false;
+  }
+  if (x.ndim() < 1) {
+    return false;
+  }
+
+  int64_t axis = x.shape(-1);
+  if (axis <= 0 || (axis % 2) != 0 ||
+      axis > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+    return false;
+  }
+  if (x.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+      x.size() != out.size() || (x.size() % static_cast<size_t>(axis)) != 0) {
+    return false;
+  }
+
+  if (w.ndim() == 0) {
+    if (!is_row_contiguous_materialized(w) || w.size() != 1) {
+      return false;
+    }
+    w_stride = 0u;
+  } else if (w.ndim() == 1) {
+    if (!is_row_contiguous_materialized(w) || w.shape(0) != axis ||
+        w.strides()[0] != 1) {
+      return false;
+    }
+    w_stride = 1u;
+  } else {
+    return false;
+  }
+
+  axis_size = static_cast<uint32_t>(axis);
+  n_rows = static_cast<uint32_t>(x.size() / static_cast<size_t>(axis));
+  return n_rows > 0;
+}
+
+inline bool read_scalar_offset_i32(const mlx::core::array& offset, int32_t& out) {
+  if (offset.size() != 1) {
+    return false;
+  }
+  switch (offset.dtype()) {
+    case mlx::core::int32:
+      out = offset.data<int32_t>()[0];
+      return true;
+    case mlx::core::int64: {
+      auto v = offset.data<int64_t>()[0];
+      if (v < std::numeric_limits<int32_t>::min() ||
+          v > std::numeric_limits<int32_t>::max()) {
+        return false;
+      }
+      out = static_cast<int32_t>(v);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+inline bool can_use_native_rope_bf16(
+    const std::vector<mlx::core::array>& inputs,
+    const std::vector<mlx::core::array>& outputs,
+    int dims,
+    bool traditional,
+    float base,
+    bool& with_freqs,
+    uint32_t& n_rows,
+    uint32_t& half_dims,
+    uint32_t& row_stride,
+    uint32_t& t_size) {
+  if ((inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1 ||
+      outputs[0].size() == 0) {
+    return false;
+  }
+  if (traditional) {
+    return false;
+  }
+  with_freqs = inputs.size() == 3;
+  if (!with_freqs && base <= 0.0f) {
+    return false;
+  }
+
+  const auto& in = inputs[0];
+  const auto& offset = inputs[1];
+  const auto& out = outputs[0];
+  if (in.dtype() != mlx::core::bfloat16 || out.dtype() != mlx::core::bfloat16 ||
+      in.shape() != out.shape()) {
+    return false;
+  }
+  if (!is_row_contiguous_materialized(in) || !out.flags().row_contiguous ||
+      in.ndim() < 2) {
+    return false;
+  }
+
+  int64_t d = in.shape(-1);
+  int64_t t = in.shape(-2);
+  if (t <= 0 || d <= 0 || dims <= 0 || dims != d || (dims % 2) != 0) {
+    return false;
+  }
+  if (in.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+      t > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+    return false;
+  }
+
+  int32_t offset_value = 0;
+  if (!read_scalar_offset_i32(offset, offset_value)) {
+    return false;
+  }
+  (void)offset_value;
+
+  row_stride = static_cast<uint32_t>(d);
+  half_dims = static_cast<uint32_t>(dims / 2);
+  if (with_freqs) {
+    const auto& freqs = inputs[2];
+    if (freqs.dtype() != mlx::core::float32 || freqs.ndim() != 1 ||
+        freqs.shape(0) != static_cast<int64_t>(half_dims) ||
+        !is_row_contiguous_materialized(freqs) || freqs.strides()[0] != 1) {
+      return false;
+    }
+  }
+  n_rows = static_cast<uint32_t>(in.size() / static_cast<size_t>(d));
+  t_size = static_cast<uint32_t>(t);
+  return n_rows > 0;
+}
+
+inline void materialize_and_share_fast_outputs(
+    const std::vector<mlx::core::array>& fallback_outputs,
+    std::vector<mlx::core::array>& outputs) {
+  if (fallback_outputs.size() != outputs.size()) {
+    throw std::runtime_error("[Vulkan fast] Fallback output arity mismatch.");
+  }
+
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    auto& src = fallback_outputs[i];
+    auto& mutable_src = const_cast<mlx::core::array&>(src);
+    if (mutable_src.status() == mlx::core::array::Status::unscheduled) {
+      mutable_src.eval();
+    } else {
+      mutable_src.wait();
+    }
+    outputs[i].copy_shared_buffer(src);
+  }
 }
 
 inline void collect_keepalive_buffers(
@@ -359,12 +523,12 @@ bool fast::LayerNorm::use_fallback(Stream) {
   return true;
 }
 
-bool fast::RMSNorm::use_fallback(Stream) {
-  return true;
+bool fast::RMSNorm::use_fallback(Stream stream) {
+  return stream.device == Device::cpu || detail::in_tracing();
 }
 
-bool fast::RoPE::use_fallback(Stream) {
-  return true;
+bool fast::RoPE::use_fallback(Stream stream) {
+  return stream.device == Device::cpu || detail::in_tracing();
 }
 
 bool fast::ScaledDotProductAttention::use_fallback(
@@ -390,9 +554,156 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(const array&, Stream) {
 
 VULKAN_NO_GPU_MULTI(fast::LayerNorm)
 VULKAN_NO_GPU_MULTI(fast::LayerNormVJP)
-VULKAN_NO_GPU_MULTI(fast::RMSNorm)
-VULKAN_NO_GPU_MULTI(fast::RMSNormVJP)
-VULKAN_NO_GPU_MULTI(fast::RoPE)
+
+void fast::RMSNorm::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto stream = outputs.empty() ? default_stream(default_device())
+                                : outputs.front().primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+
+  uint32_t n_rows = 0;
+  uint32_t axis_size = 0;
+  uint32_t w_stride = 0;
+  if (can_use_native_rmsnorm_bf16(
+          inputs, outputs, n_rows, axis_size, w_stride)) {
+    try {
+      auto& out = outputs[0];
+      if (!out.data_shared_ptr()) {
+        out.set_data(allocator::malloc(out.nbytes()));
+      }
+
+      auto& device = vulkan::device(stream.device);
+      auto& encoder = device.get_command_encoder(stream.index);
+      encoder.begin_encoding();
+
+      auto x_tensor = device.get_tensor(inputs[0]);
+      auto w_tensor = device.get_tensor(inputs[1]);
+      auto out_tensor = device.get_tensor(out);
+
+      const std::vector<float> push_consts{
+          encode_push_constant_u32(n_rows),
+          encode_push_constant_u32(axis_size),
+          encode_push_constant_u32(w_stride),
+          eps_};
+
+      encoder.record_tensor_sync_device({x_tensor, w_tensor, out_tensor});
+      encoder.record_algo_dispatch(
+          vulkan::KernelRegistry::RMSNORM_BF16,
+          {x_tensor, w_tensor, out_tensor},
+          {n_rows, 1, 1},
+          push_consts);
+      encoder.record_tensor_sync_local({out_tensor});
+      synchronize(stream);
+
+      std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+      return;
+    } catch (const std::exception&) {
+      // Fall through to fallback path.
+    }
+  }
+
+  materialize_and_share_fast_outputs(fallback_(inputs), outputs);
+}
+
+void fast::RMSNormVJP::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto stream = outputs.empty() ? default_stream(default_device())
+                                : outputs.front().primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+  materialize_and_share_fast_outputs(fallback_(inputs), outputs);
+}
+
+void fast::RoPE::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto stream = outputs.empty() ? default_stream(default_device())
+                                : outputs.front().primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+
+  uint32_t n_rows = 0;
+  uint32_t half_dims = 0;
+  uint32_t row_stride = 0;
+  uint32_t t_size = 0;
+  bool with_freqs = false;
+  if (can_use_native_rope_bf16(
+          inputs,
+          outputs,
+          dims_,
+          traditional_,
+          base_,
+          with_freqs,
+          n_rows,
+          half_dims,
+          row_stride,
+          t_size)) {
+    int32_t offset_value = 0;
+    if (read_scalar_offset_i32(inputs[1], offset_value)) {
+      try {
+        auto& out = outputs[0];
+        if (!out.data_shared_ptr()) {
+          out.set_data(allocator::malloc(out.nbytes()));
+        }
+
+        auto& device = vulkan::device(stream.device);
+        auto& encoder = device.get_command_encoder(stream.index);
+        encoder.begin_encoding();
+
+        auto in_tensor = device.get_tensor(inputs[0]);
+        auto out_tensor = device.get_tensor(out);
+
+        const uint32_t offset_bits = static_cast<uint32_t>(offset_value);
+        const uint32_t forward_flag = forward_ ? 1u : 0u;
+        if (with_freqs) {
+          auto freqs_tensor = device.get_tensor(inputs[2]);
+          const std::vector<float> push_consts{
+              encode_push_constant_u32(n_rows),
+              encode_push_constant_u32(half_dims),
+              encode_push_constant_u32(row_stride),
+              encode_push_constant_u32(offset_bits),
+              encode_push_constant_u32(t_size),
+              scale_,
+              encode_push_constant_u32(forward_flag)};
+
+          encoder.record_tensor_sync_device({in_tensor, out_tensor, freqs_tensor});
+          encoder.record_algo_dispatch(
+              vulkan::KernelRegistry::ROPE_BF16_FREQS,
+              {in_tensor, out_tensor, freqs_tensor},
+              {n_rows, 1, 1},
+              push_consts);
+        } else {
+          const std::vector<float> push_consts{
+              encode_push_constant_u32(n_rows),
+              encode_push_constant_u32(half_dims),
+              encode_push_constant_u32(row_stride),
+              encode_push_constant_u32(offset_bits),
+              encode_push_constant_u32(t_size),
+              scale_,
+              std::log2(base_),
+              encode_push_constant_u32(forward_flag)};
+
+          encoder.record_tensor_sync_device({in_tensor, out_tensor});
+          encoder.record_algo_dispatch(
+              vulkan::KernelRegistry::ROPE_BF16_T1,
+              {in_tensor, out_tensor},
+              {n_rows, 1, 1},
+              push_consts);
+        }
+        encoder.record_tensor_sync_local({out_tensor});
+        synchronize(stream);
+
+        std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+        return;
+      } catch (const std::exception&) {
+        // Fall through to fallback path.
+      }
+    }
+  }
+
+  materialize_and_share_fast_outputs(fallback_(inputs), outputs);
+}
+
 VULKAN_NO_GPU_MULTI(fast::ScaledDotProductAttention)
 VULKAN_NO_GPU_MULTI(fast::ScaledDotProductAttentionVJP)
 VULKAN_CPU_FALLBACK_MULTI(fast::ConvertFP8)
@@ -404,22 +715,7 @@ void fast::Quantize::eval_gpu(
   auto stream = outputs.empty() ? default_stream(default_device())
                                 : outputs.front().primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, stream);
-  auto fallback_outputs = fallback_(inputs);
-  if (fallback_outputs.size() != outputs.size()) {
-    throw std::runtime_error(
-        "[Vulkan fast::Quantize] Fallback output arity mismatch.");
-  }
-
-  for (size_t i = 0; i < outputs.size(); ++i) {
-    auto& src = fallback_outputs[i];
-    auto& mutable_src = const_cast<array&>(src);
-    if (mutable_src.status() == array::Status::unscheduled) {
-      mutable_src.eval();
-    } else {
-      mutable_src.wait();
-    }
-    outputs[i].copy_shared_buffer(src);
-  }
+  materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 
 VULKAN_CPU_FALLBACK_MULTI(distributed::AllReduce)

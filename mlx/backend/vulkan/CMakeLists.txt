@@ -86,6 +86,9 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sin.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/cos.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rmsnorm_bf16.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope_bf16_t1.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope_bf16_freqs.comp
 )
 
 # Compile shaders to SPIR-V

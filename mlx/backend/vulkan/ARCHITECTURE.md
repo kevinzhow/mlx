@@ -473,3 +473,31 @@ public:
 ### 9.3 策略
 - 命中条件时走 Vulkan kernel；
 - 不命中条件时保持显式 CPU fallback，确保语义与正确性优先。
+
+## 10. Fast Primitive（当前 Vulkan 覆盖）
+
+### 10.1 已原生化路径
+- `fast::RMSNorm`：`KernelRegistry::RMSNORM_BF16`
+- `fast::RoPE`：`KernelRegistry::ROPE_BF16_T1`（名称沿用，实际已支持 `T>=1`）
+- `fast::RoPE (freqs)`：`KernelRegistry::ROPE_BF16_FREQS`
+
+### 10.2 覆盖条件
+- `RMSNorm`
+  - `x/w/out = bfloat16`
+  - `x` 行连续且输出同形状
+  - `axis_size` 为偶数
+  - `w` 为标量或 1D 连续向量
+- `RoPE`
+  - `bfloat16`
+  - `traditional=false`
+  - `dims == D`，`T >= 1`
+  - `offset` 为标量（`int32/int64`）
+  - `base` 路径：按 `exp2(-p/half_dims * log2(base))` 计算频率
+  - `freqs` 路径：`freqs=float32` 且 1D 连续（长度 `dims/2`）
+  - 位置索引按 `offset + (row % T)` 计算，覆盖 decode 与 prefill 常见形态
+
+### 10.3 仍走 fallback 的场景
+- `RoPE` 的 `traditional=true`
+- `RoPE` 向量 offset
+- `RoPE` 的非连续/非 1D `freqs` 布局
+- `fast::ScaledDotProductAttention`（当前仍未原生化）
