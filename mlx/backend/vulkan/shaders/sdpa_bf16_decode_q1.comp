@@ -1,6 +1,8 @@
 #version 450
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+// One workgroup computes one (batch, query-head) decode row.
+// Threads cooperate on QK dot-products and V accumulation.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer QBuffer {
   uint words[];
@@ -27,6 +29,14 @@ layout(push_constant) uniform PushConstants {
   uint v_dim;
   float scale;
 } params;
+
+const uint WG_SIZE = 64u;
+
+shared float dot_partial[WG_SIZE];
+shared float max_logit_sh;
+shared float weight_sh;
+shared float denom_sh;
+shared float accum_sh[256];
 
 float bf16_to_f32(uint bf16_bits) {
   return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
@@ -73,7 +83,8 @@ void store_out(uint elem_idx, float value) {
 }
 
 void main() {
-  uint bh = gl_GlobalInvocationID.x;
+  uint bh = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
   uint total = params.batch_size * params.n_q_heads;
   if (bh >= total || params.v_dim == 0u || params.v_dim > 256u ||
       params.qk_dim == 0u || params.k_len == 0u || params.n_kv_heads == 0u) {
@@ -91,44 +102,78 @@ void main() {
   uint v_head_base =
       (((b * params.n_kv_heads) + hkv) * params.k_len) * params.v_dim;
 
-  float max_logit = -3.4028235e38;
+  if (lane == 0u) {
+    max_logit_sh = -3.4028235e38;
+    denom_sh = 0.0;
+  }
+  for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
+    accum_sh[dv] = 0.0;
+  }
+  barrier();
+
+  // Pass 1: find row max for numerically stable softmax.
   for (uint t = 0u; t < params.k_len; ++t) {
     uint k_base = k_head_base + t * params.qk_dim;
-    float dot = 0.0;
-    for (uint d = 0u; d < params.qk_dim; ++d) {
-      dot += load_q(q_base + d) * load_k(k_base + d);
+    float partial = 0.0;
+    for (uint d = lane; d < params.qk_dim; d += WG_SIZE) {
+      partial += load_q(q_base + d) * load_k(k_base + d);
     }
-    dot *= params.scale;
-    max_logit = max(max_logit, dot);
+    dot_partial[lane] = partial;
+    barrier();
+
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+      if (lane < stride) {
+        dot_partial[lane] += dot_partial[lane + stride];
+      }
+      barrier();
+    }
+
+    if (lane == 0u) {
+      float dot = dot_partial[0] * params.scale;
+      max_logit_sh = max(max_logit_sh, dot);
+    }
+    barrier();
   }
 
-  float denom = 0.0;
-  float accum[256];
-  for (uint i = 0u; i < params.v_dim; ++i) {
-    accum[i] = 0.0;
-  }
-
+  // Pass 2: online softmax accumulation on V.
   for (uint t = 0u; t < params.k_len; ++t) {
     uint k_base = k_head_base + t * params.qk_dim;
-    float dot = 0.0;
-    for (uint d = 0u; d < params.qk_dim; ++d) {
-      dot += load_q(q_base + d) * load_k(k_base + d);
+    float partial = 0.0;
+    for (uint d = lane; d < params.qk_dim; d += WG_SIZE) {
+      partial += load_q(q_base + d) * load_k(k_base + d);
     }
-    float w = exp(dot * params.scale - max_logit);
-    denom += w;
+    dot_partial[lane] = partial;
+    barrier();
+
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+      if (lane < stride) {
+        dot_partial[lane] += dot_partial[lane + stride];
+      }
+      barrier();
+    }
+
+    if (lane == 0u) {
+      weight_sh = exp(dot_partial[0] * params.scale - max_logit_sh);
+      denom_sh += weight_sh;
+    }
+    barrier();
 
     uint v_base = v_head_base + t * params.v_dim;
-    for (uint dv = 0u; dv < params.v_dim; ++dv) {
-      accum[dv] += w * load_v(v_base + dv);
+    float w = weight_sh;
+    for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
+      accum_sh[dv] += w * load_v(v_base + dv);
     }
+    barrier();
   }
 
-  if (denom == 0.0) {
-    return;
-  }
-  float inv_denom = 1.0 / denom;
-  uint out_base = ((b * params.n_q_heads) + hq) * params.v_dim;
-  for (uint dv = 0u; dv < params.v_dim; ++dv) {
-    store_out(out_base + dv, accum[dv] * inv_denom);
+  if (lane == 0u) {
+    if (denom_sh == 0.0) {
+      return;
+    }
+    float inv_denom = 1.0 / denom_sh;
+    uint out_base = ((b * params.n_q_heads) + hq) * params.v_dim;
+    for (uint dv = 0u; dv < params.v_dim; ++dv) {
+      store_out(out_base + dv, accum_sh[dv] * inv_denom);
+    }
   }
 }

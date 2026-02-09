@@ -880,3 +880,184 @@ python -m unittest discover -v
   - `PYTHONPATH=python`、`TARGET_DEVICE=gpu`
 - 已记录标准 Qwen3 正确性命令（含 `prompt="你好啊"`、`max_tokens=10`）与 split-prefill 检查命令。
 - 已记录常用 debug 环境变量与 native gate 开关，便于后续快速复现实验。
+
+### 2026-02-10 凌晨增量（SDPA 性能影响定量评估）
+
+#### 本轮目标
+- 回答“`SDPA` 对当前 Qwen3 Vulkan 推理性能影响有多大”。
+
+#### 实测口径
+- 模型：`Qwen/Qwen3-0.6B-MLX-4bit`
+- 设备：`TARGET_DEVICE=gpu` + 实卡 Vulkan（`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json`, `MESA_VK_DEVICE_SELECT=1002:1900`）
+- 命令：`python -m mlx_lm.generate --prompt "Hi" --temp 0`
+- 对比项：仅切换 `MLX_VK_ENABLE_SDPA_NATIVE={1,0}`
+
+#### 吞吐结果
+- 40 token 单次对比：
+  - `SDPA=1`：`Generation 1.647 tok/s`
+  - `SDPA=0`：`Generation 1.678 tok/s`
+  - 差异约 `1.9%`（单次噪声量级）
+- 20 token * 3 次重复均值：
+  - `SDPA=1`：`1.895 tok/s`（std `0.004`）
+  - `SDPA=0`：`1.884 tok/s`（std `0.017`）
+  - 差异：`SDPA=1` 仅快 `0.56%`
+
+#### 路径命中诊断
+- 开启 `MLX_VK_DEBUG_SDPA_REJECT=1` 后统计：
+  - 总拒绝：`1176`
+  - `reason=global_gate`：`28`（prefill，`has_mask=1/do_causal=1`）
+  - `reason=dim_bounds`：`1148`（decode，`k_len > 8`）
+- 结论：当前 Qwen3 路径下，`fast::ScaledDotProductAttention` native 基本未命中，`SDPA on/off` 对端到端吞吐影响接近 0。
+
+#### 当前状态
+- `SDPA native` 不是当前主性能瓶颈来源；主耗时仍由 `QuantizedMatmul` 等已命中 native 的路径主导。
+
+#### 下一步（精确）
+1. 先放宽 `SDPA` decode 维度门禁（`k_len` 上限）并保持正确性门禁（Qwen 1/10 token + ctest/Python）。
+2. 再评估 `global_gate`（`has_mask/do_causal`）在 prefill 的可支持范围，逐项放开并增加日志验证。
+3. 每次放宽后复测 A/B 吞吐，确认收益是否超过噪声区间（目标先到 `>5%` 再继续扩展）。
+
+### 2026-02-10 清晨增量（SDPA k_len 门限实验与回归保护）
+
+#### 本轮目标
+- 在不破坏正确性的前提下，验证“放宽 SDPA decode `k_len` 门限”是否能提升 Qwen3 端到端吞吐。
+
+#### 代码改动
+1. 在 `fast::ScaledDotProductAttention` 路径新增可配置门限：
+   - 环境变量：`MLX_VK_SDPA_MAX_K_LEN`
+   - 默认值：`8`（保持现有安全默认）
+   - 生效点：
+     - `can_use_native_sdpa_bf16_decode_q1`
+     - `ScaledDotProductAttention::use_fallback`
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+2. 文档同步：
+   - `ARCHITECTURE.md` 将 `k_len<=8` 更新为 `k_len<=MLX_VK_SDPA_MAX_K_LEN (default=8)`。
+
+#### 实测结论
+- 基线（`max_tokens=20`, prompt=`Hi`）：
+  - `SDPA=0`：`Generation 2.797 tok/s`
+  - `SDPA=1, k_len<=8`：`Generation 2.753 tok/s`（同量级）
+- 放宽门限实验：
+  - `SDPA=1, MLX_VK_SDPA_MAX_K_LEN=16`：`timeout 120s`
+  - `SDPA=1, MLX_VK_SDPA_MAX_K_LEN=32`：`timeout 120s`
+- reject 日志复核：
+  - 默认门限（8）下以 `k_len_cap` 为主（新增细分 reject reason，更易诊断）；
+  - 放宽至大门限后，`dim_bounds` 显著减少，但 decode 吞吐严重退化。
+
+#### 结论与当前状态
+- ✅ 已具备 `k_len` 可配置实验能力（便于后续二分门限与 A/B）。
+- ✅ 默认行为不变（`k_len=8`），避免长上下文 decode 退化。
+- ⚠️ 当前 `sdpa_bf16_decode_q1` 内核在较大 `k_len` 下计算结构/并行度不足，是放宽覆盖的主阻塞。
+
+#### 下一步（精确）
+1. 先优化 SDPA decode kernel 并行结构（避免“一 head 一线程”长循环），再逐步放宽 `MLX_VK_SDPA_MAX_K_LEN` 默认值。
+2. 每次优化后固定复测：
+   - `Hi`/`你好啊` 1/10 token 正确性
+   - `Hi, max_tokens=20/40` 吞吐
+   - `MLX_VK_DEBUG_SDPA_REJECT=1` 命中分布
+3. 在 `k_len>=16` 无明显退化前，不推进 prefill 的 causal/mask 解禁。
+
+### 2026-02-10 研究增量（Metal 对齐 + Ollama/ggml 参考后的 SDPA 新方案）
+
+#### 本轮目标
+- 不直接改 kernel，先完成 SDPA 设计研究并产出可执行的新方案。
+
+#### 研究结论（代码证据）
+- 当前 Vulkan SDPA 首版核心问题：
+  - `sdpa_bf16_decode_q1.comp` 是 `local_size_x=1`，单线程对 `KV` 两次遍历（max + weighted sum），长上下文退化明显。
+  - 代码位置：`mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp`。
+- Metal 的做法不是“单 kernel 全吃”，而是明确双路径：
+  - `Q_len<=8` 走 `sdpa_vector` / `sdpa_vector_2pass`；
+  - `Q_len>8` 走 `sdpa_full_self_attention_*`；
+  - 并根据 `KV`/`GQA`/设备架构切换 1-pass 与 2-pass。
+  - 代码位置：`mlx/backend/metal/scaled_dot_product_attention.cpp`、`mlx/backend/metal/kernels/sdpa_vector.h`。
+- Ollama（ggml-vulkan）做法同样是多路径 + 多 variant：
+  - `scalar / coopmat1 / coopmat2` 三类 flash-attn 路径；
+  - 支持 `split_k` reduce、`mask_opt` 预处理、`GQA` 特殊调度；
+  - 按 `HSK/HSV/small_rows/aligned/f32acc/flags` 选择 pipeline。
+  - 代码位置：`ml/backend/ggml/ggml/src/ggml-vulkan/ggml-vulkan.cpp` 与 `vulkan-shaders/flash_attn*.comp`。
+
+#### 新方案（已写入 ARCHITECTURE）
+- 在 `ARCHITECTURE.md` 新增 `10.4 SDPA v2 方案（Metal 对齐 + Vulkan 实战）`：
+  - 双路径：`vector/decode (Q_len<=8)` + `full/prefill (Q_len>8)`；
+  - `2-pass`、`split_k`、`mask_opt` 作为长上下文与低占用优化组件；
+  - `scalar/subgroup` 兜底，`coopmat` 可选加速；
+  - 明确数值语义与分阶段落地顺序。
+
+#### 当前状态
+- ✅ 已形成可执行的 SDPA v2 架构路线，并完成文档落地（非口头方案）。
+- ⚠️ 仍未进入 kernel 实装阶段，当前运行仍依赖 `SDPA_BF16_DECODE_Q1` 首版。
+
+#### 下一步（精确）
+1. 实作 `Path A` 的 subgroup decode kernel（先替换当前单线程 `Q_len=1` 路径）。
+2. 补 `Path A` 的 2-pass 变体（长 `KV` / `GQA`）并复测 `20/40` token 吞吐。
+3. 再进入 `Path B` prefill tiled kernel（`causal + array mask`），最后引入 `split_k/mask_opt`。
+
+### 2026-02-10 研究增量（SDPA v3 方案收敛 + 代码状态校正）
+
+#### 本轮目标
+- 按“Metal 机制对齐”为主线，结合 Ollama/ggml Vulkan 实现，给出更可执行的 SDPA 新方案。
+- 同时校正当前代码状态，避免研究分支处于不可编译状态。
+
+#### 本轮变更
+1. `ARCHITECTURE.md` 升级 SDPA 方案为 `10.4 SDPA v3`：
+   - 明确 `Path A (Q_len<=8 decode vector)` 与 `Path B (Q_len>8 prefill tiled)` 的 kernel 级分解；
+   - 明确全局 gate 与路径内 gate 的边界（`mask/causal` 从长期全局拒绝改为路径内能力）；
+   - 引入可执行的 pipeline key 设计、`split_k`/`mask_opt` 接入位置、分阶段落地顺序。
+2. 校正 `sdpa_bf16_decode_q1.comp` 的编译问题（中断提交遗留）：
+   - 修复 pass1 中 `dot` 误用变量；
+   - 将 `shared` 变量提升到全局作用域（GLSL 规范要求）；
+   - 通过 `glslc -fshader-stage=compute` 单文件编译校验。
+
+#### 当前状态
+- ✅ SDPA 设计从“方向描述”升级为“可直接实施的分阶段蓝图”（v3）。
+- ✅ 当前在研 `sdpa_bf16_decode_q1.comp` 至少可单独通过 GLSL 编译，不再阻塞后续集成构建。
+- ⚠️ 仍未完成 SPIR-V 头文件更新与全链路性能/正确性门禁验证；当前主运行路径仍受首版 SDPA 覆盖限制。
+
+#### 下一步（精确）
+1. 完成 `Path A` 首阶段集成闭环：
+   - 更新 `sdpa_bf16_decode_q1_spv.h`（与 `.comp` 同步）并重建 `mlx`。
+2. 跑最小门禁：
+   - `python/tests/test_fast_sdpa.py`
+   - `Qwen3` 中英 `10 tokens` 正确性
+   - `MLX_VK_DEBUG_SDPA_REJECT=1` 命中分布
+3. 在 `A1` 稳定后推进 `A2`：
+   - 新增 decode `split_k` stage1/reduce 两个 kernel；
+   - 目标是 `k_len>=16` 不再出现超时退化，再考虑放宽默认 `MLX_VK_SDPA_MAX_K_LEN`。
+
+### 2026-02-10 继续推进（SDPA A1 集成闭环验证）
+
+#### 本轮目标
+- 把 `sdpa_bf16_decode_q1.comp` 的改动真正带入运行时（更新 `spv.h` + 重建 + Python 验证）。
+
+#### 本轮变更
+1. 同步 SPIR-V 头文件：
+   - `glslc -fshader-stage=compute mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp -o mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.spv`
+   - `xxd -i -n sdpa_bf16_decode_q1_spv mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.spv > mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_spv.h`
+2. Release Vulkan 重建：
+   - `cmake -S . -B build_release_vulkan -DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF -DMLX_BUILD_PYTHON_BINDINGS=ON -DCMAKE_BUILD_TYPE=Release`
+   - `cmake --build build_release_vulkan --target mlx -j`
+3. Python 扩展重建：
+   - `CMAKE_ARGS=\"-DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF -DMLX_BUILD_PYTHON_BINDINGS=ON -DCMAKE_BUILD_TYPE=Release\" python3 setup.py build_ext --inplace`
+   - 备注：stubgen 阶段出现 `ImportError: libkompute.so.0` 日志，但构建流程返回成功；运行时通过 `LD_LIBRARY_PATH` 指向 kompute 构建目录可正常执行。
+
+#### 验证结果
+- 设备确认（实卡 Vulkan）：
+  - `default_device = Device(gpu, 0)`
+  - `device_info = {'architecture': 'vulkan', 'device_name': 'Vulkan GPU (Kompute)'}`
+- `python/tests/test_fast_sdpa.py -v`（GPU）：
+  - `Ran 16 tests in 14.504s`
+  - `OK (skipped=1)`
+- Qwen3 正确性冒烟（实卡 Vulkan，10 tokens）：
+  - `prompt="你好啊"`：正常中文输出片段（`<think> 好的，用户发来了一条消息`），`Generation: 3.107 tok/s`
+  - `prompt="Hi what is your name"`：正常英文输出片段（`<think> Okay, the user asked, "Hi`），`Generation: 3.061 tok/s`
+
+#### 当前状态
+- ✅ A1 当前分支改动已经完成“shader -> spv.h -> 构建 -> Python/模型验证”闭环。
+- ✅ SDPA 相关基础正确性未回归（`test_fast_sdpa` + Qwen 中英冒烟均通过）。
+- ⚠️ 仍需进入 A2（decode split-k / 2-pass）以解决 `k_len` 放宽后的长上下文退化。
+
+#### 下一步（精确）
+1. 新增 decode `split_k` 两阶段 kernel（stage1 + reduce）并接入 `fast::ScaledDotProductAttention::eval_gpu`。
+2. 在 `MLX_VK_SDPA_MAX_K_LEN=16/32` 下复测 `Hi` 20/40 tokens，目标是不再 timeout。
+3. 维持门禁：`test_fast_sdpa.py` + Qwen 中英 10-token + `MLX_VK_DEBUG_SDPA_REJECT=1` 分布对比。

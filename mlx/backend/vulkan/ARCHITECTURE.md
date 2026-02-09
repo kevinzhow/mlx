@@ -501,9 +501,87 @@ public:
   - `q/k/v` 均为 4D 行连续
   - `Q_len=1`
   - 无 mask / 无 sinks / 非训练
-  - `k_len<=8`（当前回归保护门限）
+  - `k_len<=MLX_VK_SDPA_MAX_K_LEN`（默认 `8`，可通过环境变量调节）
   - `qk_dim<=256`，`v_dim<=256`
 
 ### 10.3 仍走 fallback 的场景
 - `RoPE` 的非连续/非 1D `freqs` 布局
-- `ScaledDotProductAttention` 的主流场景（`k_len>8`、causal/mask、training、sinks）
+- `ScaledDotProductAttention` 的主流场景（causal/mask、training、sinks，或 `k_len>MLX_VK_SDPA_MAX_K_LEN`）
+
+### 10.4 SDPA v3 方案（Metal 对齐 + Ollama/ggml Vulkan 参考）
+
+#### 目标
+- 直接对齐 Metal 的 `vector/full` 双路径，不再用单一路径硬门限（如固定 `k_len<=8`）承载主推理流。
+- decode 与 prefill 都走 native Vulkan；fallback 仅用于明确未覆盖语义（训练、`output_logsumexp` 等）。
+- 在当前 `Device -> CommandEncoder` 与 lazy scheduling 契约下实现，不引入 side path。
+
+#### Metal 对齐结论（作为设计约束）
+- Metal 明确分路：
+  - `Q_len <= 8`：`sdpa_vector` / `sdpa_vector_2pass`
+  - `Q_len > 8`：`sdpa_full_self_attention_*`
+- `use_fallback` 的“全局拒绝条件”仅保留语义性条件（如 training / logsumexp），不是把 `mask/causal` 永久挡在 native 外。
+- vector 路径按设备与序列长度在 1-pass/2-pass 间切换，full 路径走 tile 化 attention。
+
+#### Ollama/ggml Vulkan 借鉴点
+- 不是单一 pipeline：按 `HSK/HSV/small_rows/aligned/f32acc/flags` 建立 variant cache。
+- path 选择包含 `scalar/coopmat1/coopmat2`，并在不满足共享内存或特性时自动回退到更稳路径。
+- 长 `KV` 场景使用 `split_k`（先算局部 `O/L/M`，后 reduce）。
+- 大 mask 场景先做 `mask_opt`（tile 级 all-`-inf` / all-`0` / mixed），减少主 kernel 无效访存。
+
+#### 目标执行架构（Vulkan）
+- `Path A: Decode Vector`（`Q_len <= 8`，优先 `Q_len=1`）
+  - `A1`: subgroup online-softmax 单 pass（替换当前单线程 decode kernel）
+  - `A2`: 2-pass/split-k（`KV` 大或 occupancy 低时启用）
+  - `A3`: 完整语义增量：`GQA -> causal -> bool/float mask -> sinks`
+- `Path B: Prefill Full`（`Q_len > 8`）
+  - `B1`: `Br x Bc` tiled flash-attn（online `M/L`）
+  - `B2`: `causal + array mask`（广播步幅与 Metal 行为对齐）
+  - `B3`: `split_k` + reduce（长上下文）
+  - `B4`: `mask_opt`（仅大 mask 启用）
+
+#### Gate 策略（新）
+- 保留全局 fallback：
+  - `stream.device == cpu`
+  - `detail::in_tracing()`
+  - `is_training`
+  - `output_logsumexp`（未实现前）
+- 从全局 reject 中移除长期限制：
+  - `has_mask`
+  - `do_causal`
+  - 大部分 `k_len` 上限限制（改为路径内策略）
+- 路径内 gate（首批建议）：
+  - dtype：`bf16` 输入，`f32` 累加，`bf16` 输出
+  - `head_dim`：首批 `64/80/96/128/256`
+  - layout：行连续优先，必要时 copy-unless（对齐 Metal 处理方式）
+
+#### Pipeline Key（建议）
+- `path` (`decode_1pass` / `decode_2pass_stage1` / `decode_2pass_reduce` / `prefill_tile` / `prefill_reduce` / `mask_opt`)
+- `qk_dim`, `v_dim`, `dtype`, `mask_type`, `causal`, `has_sinks`, `aligned`, `acc_mode`, `small_cache`, `split_k_on`
+- 仅在 key 变化时编译/缓存，避免 runtime 反复建 pipeline。
+
+#### 数值与语义要求
+- softmax 统一 online 形式：`M_new = max(M_old, rowmax)`，`L_new = exp(M_old-M_new)*L_old + sum(exp(S-M_new))`。
+- `mask` 行为与 Metal 对齐：
+  - bool mask -> `-inf` 屏蔽
+  - additive mask -> 直接加到 logits
+  - causal 在 `q_len <= k_len` 下与 Metal 同步偏移规则
+- `supports_bool_mask()` 保持 true；训练/VJP 继续 fallback，确保梯度语义不回退。
+
+#### 分阶段落地（执行顺序）
+1. `A1`：替换当前 `sdpa_bf16_decode_q1` 为 subgroup 版本，先解除 `k_len<=8` 的性能阻塞。
+2. `A2`：加 decode split-k reduce，覆盖 `KV` 长场景。
+3. `A3`：补 `causal/mask/sinks` 语义，去掉 `global_gate` 对应拒绝。
+4. `B1/B2`：落地 prefill tile kernel 与 mask/causal。
+5. `B3/B4`：补 `split_k` 与 `mask_opt`，提升长上下文稳定吞吐。
+6. `coopmat`（可选）：仅作为可探测加速 path，不替代 scalar/subgroup 兜底。
+
+#### 验收口径
+- 正确性：
+  - `python/tests/test_fast_sdpa.py`
+  - `Qwen3` 中英 prompt（1/10 token）
+  - `ctest` 全量
+- 覆盖率：
+  - `MLX_VK_DEBUG_SDPA_REJECT` 中 `global_gate/k_len_cap` 明显下降
+- 性能：
+  - decode `20/40` token 吞吐相对当前基线提升且不出现 timeout
+  - prefill（`Q_len>8`）相对 fallback 有稳定收益
