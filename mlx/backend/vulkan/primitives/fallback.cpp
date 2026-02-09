@@ -59,6 +59,34 @@ inline bool is_row_contiguous_materialized(const mlx::core::array& arr) {
   return arr.flags().row_contiguous && arr.data_size() == arr.size();
 }
 
+// Accept dense row-major views even if data_size != size (e.g. KV cache views).
+// This keeps layout constraints strict while allowing sliced/cached buffers.
+inline bool is_dense_row_major_view(const mlx::core::array& arr) {
+  if (!arr.flags().row_contiguous) {
+    return false;
+  }
+  if (arr.ndim() == 0) {
+    return true;
+  }
+
+  int64_t expected = 1;
+  for (int i = arr.ndim() - 1; i >= 0; --i) {
+    const int64_t dim = arr.shape(i);
+    const int64_t stride = arr.strides(i);
+    if (dim <= 0) {
+      return false;
+    }
+    if (dim != 1 && stride != expected) {
+      return false;
+    }
+    if (expected > std::numeric_limits<int64_t>::max() / dim) {
+      return false;
+    }
+    expected *= dim;
+  }
+  return true;
+}
+
 inline bool is_rope_head_seq_transposed_layout(const mlx::core::array& arr) {
   if (arr.ndim() != 4) {
     return false;
@@ -790,10 +818,20 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
       v.dtype() != mlx::core::bfloat16 || out.dtype() != mlx::core::bfloat16) {
     return reject("dtype");
   }
-  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 ||
-      !is_row_contiguous_materialized(q) || !is_row_contiguous_materialized(k) ||
-      !is_row_contiguous_materialized(v) || !out.flags().row_contiguous) {
-    return reject("layout");
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || out.ndim() != 4) {
+    return reject("ndim");
+  }
+  if (!is_dense_row_major_view(q)) {
+    return reject("q_layout");
+  }
+  if (!is_dense_row_major_view(k)) {
+    return reject("k_layout");
+  }
+  if (!is_dense_row_major_view(v)) {
+    return reject("v_layout");
+  }
+  if (!is_dense_row_major_view(out)) {
+    return reject("out_layout");
   }
 
   if (q.shape(0) != k.shape(0) || k.shape(0) != v.shape(0) ||
@@ -1191,9 +1229,9 @@ bool fast::ScaledDotProductAttention::use_fallback(
   if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
     return reject("ndim");
   }
-  if (!is_row_contiguous_materialized(q) ||
-      !is_row_contiguous_materialized(k) ||
-      !is_row_contiguous_materialized(v)) {
+  if (!is_dense_row_major_view(q) ||
+      !is_dense_row_major_view(k) ||
+      !is_dense_row_major_view(v)) {
     return reject("row_contiguous");
   }
 

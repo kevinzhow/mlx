@@ -64,6 +64,15 @@ if(NOT TARGET kompute::kompute)
   message(STATUS "Kompute fetched successfully")
 endif()
 
+if(MLX_BUILD_PYTHON_BINDINGS AND BUILD_SHARED_LIBS AND TARGET kompute)
+  if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+    set_target_properties(kompute PROPERTIES INSTALL_RPATH "@loader_path")
+  elseif(UNIX)
+    set_target_properties(kompute PROPERTIES INSTALL_RPATH "\$ORIGIN")
+  endif()
+  set_target_properties(kompute PROPERTIES BUILD_WITH_INSTALL_RPATH ON)
+endif()
+
 # ============================================================================
 # Shader Compilation
 # ============================================================================

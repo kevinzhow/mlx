@@ -324,6 +324,19 @@ target_include_directories(
   mlx PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}>
              $<INSTALL_INTERFACE:include>)
 
+# Python wheels load libmlx from inside the package tree. Ensure libmlx can
+# resolve its direct shared-library dependencies (e.g. libkompute) from its own
+# directory without requiring user-provided LD_LIBRARY_PATH.
+if(MLX_BUILD_PYTHON_BINDINGS AND BUILD_SHARED_LIBS)
+  if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+    set_target_properties(mlx PROPERTIES INSTALL_RPATH "@loader_path")
+  elseif(UNIX)
+    set_target_properties(mlx PROPERTIES INSTALL_RPATH "\$ORIGIN")
+  endif()
+  # Do not leak build directories into runtime search paths.
+  set_target_properties(mlx PROPERTIES BUILD_WITH_INSTALL_RPATH ON)
+endif()
+
 # Check if fmt is already provided (e.g., by Kompute)
 if(NOT TARGET fmt::fmt AND NOT TARGET fmt::fmt-header-only)
   if(USE_SYSTEM_FMT)
@@ -395,6 +408,21 @@ if(MLX_BUILD_PYTHON_BINDINGS)
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     INCLUDES
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+  if(MLX_BUILD_VULKAN AND TARGET kompute)
+    install(
+      TARGETS kompute
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  endif()
+
+  if(TARGET fmt)
+    install(
+      TARGETS fmt
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  endif()
 else()
   install(
     TARGETS mlx

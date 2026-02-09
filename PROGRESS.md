@@ -1116,3 +1116,46 @@ python -m unittest discover -v
 1. 扩展 SDPA decode native 支持到 cache view 布局（支持 `data_size != size` 的连续切片/stride 形态），提升 Qwen3 实际命中率。
 2. 在命中率提升后再做 `split_k` 规模与阈值调优（`MIN_K_LEN/TARGET_CHUNK/MAX_PARTS`），复测 `20/40` token 吞吐。
 3. 继续推进 prefill 路径（mask/causal）能力拆分，按 Metal 双路径方案逐步解禁并保持 `ctest + test_fast_sdpa + Qwen 中英 10 token` 门禁。
+
+### 2026-02-09 运行时修复（彻底消除 `libkompute.so.0` 手工参数依赖）✅
+
+#### 本轮目标
+- 解决 Python/Vulkan 运行时对 `LD_LIBRARY_PATH` 的硬依赖，避免每次执行都手工补环境变量。
+
+#### 本轮变更
+1. `libmlx.so` 运行时搜索路径修复（Python bindings 构建）：
+   - 文件：`CMakeLists.txt`
+   - 在 `MLX_BUILD_PYTHON_BINDINGS && BUILD_SHARED_LIBS` 条件下设置：
+     - Linux: `INSTALL_RPATH=$ORIGIN`
+     - macOS: `INSTALL_RPATH=@loader_path`
+     - `BUILD_WITH_INSTALL_RPATH=ON`
+2. Python 包内显式安装 Vulkan 依赖库：
+   - 文件：`CMakeLists.txt`
+   - 在 Python install 分支增加：
+     - `install(TARGETS kompute ...)`
+     - `install(TARGETS fmt ...)`（当目标存在时）
+3. `kompute` 自身运行时搜索路径修复：
+   - 文件：`mlx/backend/vulkan/CMakeLists.txt`
+   - 为 `kompute` 设置与上面一致的 `INSTALL_RPATH` + `BUILD_WITH_INSTALL_RPATH=ON`。
+
+#### 验证结果（均未设置 `LD_LIBRARY_PATH`）
+1. 依赖链检查：
+   - `readelf -d python/mlx/lib/libmlx.so` -> `RUNPATH [$ORIGIN]`
+   - `readelf -d python/mlx/lib/libkompute.so.0` -> `RUNPATH [$ORIGIN]`
+   - `ldd python/mlx/lib/libmlx.so` 显示：
+     - `libkompute.so.0 => .../python/mlx/lib/libkompute.so.0`
+     - `libfmt.so.10 => .../python/mlx/lib/libfmt.so.10`
+2. Vulkan 设备识别（实卡参数）：
+   - `env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 PYTHONPATH=python TARGET_DEVICE=gpu python3 -c "..."`
+   - 结果：`Device(gpu, 0)`，`{'architecture': 'vulkan', 'device_name': 'Vulkan GPU (Kompute)'}`
+3. Qwen 1-token 冒烟（实卡参数）：
+   - `timeout 180s env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 PYTHONPATH=python TARGET_DEVICE=gpu python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi" --max-tokens 1 --temp 0`
+   - 结果：成功输出 1 token（`<think>`），无需 `LD_LIBRARY_PATH`。
+
+#### 当前状态
+- ✅ `libkompute.so.0` 运行时加载问题已在构建层面修复，不再需要手工追加 `LD_LIBRARY_PATH`。
+- ✅ 标准 Vulkan 运行命令可统一为 `PYTHONPATH=python TARGET_DEVICE=gpu + (VK_ICD_FILENAMES/MESA_VK_DEVICE_SELECT)`。
+
+#### 下一步（精确）
+1. 提交本轮 CMake 修复（含 `PROGRESS.md`），避免后续回退。
+2. 继续回到主线目标：提升 SDPA native 命中率（尤其 cache view 布局）并复测 Qwen 20/40 token 吞吐。
