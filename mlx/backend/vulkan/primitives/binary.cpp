@@ -5,6 +5,7 @@
 #include "mlx/allocator.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernel_registry.h"
+#include "mlx/backend/vulkan/op_profiler.h"
 #include "mlx/primitives.h"
 #include "mlx/backend/cpu/eval.h"
 #include "mlx/stream.h"
@@ -36,6 +37,13 @@ inline void prepare_inputs_for_cpu_fallback(
     } else {
       mutable_in.wait();
     }
+  }
+}
+
+inline void sync_inputs_to_host_if_needed(const std::vector<array>& inputs) {
+  auto& device = vulkan::device(Device::gpu);
+  for (const auto& in : inputs) {
+    device.sync_array_to_host_if_needed(in);
   }
 }
 
@@ -80,7 +88,8 @@ inline bool dispatch_native_binary(
     const array& b,
     array& out,
     const char* kernel_name,
-    uint32_t work_items) {
+    uint32_t work_items,
+    vulkan::OpProfileScope* profile) {
   try {
     if (!out.data_shared_ptr()) {
       out.set_data(allocator::malloc(out.nbytes()));
@@ -98,16 +107,16 @@ inline bool dispatch_native_binary(
     const uint32_t groups_x = std::max<uint32_t>(1, (work_items + 255u) / 256u);
     const std::vector<float> push_consts{encode_push_constant_u32(n)};
 
-    encoder.record_tensor_sync_device({a_tensor, b_tensor, out_tensor});
+    // Output tensor is write-only for these kernels; avoid redundant H2D upload.
+    encoder.record_tensor_sync_device({a_tensor, b_tensor});
     encoder.record_algo_dispatch(
         kernel_name,
         {a_tensor, b_tensor, out_tensor},
         {groups_x, 1, 1},
         push_consts);
-    encoder.record_tensor_sync_local({out_tensor});
-    synchronize(stream);
-
-    std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+    if (out.data<void>() != out_tensor->rawData()) {
+      device.mark_tensor_host_dirty(out, stream.index);
+    }
     return true;
   } catch (const std::exception&) {
     return false;
@@ -121,6 +130,8 @@ inline bool dispatch_native_binary(
 // ============================================================================
 
 void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("Add");
+
   // Check Vulkan availability
   if (!vulkan::is_available()) {
     throw std::runtime_error("Vulkan not available");
@@ -138,7 +149,8 @@ void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
             inputs[1],
             out,
             vulkan::KernelRegistry::ADD_F32,
-            n)) {
+            n,
+            &profile)) {
       return;
     }
   }
@@ -153,14 +165,19 @@ void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
             inputs[1],
             out,
             vulkan::KernelRegistry::ADD_BF16,
-            n_words)) {
+            n_words,
+            &profile)) {
       return;
     }
   }
 
   // Route through CPU implementation until the Vulkan tensor path is stable.
+  profile.mark_fallback();
+  sync_inputs_to_host_if_needed(inputs);
   eval_cpu(inputs, out);
+  vulkan::device(Device::gpu).invalidate_tensor(out);
   synchronize(default_stream(Device::cpu));
+  profile.mark_sync();
 }
 
 // ============================================================================
@@ -168,6 +185,8 @@ void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
 // ============================================================================
 
 void Multiply::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("Multiply");
+
   if (!vulkan::is_available()) {
     throw std::runtime_error("Vulkan not available");
   }
@@ -185,33 +204,50 @@ void Multiply::eval_gpu(const std::vector<array>& inputs, array& out) {
             inputs[1],
             out,
             vulkan::KernelRegistry::MUL_BF16,
-            n_words)) {
+            n_words,
+            &profile)) {
       return;
     }
   }
 
+  profile.mark_fallback();
+  sync_inputs_to_host_if_needed(inputs);
   eval_cpu(inputs, out);
+  vulkan::device(Device::gpu).invalidate_tensor(out);
   synchronize(default_stream(Device::cpu));
+  profile.mark_sync();
 }
 
 void Subtract::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("Subtract");
   if (!vulkan::is_available()) {
     throw std::runtime_error("Vulkan not available");
   }
-  
-  prepare_inputs_for_cpu_fallback(inputs, out.primitive().stream());
+
+  auto s = out.primitive().stream();
+  profile.mark_fallback();
+  prepare_inputs_for_cpu_fallback(inputs, s);
+  sync_inputs_to_host_if_needed(inputs);
   eval_cpu(inputs, out);
+  vulkan::device(Device::gpu).invalidate_tensor(out);
   synchronize(default_stream(Device::cpu));
+  profile.mark_sync();
 }
 
 void Divide::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("Divide");
   if (!vulkan::is_available()) {
     throw std::runtime_error("Vulkan not available");
   }
-  
-  prepare_inputs_for_cpu_fallback(inputs, out.primitive().stream());
+
+  auto s = out.primitive().stream();
+  profile.mark_fallback();
+  prepare_inputs_for_cpu_fallback(inputs, s);
+  sync_inputs_to_host_if_needed(inputs);
   eval_cpu(inputs, out);
+  vulkan::device(Device::gpu).invalidate_tensor(out);
   synchronize(default_stream(Device::cpu));
+  profile.mark_sync();
 }
 
 } // namespace mlx::core

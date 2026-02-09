@@ -62,12 +62,6 @@ float load_bias_bf16(uint elem_idx) {
   return load_bf16_from_packed(packed, elem_idx);
 }
 
-uint load_w_u8(uint byte_idx) {
-  uint packed = w_buffer.words[byte_idx >> 2u];
-  uint shift = (byte_idx & 3u) * 8u;
-  return (packed >> shift) & 0xFFu;
-}
-
 float compute_output_elem(uint out_elem_idx) {
   uint row = out_elem_idx / params.n;
   uint col = out_elem_idx - row * params.n;
@@ -80,26 +74,30 @@ float compute_output_elem(uint out_elem_idx) {
 
   // Fixed to bits=4 and group_size=128 for this kernel.
   const uint group_size = 128u;
-  const uint packed_bytes_per_group = 64u; // 128 values / 2 per byte
-  const uint w_words_per_group = 16u; // 64 bytes / 4
+  const uint packed_values_per_word = 8u; // 32 bits / 4 bits
+  const uint w_words_per_group = 16u; // 128 values / 8
 
   for (uint g = 0u; g < params.groups_per_col; ++g) {
     float scale = load_scale_bf16(scale_bias_base + g);
     float bias = load_bias_bf16(scale_bias_base + g);
 
     uint x_group_offset = x_row_offset + g * group_size;
-    uint w_group_byte_base = (w_col_word_base + g * w_words_per_group) * 4u;
+    uint x_group_word_base = x_group_offset >> 1u;
+    uint w_group_word_base = w_col_word_base + g * w_words_per_group;
 
-    for (uint kw = 0u; kw < packed_bytes_per_group; ++kw) {
-      uint wi = load_w_u8(w_group_byte_base + kw);
-      float q0 = float(wi & 0xFu);
-      float q1 = float((wi >> 4u) & 0xFu);
-
-      float x0 = load_x_bf16(x_group_offset + kw * 2u);
-      float x1 = load_x_bf16(x_group_offset + kw * 2u + 1u);
-
-      sum += x0 * (scale * q0 + bias);
-      sum += x1 * (scale * q1 + bias);
+    for (uint ww = 0u; ww < w_words_per_group; ++ww) {
+      uint wi = w_buffer.words[w_group_word_base + ww];
+      uint x_word_base = x_group_word_base + ww * 4u;
+      for (uint t = 0u; t < 4u; ++t) {
+        uint x_packed = x_buffer.words[x_word_base + t];
+        uint q_idx = t * 2u;
+        float q0 = float((wi >> (q_idx * 4u)) & 0xFu);
+        float q1 = float((wi >> ((q_idx + 1u) * 4u)) & 0xFu);
+        float x0 = load_bf16_from_packed(x_packed, 0u);
+        float x1 = load_bf16_from_packed(x_packed, 1u);
+        sum += x0 * (scale * q0 + bias);
+        sum += x1 * (scale * q1 + bias);
+      }
     }
   }
 

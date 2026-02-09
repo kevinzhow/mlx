@@ -123,6 +123,7 @@ set(VULKAN_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/gpu_fallback.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gpu_interface.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/kernel_registry.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/op_profiler.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/primitives/binary.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/primitives/unary.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/primitives/fallback.cpp

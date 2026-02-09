@@ -4,6 +4,7 @@
 #include "mlx/allocator.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernel_registry.h"
+#include "mlx/backend/vulkan/op_profiler.h"
 #include "mlx/primitives.h"
 #include "mlx/backend/cpu/unary.h"
 #include "mlx/stream.h"
@@ -38,6 +39,13 @@ inline void prepare_inputs_for_cpu_fallback(
   }
 }
 
+inline void sync_inputs_to_host_if_needed(const std::vector<array>& inputs) {
+  auto& device = vulkan::device(Device::gpu);
+  for (const auto& in : inputs) {
+    device.sync_array_to_host_if_needed(in);
+  }
+}
+
 inline bool can_use_native_unary_f32(
     const array& in,
     const array& out) {
@@ -63,6 +71,8 @@ inline float encode_push_constant_u32(uint32_t value) {
 // ============================================================================
 
 void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("Sin");
+
   if (!vulkan::is_available()) {
     throw std::runtime_error("Vulkan not available");
   }
@@ -95,9 +105,12 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
           {groups_x, 1, 1},
           push_consts);
       encoder.record_tensor_sync_local({out_tensor});
-      synchronize(s);
-      
-      std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+      if (out.data<void>() != out_tensor->rawData()) {
+        synchronize(s);
+        profile.mark_sync();
+        std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+        profile.add_copy_bytes(out.nbytes());
+      }
       return;
     } catch (const std::exception& e) {
       // Fall through to CPU fallback path.
@@ -105,7 +118,10 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   // Route through CPU implementation
+  profile.mark_fallback();
+  sync_inputs_to_host_if_needed(inputs);
   eval_cpu(inputs, out);
+  vulkan::device(Device::gpu).invalidate_tensor(out);
 }
 
 // ============================================================================
@@ -113,6 +129,8 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
 // ============================================================================
 
 void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("Cos");
+
   if (!vulkan::is_available()) {
     throw std::runtime_error("Vulkan not available");
   }
@@ -145,9 +163,12 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
           {groups_x, 1, 1},
           push_consts);
       encoder.record_tensor_sync_local({out_tensor});
-      synchronize(s);
-      
-      std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+      if (out.data<void>() != out_tensor->rawData()) {
+        synchronize(s);
+        profile.mark_sync();
+        std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+        profile.add_copy_bytes(out.nbytes());
+      }
       return;
     } catch (const std::exception& e) {
       // Fall through to CPU fallback path.
@@ -155,7 +176,10 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   // Route through CPU implementation
+  profile.mark_fallback();
+  sync_inputs_to_host_if_needed(inputs);
   eval_cpu(inputs, out);
+  vulkan::device(Device::gpu).invalidate_tensor(out);
 }
 
 } // namespace mlx::core

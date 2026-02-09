@@ -3,6 +3,8 @@
 
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernel_registry.h"
+
+#include <cstring>
 #include <vulkan/vulkan.h>
 
 namespace mlx::core::vulkan {
@@ -47,6 +49,31 @@ struct VulkanAvailabilityProbe {
 const VulkanAvailabilityProbe& vulkan_availability() {
   static const VulkanAvailabilityProbe kProbe{};
   return kProbe;
+}
+
+inline kp::Tensor::TensorDataTypes to_kompute_dtype(Dtype dtype) {
+  switch (dtype) {
+    case bool_:
+      return kp::Tensor::TensorDataTypes::eBool;
+    case uint8:
+    case uint16:
+    case uint32:
+    case uint64:
+      return kp::Tensor::TensorDataTypes::eUnsignedInt;
+    case int8:
+    case int16:
+    case int32:
+    case int64:
+      return kp::Tensor::TensorDataTypes::eInt;
+    case float16:
+    case float32:
+    case bfloat16:
+    case complex64:
+      return kp::Tensor::TensorDataTypes::eFloat;
+    case float64:
+      return kp::Tensor::TensorDataTypes::eDouble;
+  }
+  return kp::Tensor::TensorDataTypes::eFloat;
 }
 
 } // namespace
@@ -267,6 +294,10 @@ Device::Device() {
 Device::~Device() {
   // Cleanup
   stream_map_.clear();
+  {
+    std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+    tensor_cache_.clear();
+  }
   
   if (initialized_buffer_manager_) {
     BufferManager::instance().shutdown();
@@ -287,24 +318,188 @@ std::shared_ptr<Buffer> Device::create_buffer(size_t size) {
 }
 
 std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
-  auto buffer = get_buffer(arr);
-  if (buffer && buffer->tensor()) {
-    return buffer->tensor();
+  const auto key = arr.id();
+  const auto data_ptr = arr.data<void>();
+  const auto nbytes = arr.nbytes();
+  const auto dtype = arr.dtype();
+  const auto data_ref = arr.data_shared_ptr();
+
+  {
+    std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+    auto it = tensor_cache_.find(key);
+    if (it != tensor_cache_.end()) {
+      const bool same_meta =
+          it->second.data_ptr == data_ptr && it->second.nbytes == nbytes &&
+          it->second.dtype == dtype && !it->second.data_ref.expired() &&
+          it->second.data_ref.lock() == data_ref;
+      if (same_meta) {
+        if (auto tensor = it->second.tensor.lock()) {
+          return tensor;
+        }
+      }
+      tensor_cache_.erase(it);
+    }
   }
-  
-  // Create tensor from array data
+
   auto tensor = manager_->tensor(
-      const_cast<void*>(arr.data<void>()),
-      arr.size(),
-      arr.itemsize(),
-      kp::Tensor::TensorDataTypes::eFloat);  // TODO: Map MLX dtype to Kompute type
-  
+      const_cast<void*>(data_ptr),
+      static_cast<uint32_t>(arr.size()),
+      static_cast<uint32_t>(arr.itemsize()),
+      to_kompute_dtype(dtype));
+
+  {
+    std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+    tensor_cache_[key] = TensorCacheEntry{
+        tensor, data_ref, data_ptr, nbytes, dtype, false, -1};
+  }
+
   return tensor;
 }
 
 std::shared_ptr<kp::Tensor> Device::create_tensor(size_t size) {
   std::vector<float> initial_data(size / sizeof(float), 0.0f);
   return manager_->tensor(initial_data);
+}
+
+void Device::invalidate_tensor(const array& arr) {
+  std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+  tensor_cache_.erase(arr.id());
+}
+
+void Device::mark_tensor_host_dirty(const array& arr, int stream_index) {
+  const auto key = arr.id();
+  const auto data_ptr = arr.data<void>();
+  const auto nbytes = arr.nbytes();
+  const auto dtype = arr.dtype();
+  const auto data_ref = arr.data_shared_ptr();
+
+  std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+  auto it = tensor_cache_.find(key);
+  if (it == tensor_cache_.end()) {
+    return;
+  }
+  const bool same_meta =
+      it->second.data_ptr == data_ptr && it->second.nbytes == nbytes &&
+      it->second.dtype == dtype && !it->second.data_ref.expired() &&
+      it->second.data_ref.lock() == data_ref;
+  if (!same_meta || it->second.tensor.expired()) {
+    tensor_cache_.erase(it);
+    return;
+  }
+  it->second.host_dirty = true;
+  it->second.dirty_stream_index = stream_index;
+}
+
+void Device::sync_array_to_host_if_needed(const array& arr) {
+  const auto key = arr.id();
+  const auto data_ptr = arr.data<void>();
+  const auto nbytes = arr.nbytes();
+  const auto dtype = arr.dtype();
+  const auto data_ref = arr.data_shared_ptr();
+
+  std::shared_ptr<kp::Tensor> tensor;
+  {
+    std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+    auto it = tensor_cache_.find(key);
+    if (it == tensor_cache_.end()) {
+      return;
+    }
+    const bool same_meta =
+        it->second.data_ptr == data_ptr && it->second.nbytes == nbytes &&
+        it->second.dtype == dtype && !it->second.data_ref.expired() &&
+        it->second.data_ref.lock() == data_ref;
+    if (!same_meta) {
+      tensor_cache_.erase(it);
+      return;
+    }
+    if (!it->second.host_dirty) {
+      return;
+    }
+    tensor = it->second.tensor.lock();
+    if (!tensor) {
+      tensor_cache_.erase(it);
+      return;
+    }
+  }
+
+  auto seq = manager_->sequence();
+  seq->record<kp::OpTensorSyncLocal>({tensor});
+  seq->eval();
+
+  if (data_ptr != tensor->rawData()) {
+    std::memcpy(const_cast<void*>(data_ptr), tensor->rawData(), nbytes);
+  }
+
+  std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+  auto it = tensor_cache_.find(key);
+  if (it != tensor_cache_.end()) {
+    if (auto cur = it->second.tensor.lock(); cur && cur == tensor) {
+      it->second.host_dirty = false;
+      it->second.dirty_stream_index = -1;
+    }
+  }
+}
+
+void Device::sync_dirty_tensors_for_stream(int stream_index) {
+  struct PendingCopy {
+    std::uintptr_t key{0};
+    std::shared_ptr<kp::Tensor> tensor;
+    std::shared_ptr<array::Data> data_ref;
+    const void* data_ptr{nullptr};
+    size_t nbytes{0};
+  };
+
+  std::vector<PendingCopy> pending;
+  {
+    std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+    for (auto it = tensor_cache_.begin(); it != tensor_cache_.end();) {
+      auto& entry = it->second;
+      if (!entry.host_dirty || entry.dirty_stream_index != stream_index) {
+        ++it;
+        continue;
+      }
+
+      auto tensor = entry.tensor.lock();
+      auto data_ref = entry.data_ref.lock();
+      if (!tensor || !data_ref) {
+        it = tensor_cache_.erase(it);
+        continue;
+      }
+
+      pending.push_back(PendingCopy{
+          it->first, tensor, data_ref, entry.data_ptr, entry.nbytes});
+      ++it;
+    }
+  }
+
+  if (pending.empty()) {
+    return;
+  }
+
+  auto seq = manager_->sequence();
+  for (const auto& item : pending) {
+    seq->record<kp::OpTensorSyncLocal>({item.tensor});
+  }
+  seq->eval();
+
+  for (const auto& item : pending) {
+    if (item.data_ptr != item.tensor->rawData()) {
+      std::memcpy(
+          const_cast<void*>(item.data_ptr), item.tensor->rawData(), item.nbytes);
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+  for (const auto& item : pending) {
+    auto it = tensor_cache_.find(item.key);
+    if (it == tensor_cache_.end()) {
+      continue;
+    }
+    if (auto cur = it->second.tensor.lock(); cur && cur == item.tensor) {
+      it->second.host_dirty = false;
+      it->second.dirty_stream_index = -1;
+    }
+  }
 }
 
 void Device::register_array_buffer(const array& arr, std::shared_ptr<Buffer> buffer) {

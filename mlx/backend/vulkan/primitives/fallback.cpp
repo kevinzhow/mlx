@@ -3,8 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -12,6 +16,7 @@
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernel_registry.h"
+#include "mlx/backend/vulkan/op_profiler.h"
 #include "mlx/distributed/primitives.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
@@ -42,8 +47,194 @@ inline void prepare_inputs_for_cpu_fallback(
   }
 }
 
+inline void sync_inputs_to_host_if_needed(
+    const std::vector<mlx::core::array>& inputs) {
+  auto& device = mlx::core::vulkan::device(mlx::core::Device::gpu);
+  for (const auto& in : inputs) {
+    device.sync_array_to_host_if_needed(in);
+  }
+}
+
 inline bool is_row_contiguous_materialized(const mlx::core::array& arr) {
   return arr.flags().row_contiguous && arr.data_size() == arr.size();
+}
+
+inline bool rope_debug_reject_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_DEBUG_ROPE_REJECT");
+    if (!v) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
+inline void log_rope_reject(
+    const std::vector<mlx::core::array>& inputs,
+    const std::vector<mlx::core::array>& outputs,
+    int dims,
+    bool traditional,
+    float base,
+    const char* reason) {
+  if (!rope_debug_reject_enabled()) {
+    return;
+  }
+
+  auto shape_string = [](const mlx::core::array& a) {
+    std::string s = "[";
+    for (int i = 0; i < a.ndim(); ++i) {
+      if (i > 0) {
+        s += ",";
+      }
+      s += std::to_string(a.shape(i));
+    }
+    s += "]";
+    return s;
+  };
+  auto strides_string = [](const mlx::core::array& a) {
+    std::string s = "[";
+    const auto& st = a.strides();
+    for (size_t i = 0; i < st.size(); ++i) {
+      if (i > 0) {
+        s += ",";
+      }
+      s += std::to_string(st[i]);
+    }
+    s += "]";
+    return s;
+  };
+
+  std::cerr << "[VulkanRoPEReject] reason=" << (reason ? reason : "unknown")
+            << " dims=" << dims
+            << " traditional=" << (traditional ? 1 : 0)
+            << " base=" << base;
+  if (!inputs.empty()) {
+    std::cerr << " in.dtype=" << inputs[0].dtype()
+              << " in.shape=" << shape_string(inputs[0]);
+    std::cerr << " in.strides=" << strides_string(inputs[0]);
+    std::cerr << " in.row=" << (inputs[0].flags().row_contiguous ? 1 : 0);
+  }
+  if (inputs.size() > 1) {
+    std::cerr << " offset.dtype=" << inputs[1].dtype()
+              << " offset.shape=" << shape_string(inputs[1]);
+  }
+  if (inputs.size() > 2) {
+    std::cerr << " freqs.dtype=" << inputs[2].dtype()
+              << " freqs.shape=" << shape_string(inputs[2]);
+  }
+  if (!outputs.empty()) {
+    std::cerr << " out.dtype=" << outputs[0].dtype()
+              << " out.shape=" << shape_string(outputs[0]);
+    std::cerr << " out.strides=" << strides_string(outputs[0]);
+    std::cerr << " out.row=" << (outputs[0].flags().row_contiguous ? 1 : 0);
+  }
+  std::cerr << "\n";
+}
+
+inline kp::Tensor::TensorDataTypes to_kompute_dtype(mlx::core::Dtype dtype) {
+  switch (dtype) {
+    case mlx::core::bool_:
+      return kp::Tensor::TensorDataTypes::eBool;
+    case mlx::core::uint8:
+    case mlx::core::uint16:
+    case mlx::core::uint32:
+    case mlx::core::uint64:
+      return kp::Tensor::TensorDataTypes::eUnsignedInt;
+    case mlx::core::int8:
+    case mlx::core::int16:
+    case mlx::core::int32:
+    case mlx::core::int64:
+      return kp::Tensor::TensorDataTypes::eInt;
+    case mlx::core::float16:
+    case mlx::core::float32:
+    case mlx::core::bfloat16:
+    case mlx::core::complex64:
+      return kp::Tensor::TensorDataTypes::eFloat;
+    case mlx::core::float64:
+      return kp::Tensor::TensorDataTypes::eDouble;
+  }
+  return kp::Tensor::TensorDataTypes::eFloat;
+}
+
+struct CachedQmmConstTensorEntry {
+  std::weak_ptr<kp::Tensor> tensor;
+  const void* data_ptr{nullptr};
+  size_t nbytes{0};
+  mlx::core::Dtype dtype{mlx::core::float32};
+  bool uploaded{false};
+};
+
+struct QmmConstTensorRef {
+  std::uintptr_t key{0};
+  std::shared_ptr<kp::Tensor> tensor;
+  bool needs_sync{true};
+  bool cacheable{false};
+};
+
+std::mutex& qmm_const_tensor_cache_mutex() {
+  static std::mutex mtx;
+  return mtx;
+}
+
+std::unordered_map<std::uintptr_t, CachedQmmConstTensorEntry>&
+qmm_const_tensor_cache() {
+  static std::unordered_map<std::uintptr_t, CachedQmmConstTensorEntry> cache;
+  return cache;
+}
+
+inline QmmConstTensorRef get_qmm_const_tensor(
+    const mlx::core::array& arr,
+    mlx::core::vulkan::Device& device) {
+  // Cache only leaf arrays (model weights/scales/biases). Dynamic graph
+  // temporaries may mutate and should remain uncached.
+  if (arr.has_primitive()) {
+    return {0, device.get_tensor(arr), true, false};
+  }
+
+  auto manager = device.kompute_manager();
+  if (!manager) {
+    return {0, device.get_tensor(arr), true, false};
+  }
+
+  const auto key = arr.id();
+  const void* ptr = arr.data<void>();
+  const size_t nbytes = arr.nbytes();
+  const auto dtype = arr.dtype();
+
+  std::lock_guard<std::mutex> lock(qmm_const_tensor_cache_mutex());
+  auto& cache = qmm_const_tensor_cache();
+  auto it = cache.find(key);
+  if (it != cache.end()) {
+    const bool same_meta =
+        it->second.data_ptr == ptr && it->second.nbytes == nbytes &&
+        it->second.dtype == dtype;
+    if (same_meta) {
+      if (auto tensor = it->second.tensor.lock()) {
+        return {key, tensor, !it->second.uploaded, true};
+      }
+    }
+    cache.erase(it);
+  }
+
+  auto tensor = manager->tensor(
+      const_cast<void*>(ptr),
+      static_cast<uint32_t>(arr.size()),
+      static_cast<uint32_t>(arr.itemsize()),
+      to_kompute_dtype(dtype));
+  cache[key] = CachedQmmConstTensorEntry{
+      tensor, ptr, nbytes, dtype, false};
+  return {key, tensor, true, true};
+}
+
+inline void mark_qmm_const_tensor_uploaded(std::uintptr_t key) {
+  std::lock_guard<std::mutex> lock(qmm_const_tensor_cache_mutex());
+  auto& cache = qmm_const_tensor_cache();
+  auto it = cache.find(key);
+  if (it != cache.end()) {
+    it->second.uploaded = true;
+  }
 }
 
 inline float encode_push_constant_u32(uint32_t value) {
@@ -220,14 +411,22 @@ inline bool can_use_native_rope_bf16(
     uint32_t& row_stride,
     uint32_t& t_size,
     uint32_t& rows_per_batch,
-    uint32_t& offset_is_vector) {
+    uint32_t& offset_is_vector,
+    const char** reject_reason = nullptr) {
+  auto reject = [&](const char* reason) {
+    if (reject_reason) {
+      *reject_reason = reason;
+    }
+    return false;
+  };
+
   if ((inputs.size() != 2 && inputs.size() != 3) || outputs.size() != 1 ||
       outputs[0].size() == 0) {
-    return false;
+    return reject("inputs_or_outputs_shape");
   }
   with_freqs = inputs.size() == 3;
   if (!with_freqs && base <= 0.0f) {
-    return false;
+    return reject("invalid_base");
   }
 
   const auto& in = inputs[0];
@@ -235,40 +434,40 @@ inline bool can_use_native_rope_bf16(
   const auto& out = outputs[0];
   if (in.dtype() != mlx::core::bfloat16 || out.dtype() != mlx::core::bfloat16 ||
       in.shape() != out.shape()) {
-    return false;
+    return reject("dtype_or_shape_mismatch");
   }
   if (!is_row_contiguous_materialized(in) || !out.flags().row_contiguous ||
       in.ndim() < 2) {
-    return false;
+    return reject("in_or_out_layout");
   }
 
   int64_t d = in.shape(-1);
   int64_t t = in.shape(-2);
   if (t <= 0 || d <= 0 || dims <= 0 || dims != d || (dims % 2) != 0) {
-    return false;
+    return reject("dims_constraints");
   }
   if (in.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
       t > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
-    return false;
+    return reject("size_overflow");
   }
 
   const int64_t batch = in.shape(0);
   if (batch <= 0 || batch > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
-    return false;
+    return reject("batch_constraints");
   }
 
   row_stride = static_cast<uint32_t>(d);
   half_dims = static_cast<uint32_t>(dims / 2);
   n_rows = static_cast<uint32_t>(in.size() / static_cast<size_t>(d));
   if (n_rows == 0) {
-    return false;
+    return reject("zero_rows");
   }
   if (with_freqs) {
     const auto& freqs = inputs[2];
     if (freqs.dtype() != mlx::core::float32 || freqs.ndim() != 1 ||
         freqs.shape(0) != static_cast<int64_t>(half_dims) ||
         !is_row_contiguous_materialized(freqs) || freqs.strides()[0] != 1) {
-      return false;
+      return reject("freqs_layout_or_dtype");
     }
   }
 
@@ -276,7 +475,7 @@ inline bool can_use_native_rope_bf16(
     int32_t offset_value = 0;
     if (!read_scalar_offset_i32(offset, offset_value) ||
         !is_row_contiguous_materialized(offset)) {
-      return false;
+      return reject("scalar_offset_constraints");
     }
     (void)offset_value;
     rows_per_batch = 1u;
@@ -285,20 +484,23 @@ inline bool can_use_native_rope_bf16(
     if (offset.dtype() != mlx::core::int32 || offset.ndim() != 1 ||
         offset.shape(0) != batch || !is_row_contiguous_materialized(offset) ||
         offset.strides()[0] != 1) {
-      return false;
+      return reject("vector_offset_constraints");
     }
     const uint32_t batch_u32 = static_cast<uint32_t>(batch);
     if (batch_u32 == 0 || (n_rows % batch_u32) != 0) {
-      return false;
+      return reject("rows_per_batch_divisibility");
     }
     rows_per_batch = n_rows / batch_u32;
     if (rows_per_batch == 0) {
-      return false;
+      return reject("zero_rows_per_batch");
     }
     offset_is_vector = 1u;
   }
 
   t_size = static_cast<uint32_t>(t);
+  if (reject_reason) {
+    *reject_reason = nullptr;
+  }
   return n_rows > 0;
 }
 
@@ -420,7 +622,8 @@ inline void collect_keepalive_buffers(
 template <typename OutputCollector>
 inline void finalize_cpu_fallback(
     const std::vector<mlx::core::array>& inputs,
-    OutputCollector&& collect_outputs) {
+    OutputCollector&& collect_outputs,
+    mlx::core::vulkan::OpProfileScope* profile) {
   auto cpu_stream = mlx::core::default_stream(mlx::core::Device::cpu);
   auto& encoder = mlx::core::cpu::get_command_encoder(cpu_stream);
 
@@ -435,34 +638,51 @@ inline void finalize_cpu_fallback(
       [buffers = std::move(buffers),
        temps = std::move(encoder.temporaries())]() mutable {});
   mlx::core::synchronize(cpu_stream);
+  if (profile) {
+    profile->mark_sync();
+  }
 }
 
 template <typename EvalFn>
 inline void run_cpu_fallback_single(
     const std::vector<mlx::core::array>& inputs,
     mlx::core::array& out,
-    EvalFn&& eval_fn) {
-  prepare_inputs_for_cpu_fallback(inputs, out.primitive().stream());
+    EvalFn&& eval_fn,
+    mlx::core::vulkan::OpProfileScope* profile) {
+  auto stream = out.primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+  sync_inputs_to_host_if_needed(inputs);
   std::forward<EvalFn>(eval_fn)();
-  finalize_cpu_fallback(inputs, [&](auto& buffers) {
-    collect_keepalive_buffers(out, buffers);
-  });
+  mlx::core::vulkan::device(mlx::core::Device::gpu).invalidate_tensor(out);
+  finalize_cpu_fallback(
+      inputs,
+      [&](auto& buffers) { collect_keepalive_buffers(out, buffers); },
+      profile);
 }
 
 template <typename EvalFn>
 inline void run_cpu_fallback_multi(
     const std::vector<mlx::core::array>& inputs,
     std::vector<mlx::core::array>& outputs,
-    EvalFn&& eval_fn) {
+    EvalFn&& eval_fn,
+    mlx::core::vulkan::OpProfileScope* profile) {
   auto stream = outputs.empty() ? mlx::core::default_stream(mlx::core::default_device())
                                 : outputs.front().primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, stream);
+  sync_inputs_to_host_if_needed(inputs);
   std::forward<EvalFn>(eval_fn)();
-  finalize_cpu_fallback(inputs, [&](auto& buffers) {
-    for (const auto& out : outputs) {
-      collect_keepalive_buffers(out, buffers);
-    }
-  });
+  auto& device = mlx::core::vulkan::device(mlx::core::Device::gpu);
+  for (const auto& out : outputs) {
+    device.invalidate_tensor(out);
+  }
+  finalize_cpu_fallback(
+      inputs,
+      [&](auto& buffers) {
+        for (const auto& out : outputs) {
+          collect_keepalive_buffers(out, buffers);
+        }
+      },
+      profile);
 }
 
 } // namespace
@@ -470,12 +690,18 @@ inline void run_cpu_fallback_multi(
 #define VULKAN_CPU_FALLBACK_MULTI(func)                               \
   void func::eval_gpu(                                                \
       const std::vector<array>& inputs, std::vector<array>& outputs) { \
-    run_cpu_fallback_multi(inputs, outputs, [&]() { eval_cpu(inputs, outputs); }); \
+    vulkan::OpProfileScope profile(#func);                            \
+    profile.mark_fallback();                                          \
+    run_cpu_fallback_multi(                                           \
+        inputs, outputs, [&]() { eval_cpu(inputs, outputs); }, &profile); \
   }
 
 #define VULKAN_CPU_FALLBACK(func)                                     \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }); \
+    vulkan::OpProfileScope profile(#func);                            \
+    profile.mark_fallback();                                          \
+    run_cpu_fallback_single(                                          \
+        inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);     \
   }
 
 #define VULKAN_NO_GPU_MULTI(func)                                     \
@@ -487,6 +713,7 @@ inline void run_cpu_fallback_multi(
 namespace mlx::core {
 
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("QuantizedMatmul");
   auto stream = out.primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, stream);
 
@@ -502,9 +729,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       encoder.begin_encoding();
 
       auto x_tensor = device.get_tensor(inputs[0]);
-      auto w_tensor = device.get_tensor(inputs[1]);
-      auto scales_tensor = device.get_tensor(inputs[2]);
-      auto biases_tensor = device.get_tensor(inputs[3]);
+      auto w_cached = get_qmm_const_tensor(inputs[1], device);
+      auto scales_cached = get_qmm_const_tensor(inputs[2], device);
+      auto biases_cached = get_qmm_const_tensor(inputs[3], device);
       auto out_tensor = device.get_tensor(out);
 
       const uint32_t out_elems = static_cast<uint32_t>(out.size());
@@ -524,24 +751,47 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           encode_push_constant_u32(groups_per_col),
           encode_push_constant_u32(w_words_per_col)};
 
-      encoder.record_tensor_sync_device(
-          {x_tensor, w_tensor, scales_tensor, biases_tensor, out_tensor});
+      // Output tensor is fully overwritten by the kernel; no need to upload it.
+      std::vector<std::shared_ptr<kp::Tensor>> sync_tensors{x_tensor};
+      if (w_cached.needs_sync) {
+        sync_tensors.push_back(w_cached.tensor);
+      }
+      if (scales_cached.needs_sync) {
+        sync_tensors.push_back(scales_cached.tensor);
+      }
+      if (biases_cached.needs_sync) {
+        sync_tensors.push_back(biases_cached.tensor);
+      }
+      encoder.record_tensor_sync_device(sync_tensors);
+      if (w_cached.cacheable && w_cached.needs_sync) {
+        mark_qmm_const_tensor_uploaded(w_cached.key);
+      }
+      if (scales_cached.cacheable && scales_cached.needs_sync) {
+        mark_qmm_const_tensor_uploaded(scales_cached.key);
+      }
+      if (biases_cached.cacheable && biases_cached.needs_sync) {
+        mark_qmm_const_tensor_uploaded(biases_cached.key);
+      }
       encoder.record_algo_dispatch(
           vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128,
-          {x_tensor, w_tensor, scales_tensor, biases_tensor, out_tensor},
+          {x_tensor,
+           w_cached.tensor,
+           scales_cached.tensor,
+           biases_cached.tensor,
+           out_tensor},
           {groups_x, 1, 1},
           push_consts);
-      encoder.record_tensor_sync_local({out_tensor});
-      synchronize(stream);
-
-      std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+      if (out.data<void>() != out_tensor->rawData()) {
+        device.mark_tensor_host_dirty(out, stream.index);
+      }
       return;
     } catch (const std::exception&) {
       // Fall through to CPU fallback.
     }
   }
 
-  run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); });
+  profile.mark_fallback();
+  run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);
 }
 
 VULKAN_CPU_FALLBACK(Abs)
@@ -702,6 +952,7 @@ VULKAN_NO_GPU_MULTI(fast::LayerNormVJP)
 void fast::RMSNorm::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  vulkan::OpProfileScope profile("fast::RMSNorm");
   auto stream = outputs.empty() ? default_stream(default_device())
                                 : outputs.front().primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, stream);
@@ -731,37 +982,43 @@ void fast::RMSNorm::eval_gpu(
           encode_push_constant_u32(w_stride),
           eps_};
 
-      encoder.record_tensor_sync_device({x_tensor, w_tensor, out_tensor});
+      // Output tensor is write-only in this dispatch.
+      encoder.record_tensor_sync_device({x_tensor, w_tensor});
       encoder.record_algo_dispatch(
           vulkan::KernelRegistry::RMSNORM_BF16,
           {x_tensor, w_tensor, out_tensor},
           {n_rows, 1, 1},
           push_consts);
-      encoder.record_tensor_sync_local({out_tensor});
-      synchronize(stream);
-
-      std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+      if (out.data<void>() != out_tensor->rawData()) {
+        device.mark_tensor_host_dirty(out, stream.index);
+      }
       return;
     } catch (const std::exception&) {
       // Fall through to fallback path.
     }
   }
 
+  profile.mark_fallback();
+  sync_inputs_to_host_if_needed(inputs);
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 
 void fast::RMSNormVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  vulkan::OpProfileScope profile("fast::RMSNormVJP");
+  profile.mark_fallback();
   auto stream = outputs.empty() ? default_stream(default_device())
                                 : outputs.front().primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, stream);
+  sync_inputs_to_host_if_needed(inputs);
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 
 void fast::RoPE::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  vulkan::OpProfileScope profile("fast::RoPE");
   auto stream = outputs.empty() ? default_stream(default_device())
                                 : outputs.front().primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, stream);
@@ -773,6 +1030,7 @@ void fast::RoPE::eval_gpu(
   uint32_t rows_per_batch = 0;
   uint32_t offset_is_vector = 0;
   bool with_freqs = false;
+  const char* rope_reject_reason = nullptr;
   if (can_use_native_rope_bf16(
           inputs,
           outputs,
@@ -785,7 +1043,8 @@ void fast::RoPE::eval_gpu(
           row_stride,
           t_size,
           rows_per_batch,
-          offset_is_vector)) {
+          offset_is_vector,
+          &rope_reject_reason)) {
     try {
       auto& out = outputs[0];
       if (!out.data_shared_ptr()) {
@@ -815,8 +1074,9 @@ void fast::RoPE::eval_gpu(
             scale_,
             encode_push_constant_u32(forward_flag)};
 
+        // Output tensor is written by the kernel; skip redundant upload.
         encoder.record_tensor_sync_device(
-            {in_tensor, out_tensor, freqs_tensor, offset_tensor});
+            {in_tensor, freqs_tensor, offset_tensor});
         encoder.record_algo_dispatch(
             vulkan::KernelRegistry::ROPE_BF16_FREQS,
             {in_tensor, out_tensor, freqs_tensor, offset_tensor},
@@ -835,30 +1095,35 @@ void fast::RoPE::eval_gpu(
             std::log2(base_),
             encode_push_constant_u32(forward_flag)};
 
+        // Output tensor is written by the kernel; skip redundant upload.
         encoder.record_tensor_sync_device(
-            {in_tensor, out_tensor, offset_tensor});
+            {in_tensor, offset_tensor});
         encoder.record_algo_dispatch(
             vulkan::KernelRegistry::ROPE_BF16_T1,
             {in_tensor, out_tensor, offset_tensor},
             {n_rows, 1, 1},
             push_consts);
       }
-      encoder.record_tensor_sync_local({out_tensor});
-      synchronize(stream);
-
-      std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+      if (out.data<void>() != out_tensor->rawData()) {
+        device.mark_tensor_host_dirty(out, stream.index);
+      }
       return;
     } catch (const std::exception&) {
       // Fall through to fallback path.
     }
   }
 
+  log_rope_reject(
+      inputs, outputs, dims_, traditional_, base_, rope_reject_reason);
+  profile.mark_fallback();
+  sync_inputs_to_host_if_needed(inputs);
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 
 void fast::ScaledDotProductAttention::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  vulkan::OpProfileScope profile("fast::ScaledDotProductAttention");
   auto stream = outputs.empty() ? default_stream(default_device())
                                 : outputs.front().primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, stream);
@@ -906,22 +1171,24 @@ void fast::ScaledDotProductAttention::eval_gpu(
           encode_push_constant_u32(v_dim),
           scale_};
 
-      encoder.record_tensor_sync_device({q_tensor, k_tensor, v_tensor, out_tensor});
+      // Output tensor is write-only in this decode kernel.
+      encoder.record_tensor_sync_device({q_tensor, k_tensor, v_tensor});
       encoder.record_algo_dispatch(
           vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1,
           {q_tensor, k_tensor, v_tensor, out_tensor},
           {n_work, 1, 1},
           push_consts);
-      encoder.record_tensor_sync_local({out_tensor});
-      synchronize(stream);
-
-      std::memcpy(out.data<void>(), out_tensor->rawData(), out.nbytes());
+      if (out.data<void>() != out_tensor->rawData()) {
+        device.mark_tensor_host_dirty(out, stream.index);
+      }
       return;
     } catch (const std::exception&) {
       // Fall through to fallback path.
     }
   }
 
+  profile.mark_fallback();
+  sync_inputs_to_host_if_needed(inputs);
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 
@@ -932,9 +1199,12 @@ VULKAN_NO_GPU_MULTI(fast::CustomKernel)
 void fast::Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  vulkan::OpProfileScope profile("fast::Quantize");
+  profile.mark_fallback();
   auto stream = outputs.empty() ? default_stream(default_device())
                                 : outputs.front().primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, stream);
+  sync_inputs_to_host_if_needed(inputs);
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 

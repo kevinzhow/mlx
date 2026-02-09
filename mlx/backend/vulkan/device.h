@@ -157,6 +157,10 @@ class MLX_API Device {
   // Tensor management (Kompute)
   std::shared_ptr<kp::Tensor> get_tensor(const array& arr);
   std::shared_ptr<kp::Tensor> create_tensor(size_t size);
+  void invalidate_tensor(const array& arr);
+  void mark_tensor_host_dirty(const array& arr, int stream_index);
+  void sync_array_to_host_if_needed(const array& arr);
+  void sync_dirty_tensors_for_stream(int stream_index);
   
   // Queue management
   void new_queue(int index);
@@ -197,6 +201,18 @@ class MLX_API Device {
   // Algorithm cache (equivalent to pipeline cache)
   std::shared_mutex algorithm_mutex_;
   std::unordered_map<std::string, std::shared_ptr<kp::Algorithm>> algorithm_cache_;
+
+  struct TensorCacheEntry {
+    std::weak_ptr<kp::Tensor> tensor;
+    std::weak_ptr<array::Data> data_ref;
+    const void* data_ptr{nullptr};
+    size_t nbytes{0};
+    Dtype dtype{float32};
+    bool host_dirty{false};
+    int dirty_stream_index{-1};
+  };
+  std::mutex tensor_cache_mutex_;
+  std::unordered_map<std::uintptr_t, TensorCacheEntry> tensor_cache_;
   
   // Configuration
   int max_ops_per_buffer_ = 100;

@@ -260,6 +260,72 @@
 - ✅ 首 token 阻塞已解除（`2026-02-09` 晚）  
   旧问题来源于未优化构建 + qmm 单核热点；修复后首 token 在 2 秒量级完成（见上方“新性能验证”）。
 
+### 2026-02-09 深夜增量（热点剖析 + 风险试验回滚）⚙️
+- ✅ 新增 Vulkan 运行时算子级 profiling（`MLX_VK_PROFILE=1`）：
+  - 新文件：`mlx/backend/vulkan/op_profiler.h`、`mlx/backend/vulkan/op_profiler.cpp`
+  - 统计维度：`calls / total_ns / fallback / sync / copy_bytes`
+  - 覆盖接入：`binary.cpp`、`unary.cpp`、`fallback.cpp` 的关键路径（含 `QuantizedMatmul` / `fast::RMSNorm` / `fast::RoPE` / `fast::SDPA`）。
+- ✅ 基于 Qwen3-0.6B-MLX-4bit（`max-tokens=20`）完成热点确认：
+  1. `QuantizedMatmul` ~5.3s（4328 次）
+  2. `fast::RMSNorm` ~0.86s（2483 次）
+  3. `fast::RoPE` ~0.49s（1231 次）
+  4. `Add` ~0.36s（1362 次）
+  全局：`sync=13750`、`copy≈44.79MB`、`fallback_calls=4445/13827`。
+- ⚠️ 试验过一次“按 commit 批量 host 回写 + array-id tensor 缓存 + native 路径去逐算子 sync/memcpy”的激进方案（`buffer.{h,cpp}`/`device.cpp`/相关 primitive）。
+  - 结果：触发明显 correctness 回归（`test_fast`/`test_fast_sdpa`/`test_ops` 多项失败，出现大偏差与 NaN）。
+  - 处理：**当轮已全部回滚该试验改动**，恢复到上一稳定实现，避免引入隐性错误。
+- ✅ 回滚后重新验证通过：
+  - C++：`ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` 通过（`9.47 sec`）
+  - Python 关键集（GPU）：`test_eval/test_fast/test_fast_sdpa/test_ops` 组合 `27` 项通过（`1` skip）
+  - 模型冒烟：`Generation: 10 tokens, 2.971 tokens-per-sec`（prompt=`Hi what is your name`）。
+
+### 2026-02-09 深夜增量（QuantizedMatmul 优化试验 #2）🧪
+- ✅ 按“先做 2（先优化 QuantizedMatmul）”执行了两轮 A/B：
+  1. **QMM 常量 tensor 缓存**（`w/scales/biases` 首次 `sync_device` 后复用）；
+  2. **QMM shader 代数改写试验**（`qdot/xsum` 聚合，减少组内重复 `scale/bias` 运算）。
+- ✅ 试验结论（Qwen3-0.6B-MLX-4bit，`max-tokens=20`，实卡 Vulkan，同口径 profile）：
+  - 基线（`/tmp/vk_profile_qmm_opt2_run3.log`）：`Generation=2.724 tok/s`，`QuantizedMatmul=5300.445 ms`
+  - 缓存版（`/tmp/vk_profile_qmm_cache_final.log`）：`Generation=2.701 tok/s`，`QuantizedMatmul=5292.308 ms`
+  - `sync/copy/fallback` 总量不变：`sync=13750`、`copy=44.793 MB`、`fallback=4445/13827`
+  - 判断：无显著收益（吞吐基本在噪声区间）。
+- ✅ `qdot/xsum` shader 改写已回退（该版样本中 `QuantizedMatmul` 反而上升到约 `5440 ms`，无收益）。
+- ✅ 回归验证通过（当前停在“缓存版 + 原始 QMM kernel 计算式”）：
+  - C++：`ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` 通过（`9.76 sec`）
+  - Python：`DEVICE=gpu PYTHONPATH=python python3 python/tests/test_quantized.py -v` => 运行项 `10/10` 通过（其余按条件 `skip`）。
+- 📌 下一步动作（精确）：
+  1. 在 `QuantizedMatmul -> Add -> fast::RMSNorm` 链路做“无逐算子 `synchronize+memcpy`”小范围 PoC（先不全局替换，先门禁 correctness）。
+  2. 给 PoC 增加强门禁：`ctest 223/223` + `python/tests` 的 `test_eval/test_fast/test_ops/test_quantized` 子集。
+  3. 仅当 PoC 通过门禁后，再扩展到 `fast::RoPE` 与 `fast::SDPA` 主路径。
+
+### 2026-02-09 深夜增量（Metal 对比瓶颈分析）🔬
+- ✅ 基于同口径 Vulkan 实测（`/tmp/vk_profile_qmm_cache_final.log`）：
+  - `total_ms=7322.116`（`20` token 样本）
+  - `QuantizedMatmul=5292.308 ms`（`72.28%`）
+  - `fast::RMSNorm=862.512 ms`（`11.78%`）
+  - `fast::RoPE=468.326 ms`（`6.40%`）
+  - 全局：`calls=13827`、`fallback=4445`、`sync=13750`、`copy=44.793 MB`
+- ✅ 对比 Metal 机制后的核心结论：
+  1. **主瓶颈不是单个 kernel 算术吞吐，而是 GPU/Host 边界过于频繁**：当前 Vulkan 原生路径普遍在算子内执行 `sync_local + synchronize + memcpy`，与 Metal 的“延迟到 stream 级 commit/synchronize”机制不一致。
+  2. **算子覆盖差距仍明显**：Metal 在 GPU 侧对 `binary/unary`、`RMSNorm/RoPE`、`SDPA`、`QuantizedMatmul` 的覆盖更宽；Vulkan 仍有大量路径回退 CPU（尤其 `Matmul/Softmax/Compiled` 等在样本中 100% fallback）。
+  3. **当前 QMM 微优化收益受限**：已验证 `QMM` 常量缓存/代数改写都未带来显著吞吐提升，说明阶段性 ROI 更高的方向是“减少逐算子同步与 host 回写”而非继续抠单 kernel 指令。
+- 📌 对齐 Metal 的下一阶段建议：
+  1. 先做链路级 PoC：`QuantizedMatmul -> Add -> fast::RMSNorm` 去逐算子 `synchronize+memcpy`（保留正确性门禁，不做一次性全局改造）。
+  2. 在 PoC 稳定后，扩展到 `fast::RoPE` 与 `fast::SDPA`，优先降低 `fallback_calls` 与 `sync` 数量，再继续做 kernel 微优化。
+
+### 2026-02-09 深夜增量（边界开销削减：去掉原生路径输出 H2D 上传）⚙️
+- ✅ 改动：在原生 Vulkan 路径中移除输出张量的 `sync_device`（输出为 write-only，不应上传 host 内容）：
+  - `QuantizedMatmul`（`fallback.cpp`）
+  - `fast::RMSNorm / fast::RoPE / fast::SDPA`（`fallback.cpp`）
+  - `binary` 原生派发（`binary.cpp`）
+- ✅ 回归验证：
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过（`14.77 sec`）
+  - `DEVICE=gpu PYTHONPATH=python python3 python/tests/test_quantized.py -v`：运行项 `10/10` 通过（其余按条件 skip）
+- ✅ 同口径性能对比（Qwen3-0.6B-MLX-4bit，`max-tokens=20`）：
+  - 基线（`/tmp/vk_profile_qmm_cache_final.log`）：`Generation=2.701 tok/s`，`total_ms=7322.116`
+  - 本轮（`/tmp/vk_profile_syncdevice_out_removed.log`）：`Generation=2.692 tok/s`，`total_ms=7295.845`
+  - 分项：`QMM 5292.308 -> 5293.175 ms`，`RMS 862.512 -> 868.990 ms`，`RoPE 468.326 -> 456.415 ms`，`Add 356.895 -> 355.966 ms`
+  - 结论：属低风险正确性修正，性能整体在噪声区间（无显著吞吐提升），主瓶颈判断不变（仍是逐算子 sync/host 回写边界）。
+
 ### 当前阻塞
 - 当前验证范围内暂无已复现的 correctness blocker。
 - `PROGRESS.md` 中旧的“Python 失败清单”已过时，保留为历史记录；当前以本节验证结果为准。
@@ -269,6 +335,7 @@
 - 运行环境差异已确认：沙箱内对 `/dev/dri/renderD128` 缺少 `O_RDWR` 权限会退化到 `llvmpipe`；非沙箱可见硬件 Radeon。
 - `python/tests` 在 `DEVICE=gpu` 下的 `test_quantized` 仍有历史问题（`GatherMM` float32 限制与 1 个 qmm 精度阈值失败）；`DEVICE=cpu` 下 `test_quantized` 全通过。该项需单独梳理 Vulkan fallback 与 dtype 契约。
 - 模型端吞吐已从早期 `0.339 tok/s` 提升到 `~2.5 tok/s`，但仍明显偏慢；下一步主要瓶颈转向 `fast::RMSNorm` / `fast::RoPE` / `fast::ScaledDotProductAttention` 的 fallback 与频繁同步。
+- `QuantizedMatmul`“算术侧”微优化（常量缓存/代数改写）在当前链路中收益极小；瓶颈仍以**逐算子同步与 host 回写边界**为主（`sync=13750`、`copy≈44.79MB`）。
 - `fast::RMSNorm` 与 `fast::RoPE` 已有原生覆盖，但仍是**窄覆盖**（RMSNorm 仅 bf16 连续布局；RoPE 对非连续 `freqs` 等布局仍回退）；大量场景仍走 fallback。
 - `fast::ScaledDotProductAttention` 已有**极窄**原生覆盖（`Q_len=1`、`k_len<=8`、无 mask/sinks、非训练）；主路径仍基本 fallback，是当前最大剩余热点之一。
 
@@ -409,10 +476,11 @@
 下一阶段聚焦：
 - 扩展 `QuantizedMatmul` 原生 Vulkan 覆盖（更多 bits/group_size/quant mode 与非 2D 权重布局），持续降低 CPU fallback 占比；
 - 梳理 `DEVICE=gpu` 下 `test_quantized` 失败项（`GatherMM` dtype 限制、qmm 精度阈值）并分离“历史问题”与“新回归”；
+- 在 `Device/Buffer/Tensor` 层先设计“host/device 数据新鲜度状态机”并做**小范围 PoC**（先在 `Add`/`RMSNorm` 验证），通过门禁后再扩展，避免一次性全局替换导致 correctness 回归；
 - 统一使用 Release 构建基线做性能对比，避免无优化构建造成误判。
 
-3. 进入下一轮门禁  
-- C++：`ctest --test-dir build --output-on-failure --timeout 120`
+4. 进入下一轮门禁  
+- C++：`ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`
 - Python：`source venv/bin/activate && cd python/tests && python -m unittest discover -v`
 
 ### 验证门禁
@@ -420,7 +488,7 @@
 **单项测试**:
 ```bash
 # C++ 测试
-ctest --test-dir build -R "test scheduler races" --output-on-failure --timeout 120
+ctest --test-dir build_release_vulkan -R "test scheduler races" --output-on-failure --timeout 120
 
 # Python 单个文件
 source venv/bin/activate && cd python/tests
@@ -431,7 +499,7 @@ python test_ops.py -v
 **全量测试**:
 ```bash
 # C++ 全量
-ctest --test-dir build --stop-on-failure --output-on-failure
+ctest --test-dir build_release_vulkan --stop-on-failure --output-on-failure
 
 # Python 批量
 source venv/bin/activate && cd python/tests
@@ -442,3 +510,57 @@ python -m unittest discover -v
 
 - 每次有实质进展（修复、发现新阻塞、测试里程碑）必须更新本文件。
 - 进入下一轮工作前，先以本文件中的"当前阻塞 + 下一步计划"为执行入口。
+
+---
+
+## 2026-02-09: Vulkan 真实性能复测与瓶颈定位（Metal 对照）🔬
+
+### 本轮变更
+1. 修复 Python 本地重编译阻塞（Vulkan 构建）  
+   - 现象：`setup.py build_ext --inplace` / `pip install -e .` 在 Vulkan+Kompute 下配置阶段报错：  
+     `install(EXPORT "MLXTargets" ...) includes target "mlx" which requires target "kompute" that is not in any export set.`
+   - 处理：仅在 `MLX_BUILD_PYTHON_BINDINGS=ON` 时跳过 CMake package export（保留库安装）。  
+   - 文件：`CMakeLists.txt`
+
+2. 新增 RoPE fallback 诊断（仅调试开关下生效）  
+   - 新增环境变量：`MLX_VK_DEBUG_ROPE_REJECT=1`  
+   - 在 `fast::RoPE` 走 fallback 时打印拒绝原因 + shape/strides（用于定位门禁失配）。  
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+
+### 关键验证结果
+
+1. Vulkan + 实卡确认  
+   - `build_release_vulkan/CMakeCache.txt`：`MLX_BUILD_VULKAN=ON`, `CMAKE_BUILD_TYPE=Release`
+   - `vulkaninfo --summary`：识别 `AMD Radeon Graphics (RADV PHOENIX)`
+
+2. C++ 回归  
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`  
+   - 结果：`223/223 passed`
+
+3. Qwen3-0.6B-MLX-4bit（`hi what is your name`, `--max-tokens 10`, `temp=0`）  
+   - 复测（最新本地扩展）：`Generation: 3.094 tokens-per-sec`  
+   - Profile 聚合（`MLX_VK_PROFILE=1`）：
+     - `QuantizedMatmul`: `48.01%`
+     - `fast::RoPE`: `29.86%`（其中 `55` 次 fallback）
+     - `fast::RMSNorm`: `7.18%`
+     - `Compiled`: `5.44%`
+     - `fallback_total`: `43.21%`
+
+### Metal 对照后的结论
+
+- 当前 RoPE 预填充热点并非 dtype/base/offset 问题，而是 **layout 覆盖缺口**：
+  - `MLX_VK_DEBUG_ROPE_REJECT=1` 统计：`55` 次均为 `reason=in_or_out_layout`
+  - 典型输入：`shape=[1,8,12,128]` / `shape=[1,16,12,128]`
+  - 典型 strides：`[12288,128,1024,1]` / `[24576,128,2048,1]`
+  - 这正是 Metal `rope.cpp` 中已有专门处理的 head/seq transpose 布局（Vulkan 当前未覆盖）。
+
+### 风险与回退说明
+
+- 本轮做过一次“直接放宽 RoPE layout 门禁并改 shader 寻址”的尝试，虽然可消除这 55 次 fallback 并显著降低 profile 时间，但 correctness 未达标（RoPE 单测出现大偏差），因此**未保留该放量改动**。  
+- 当前代码保持保守正确路径：该类布局继续显式 fallback，并保留诊断能力用于下一轮精确修复。
+
+### 下一步（按优先级）
+
+1. 以 Metal `rope.cpp` 为蓝本，设计 Vulkan RoPE 的**正确寻址方案**（先覆盖 head/seq transpose，避免直接放宽门禁）。  
+2. 为该布局补充最小回归用例（至少覆盖 `shape=[B,H,T,D]` + transposed strides），门禁通过后再放量。  
+3. 在 RoPE 稳定后继续压缩 `Compiled/Matmul/Softmax` fallback 链路（目前仍是 decode 阶段稳定热点）。  

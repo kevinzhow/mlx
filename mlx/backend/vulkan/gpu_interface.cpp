@@ -83,6 +83,7 @@ void synchronize(Stream s) {
     auto& d = vulkan::device(s.device);
     d.end_encoding(s.index);
     d.commit_command_buffer(s.index);
+    d.sync_dirty_tensors_for_stream(s.index);
     
     // Get sequence to force completion
     d.get_sequence(s.index);
