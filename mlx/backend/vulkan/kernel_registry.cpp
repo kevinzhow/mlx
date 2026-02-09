@@ -19,6 +19,8 @@
 #include "shaders/rope_bf16_t1_spv.h"
 #include "shaders/rope_bf16_freqs_spv.h"
 #include "shaders/sdpa_bf16_decode_q1_spv.h"
+#include "shaders/sdpa_bf16_decode_splitk_stage1_spv.h"
+#include "shaders/sdpa_bf16_decode_splitk_reduce_spv.h"
 
 namespace mlx::core::vulkan {
 
@@ -38,6 +40,10 @@ const char* KernelRegistry::RMSNORM_BF16 = "rmsnorm_bf16";
 const char* KernelRegistry::ROPE_BF16_T1 = "rope_bf16_t1";
 const char* KernelRegistry::ROPE_BF16_FREQS = "rope_bf16_freqs";
 const char* KernelRegistry::SDPA_BF16_DECODE_Q1 = "sdpa_bf16_decode_q1";
+const char* KernelRegistry::SDPA_BF16_DECODE_SPLITK_STAGE1 =
+    "sdpa_bf16_decode_splitk_stage1";
+const char* KernelRegistry::SDPA_BF16_DECODE_SPLITK_REDUCE =
+    "sdpa_bf16_decode_splitk_reduce";
 
 KernelRegistry& KernelRegistry::instance() {
   static KernelRegistry registry;
@@ -108,6 +114,22 @@ void KernelRegistry::register_builtin_shaders() {
       sdpa_bf16_decode_q1_spv,
       sdpa_bf16_decode_q1_spv_len);
   shaders_[SDPA_BF16_DECODE_Q1] = std::move(sdpa_spirv);
+
+  std::vector<uint32_t> sdpa_splitk_stage1_spirv(
+      (sdpa_bf16_decode_splitk_stage1_spv_len + 3) / 4);
+  std::memcpy(
+      sdpa_splitk_stage1_spirv.data(),
+      sdpa_bf16_decode_splitk_stage1_spv,
+      sdpa_bf16_decode_splitk_stage1_spv_len);
+  shaders_[SDPA_BF16_DECODE_SPLITK_STAGE1] = std::move(sdpa_splitk_stage1_spirv);
+
+  std::vector<uint32_t> sdpa_splitk_reduce_spirv(
+      (sdpa_bf16_decode_splitk_reduce_spv_len + 3) / 4);
+  std::memcpy(
+      sdpa_splitk_reduce_spirv.data(),
+      sdpa_bf16_decode_splitk_reduce_spv,
+      sdpa_bf16_decode_splitk_reduce_spv_len);
+  shaders_[SDPA_BF16_DECODE_SPLITK_REDUCE] = std::move(sdpa_splitk_reduce_spirv);
 }
 
 const std::vector<uint32_t>& KernelRegistry::get_shader(const std::string& name) {

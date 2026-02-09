@@ -145,6 +145,81 @@ inline bool native_sdpa_enabled() {
   return enabled;
 }
 
+inline uint32_t native_sdpa_max_k_len() {
+  static const uint32_t max_k_len = []() -> uint32_t {
+    constexpr uint32_t kDefault = 8u;
+    const char* v = std::getenv("MLX_VK_SDPA_MAX_K_LEN");
+    if (!v || v[0] == '\0') {
+      return kDefault;
+    }
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(v, &end, 10);
+    if (end == v || *end != '\0' || parsed == 0ul) {
+      return kDefault;
+    }
+    if (parsed > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+      return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(parsed);
+  }();
+  return max_k_len;
+}
+
+inline uint32_t parse_env_u32(const char* name, uint32_t default_value) {
+  const char* v = std::getenv(name);
+  if (!v || v[0] == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  unsigned long parsed = std::strtoul(v, &end, 10);
+  if (end == v || *end != '\0') {
+    return default_value;
+  }
+  if (parsed > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+    return std::numeric_limits<uint32_t>::max();
+  }
+  return static_cast<uint32_t>(parsed);
+}
+
+inline uint32_t native_sdpa_splitk_min_k_len() {
+  static const uint32_t value =
+      std::max<uint32_t>(2u, parse_env_u32("MLX_VK_SDPA_SPLITK_MIN_K_LEN", 16u));
+  return value;
+}
+
+inline uint32_t native_sdpa_splitk_target_chunk() {
+  static const uint32_t value = std::max<uint32_t>(
+      1u, parse_env_u32("MLX_VK_SDPA_SPLITK_TARGET_CHUNK", 16u));
+  return value;
+}
+
+inline uint32_t native_sdpa_splitk_max_parts() {
+  static const uint32_t value =
+      std::max<uint32_t>(1u, parse_env_u32("MLX_VK_SDPA_SPLITK_MAX_PARTS", 8u));
+  return value;
+}
+
+inline uint32_t native_sdpa_splitk_forced_parts() {
+  static const uint32_t value = parse_env_u32("MLX_VK_SDPA_SPLIT_K", 0u);
+  return value;
+}
+
+inline uint32_t select_sdpa_split_k(uint32_t k_len) {
+  const uint32_t forced = native_sdpa_splitk_forced_parts();
+  if (forced > 0u) {
+    return std::min<uint32_t>(k_len, std::max<uint32_t>(1u, forced));
+  }
+  if (k_len < native_sdpa_splitk_min_k_len()) {
+    return 1u;
+  }
+  const uint32_t target_chunk = native_sdpa_splitk_target_chunk();
+  uint32_t split_k = (k_len + target_chunk - 1u) / target_chunk;
+  split_k = std::max<uint32_t>(2u, split_k);
+  split_k = std::min<uint32_t>(split_k, native_sdpa_splitk_max_parts());
+  split_k = std::min<uint32_t>(split_k, k_len);
+  return std::max<uint32_t>(1u, split_k);
+}
+
 inline bool native_rope_hs_transposed_enabled() {
   static const bool enabled = []() {
     const char* v = std::getenv("MLX_VK_ENABLE_ROPE_HS_TRANSPOSED");
@@ -693,10 +768,18 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
     uint32_t& n_kv_heads,
     uint32_t& k_len,
     uint32_t& qk_dim,
-    uint32_t& v_dim) {
+    uint32_t& v_dim,
+    const char** reject_reason = nullptr) {
+  auto reject = [&](const char* reason) {
+    if (reject_reason) {
+      *reject_reason = reason;
+    }
+    return false;
+  };
+
   if (has_sinks || output_logsumexp || inputs.size() != 3 ||
       outputs.size() != 1 || outputs[0].size() == 0) {
-    return false;
+    return reject("shape_or_aux");
   }
 
   const auto& q = inputs[0];
@@ -705,21 +788,21 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
   const auto& out = outputs[0];
   if (q.dtype() != mlx::core::bfloat16 || k.dtype() != mlx::core::bfloat16 ||
       v.dtype() != mlx::core::bfloat16 || out.dtype() != mlx::core::bfloat16) {
-    return false;
+    return reject("dtype");
   }
   if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 ||
       !is_row_contiguous_materialized(q) || !is_row_contiguous_materialized(k) ||
       !is_row_contiguous_materialized(v) || !out.flags().row_contiguous) {
-    return false;
+    return reject("layout");
   }
 
   if (q.shape(0) != k.shape(0) || k.shape(0) != v.shape(0) ||
       q.shape(3) != k.shape(3) || k.shape(1) != v.shape(1) ||
       k.shape(2) != v.shape(2) || q.shape(2) != 1) {
-    return false;
+    return reject("shape_contract");
   }
   if (do_causal && q.shape(2) != 1) {
-    return false;
+    return reject("causal_q_len");
   }
 
   const int64_t b = q.shape(0);
@@ -730,17 +813,17 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
   const int64_t dv = v.shape(3);
   if (b <= 0 || hq <= 0 || hkv <= 0 || lk <= 0 || dq <= 0 || dv <= 0 ||
       (hq % hkv) != 0) {
-    return false;
+    return reject("dim_nonpositive_or_head_repeat");
   }
-  if (lk > 8) {
-    return false;
+  if (lk > static_cast<int64_t>(native_sdpa_max_k_len())) {
+    return reject("k_len_cap");
   }
   if (dq > 256 || dv > 256) {
-    return false;
+    return reject("dim_bounds");
   }
   if ((q.size() % 2) != 0 || (k.size() % 2) != 0 || (v.size() % 2) != 0 ||
       (out.size() % 2) != 0) {
-    return false;
+    return reject("bf16_pack");
   }
   if (b > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
       hq > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
@@ -748,12 +831,12 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
       lk > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
       dq > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
       dv > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
-    return false;
+    return reject("u32_overflow");
   }
 
   if (out.ndim() != 4 || out.shape(0) != b || out.shape(1) != hq ||
       out.shape(2) != 1 || out.shape(3) != dv) {
-    return false;
+    return reject("output_shape");
   }
 
   batch_size = static_cast<uint32_t>(b);
@@ -762,6 +845,9 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
   k_len = static_cast<uint32_t>(lk);
   qk_dim = static_cast<uint32_t>(dq);
   v_dim = static_cast<uint32_t>(dv);
+  if (reject_reason) {
+    *reject_reason = nullptr;
+  }
   return true;
 }
 
@@ -1089,6 +1175,10 @@ bool fast::ScaledDotProductAttention::use_fallback(
     return true;
   };
 
+  if (!native_sdpa_enabled()) {
+    return reject("native_disabled");
+  }
+
   if (stream.device == Device::cpu || detail::in_tracing() || has_mask ||
       do_causal || is_training || output_logsumexp) {
     return reject("global_gate");
@@ -1101,8 +1191,9 @@ bool fast::ScaledDotProductAttention::use_fallback(
   if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
     return reject("ndim");
   }
-  if (!q.flags().row_contiguous || !k.flags().row_contiguous ||
-      !v.flags().row_contiguous) {
+  if (!is_row_contiguous_materialized(q) ||
+      !is_row_contiguous_materialized(k) ||
+      !is_row_contiguous_materialized(v)) {
     return reject("row_contiguous");
   }
 
@@ -1114,7 +1205,13 @@ bool fast::ScaledDotProductAttention::use_fallback(
   if (k.shape(1) <= 0 || (q.shape(1) % k.shape(1)) != 0) {
     return reject("head_repeat");
   }
-  if (k.shape(2) <= 0 || k.shape(2) > 8 || q.shape(3) <= 0 || q.shape(3) > 256 ||
+  if (k.shape(2) <= 0) {
+    return reject("k_len_nonpositive");
+  }
+  if (k.shape(2) > static_cast<int64_t>(native_sdpa_max_k_len())) {
+    return reject("k_len_cap");
+  }
+  if (q.shape(3) <= 0 || q.shape(3) > 256 ||
       v.shape(3) <= 0 || v.shape(3) > 256) {
     return reject("dim_bounds");
   }
@@ -1142,7 +1239,6 @@ void fast::RMSNorm::eval_gpu(
   vulkan::OpProfileScope profile("fast::RMSNorm");
   auto stream = outputs.empty() ? default_stream(default_device())
                                 : outputs.front().primitive().stream();
-  prepare_inputs_for_cpu_fallback(inputs, stream);
 
   uint32_t n_rows = 0;
   uint32_t axis_size = 0;
@@ -1193,7 +1289,6 @@ void fast::RMSNorm::eval_gpu(
   }
 
   profile.mark_fallback();
-  sync_inputs_to_host_if_needed(inputs);
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 
@@ -1202,10 +1297,6 @@ void fast::RMSNormVJP::eval_gpu(
     std::vector<array>& outputs) {
   vulkan::OpProfileScope profile("fast::RMSNormVJP");
   profile.mark_fallback();
-  auto stream = outputs.empty() ? default_stream(default_device())
-                                : outputs.front().primitive().stream();
-  prepare_inputs_for_cpu_fallback(inputs, stream);
-  sync_inputs_to_host_if_needed(inputs);
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 
@@ -1215,7 +1306,6 @@ void fast::RoPE::eval_gpu(
   vulkan::OpProfileScope profile("fast::RoPE");
   auto stream = outputs.empty() ? default_stream(default_device())
                                 : outputs.front().primitive().stream();
-  prepare_inputs_for_cpu_fallback(inputs, stream);
 
   uint32_t n_rows = 0;
   uint32_t half_dims = 0;
@@ -1347,7 +1437,6 @@ void fast::RoPE::eval_gpu(
   log_rope_reject(
       inputs, outputs, dims_, traditional_, base_, rope_reject_reason);
   profile.mark_fallback();
-  sync_inputs_to_host_if_needed(inputs);
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 
@@ -1357,7 +1446,6 @@ void fast::ScaledDotProductAttention::eval_gpu(
   vulkan::OpProfileScope profile("fast::ScaledDotProductAttention");
   auto stream = outputs.empty() ? default_stream(default_device())
                                 : outputs.front().primitive().stream();
-  prepare_inputs_for_cpu_fallback(inputs, stream);
 
   uint32_t batch_size = 0;
   uint32_t n_q_heads = 0;
@@ -1365,6 +1453,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
   uint32_t k_len = 0;
   uint32_t qk_dim = 0;
   uint32_t v_dim = 0;
+  uint32_t split_k = 1;
+  const char* native_reject_reason = nullptr;
   if (native_sdpa_enabled() && can_use_native_sdpa_bf16_decode_q1(
           inputs,
           outputs,
@@ -1376,7 +1466,9 @@ void fast::ScaledDotProductAttention::eval_gpu(
           n_kv_heads,
           k_len,
           qk_dim,
-          v_dim)) {
+          v_dim,
+          &native_reject_reason)) {
+    split_k = select_sdpa_split_k(k_len);
     try {
       auto& out = outputs[0];
       if (!out.data_shared_ptr()) {
@@ -1392,16 +1484,6 @@ void fast::ScaledDotProductAttention::eval_gpu(
       auto v_tensor = device.get_tensor(inputs[2]);
       auto out_tensor = device.get_tensor(out);
 
-      const uint32_t n_work = batch_size * n_q_heads;
-      const std::vector<uint32_t> push_consts{
-          encode_push_constant_u32(batch_size),
-          encode_push_constant_u32(n_q_heads),
-          encode_push_constant_u32(n_kv_heads),
-          encode_push_constant_u32(k_len),
-          encode_push_constant_u32(qk_dim),
-          encode_push_constant_u32(v_dim),
-          encode_push_constant_f32(scale_)};
-
       // Output tensor is write-only in this decode kernel.
       std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
       if (device.tensor_needs_sync_device(inputs[0])) {
@@ -1416,20 +1498,108 @@ void fast::ScaledDotProductAttention::eval_gpu(
       if (!sync_tensors.empty()) {
         encoder.record_tensor_sync_device(sync_tensors);
       }
-      encoder.record_algo_dispatch(
-          vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1,
-          {q_tensor, k_tensor, v_tensor, out_tensor},
-          {n_work, 1, 1},
-          push_consts);
+
+      const uint64_t n_rows_u64 =
+          static_cast<uint64_t>(batch_size) * static_cast<uint64_t>(n_q_heads);
+      if (n_rows_u64 == 0u ||
+          n_rows_u64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+        throw std::runtime_error("[Vulkan SDPA] row shape overflow.");
+      }
+      const uint32_t n_rows = static_cast<uint32_t>(n_rows_u64);
+      if (split_k <= 1u) {
+        const std::vector<uint32_t> push_consts{
+            encode_push_constant_u32(batch_size),
+            encode_push_constant_u32(n_q_heads),
+            encode_push_constant_u32(n_kv_heads),
+            encode_push_constant_u32(k_len),
+            encode_push_constant_u32(qk_dim),
+            encode_push_constant_u32(v_dim),
+            encode_push_constant_f32(scale_)};
+
+        encoder.record_algo_dispatch(
+            vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1,
+            {q_tensor, k_tensor, v_tensor, out_tensor},
+            {n_rows, 1, 1},
+            push_consts);
+      } else {
+        auto manager = device.kompute_manager();
+        if (!manager) {
+          throw std::runtime_error("[Vulkan SDPA] Missing Kompute manager.");
+        }
+
+        const uint64_t partial_rows_u64 =
+            n_rows_u64 * static_cast<uint64_t>(split_k);
+        const uint64_t partial_o_elems_u64 =
+            partial_rows_u64 * static_cast<uint64_t>(v_dim);
+        if (partial_rows_u64 == 0u ||
+            partial_rows_u64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+            partial_rows_u64 > std::numeric_limits<size_t>::max() ||
+            partial_o_elems_u64 == 0u ||
+            partial_o_elems_u64 > std::numeric_limits<size_t>::max()) {
+          throw std::runtime_error("[Vulkan SDPA] split-k temporary shape overflow.");
+        }
+
+        const size_t partial_rows = static_cast<size_t>(partial_rows_u64);
+        const size_t partial_o_elems = static_cast<size_t>(partial_o_elems_u64);
+        auto partial_o_tensor = manager->tensor(std::vector<float>(partial_o_elems, 0.0f));
+        auto partial_m_tensor = manager->tensor(std::vector<float>(partial_rows, 0.0f));
+        auto partial_l_tensor = manager->tensor(std::vector<float>(partial_rows, 0.0f));
+
+        const std::vector<uint32_t> stage1_push_consts{
+            encode_push_constant_u32(batch_size),
+            encode_push_constant_u32(n_q_heads),
+            encode_push_constant_u32(n_kv_heads),
+            encode_push_constant_u32(k_len),
+            encode_push_constant_u32(qk_dim),
+            encode_push_constant_u32(v_dim),
+            encode_push_constant_u32(split_k),
+            encode_push_constant_f32(scale_)};
+
+        encoder.record_algo_dispatch(
+            vulkan::KernelRegistry::SDPA_BF16_DECODE_SPLITK_STAGE1,
+            {q_tensor,
+             k_tensor,
+             v_tensor,
+             partial_o_tensor,
+             partial_m_tensor,
+             partial_l_tensor},
+            {static_cast<uint32_t>(partial_rows_u64), 1, 1},
+            stage1_push_consts);
+
+        const std::vector<uint32_t> reduce_push_consts{
+            encode_push_constant_u32(batch_size),
+            encode_push_constant_u32(n_q_heads),
+            encode_push_constant_u32(v_dim),
+            encode_push_constant_u32(split_k)};
+
+        encoder.record_algo_dispatch(
+            vulkan::KernelRegistry::SDPA_BF16_DECODE_SPLITK_REDUCE,
+            {partial_o_tensor, partial_m_tensor, partial_l_tensor, out_tensor},
+            {n_rows, 1, 1},
+            reduce_push_consts);
+      }
       device.mark_tensor_host_dirty(out, stream.index);
       return;
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+      if (sdpa_debug_reject_enabled() ||
+          env_flag_default_false("MLX_VK_DEBUG_SDPA_ERROR")) {
+        std::cerr << "[VulkanSDPAError] native path failed: " << e.what()
+                  << " split_k=" << split_k << " k_len=" << k_len
+                  << " qk_dim=" << qk_dim << " v_dim=" << v_dim << "\n";
+      }
       // Fall through to fallback path.
     }
   }
 
+  if (native_sdpa_enabled() &&
+      (sdpa_debug_reject_enabled() ||
+       env_flag_default_false("MLX_VK_DEBUG_SDPA_ERROR")) &&
+      native_reject_reason) {
+    std::cerr << "[VulkanSDPANativeReject] reason=" << native_reject_reason
+              << "\n";
+  }
+
   profile.mark_fallback();
-  sync_inputs_to_host_if_needed(inputs);
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 
@@ -1442,10 +1612,6 @@ void fast::Quantize::eval_gpu(
     std::vector<array>& outputs) {
   vulkan::OpProfileScope profile("fast::Quantize");
   profile.mark_fallback();
-  auto stream = outputs.empty() ? default_stream(default_device())
-                                : outputs.front().primitive().stream();
-  prepare_inputs_for_cpu_fallback(inputs, stream);
-  sync_inputs_to_host_if_needed(inputs);
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
 

@@ -1,0 +1,193 @@
+#version 450
+
+// Stage 1 for decode SDPA split-k:
+// each workgroup computes one (row, split) partial tuple:
+// - partial row max (m)
+// - partial row exp sum (l)
+// - partial unnormalized weighted value sum (o)
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuffer {
+  uint words[];
+} q_buffer;
+
+layout(set = 0, binding = 1) readonly buffer KBuffer {
+  uint words[];
+} k_buffer;
+
+layout(set = 0, binding = 2) readonly buffer VBuffer {
+  uint words[];
+} v_buffer;
+
+layout(set = 0, binding = 3) buffer PartialOBuffer {
+  float values[];
+} partial_o_buffer;
+
+layout(set = 0, binding = 4) buffer PartialMBuffer {
+  float values[];
+} partial_m_buffer;
+
+layout(set = 0, binding = 5) buffer PartialLBuffer {
+  float values[];
+} partial_l_buffer;
+
+layout(push_constant) uniform PushConstants {
+  uint batch_size;
+  uint n_q_heads;
+  uint n_kv_heads;
+  uint k_len;
+  uint qk_dim;
+  uint v_dim;
+  uint split_k;
+  float scale;
+} params;
+
+const uint WG_SIZE = 64u;
+
+shared float dot_partial[WG_SIZE];
+shared float max_logit_sh;
+shared float weight_sh;
+shared float denom_sh;
+shared float accum_sh[256];
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+float load_q(uint elem_idx) {
+  uint packed = q_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float load_k(uint elem_idx) {
+  uint packed = k_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float load_v(uint elem_idx) {
+  uint packed = v_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+void main() {
+  uint gid = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+
+  uint n_rows = params.batch_size * params.n_q_heads;
+  uint total = n_rows * params.split_k;
+  if (gid >= total || params.split_k == 0u || params.v_dim == 0u ||
+      params.v_dim > 256u || params.qk_dim == 0u || params.k_len == 0u ||
+      params.n_kv_heads == 0u) {
+    return;
+  }
+
+  uint row = gid / params.split_k;
+  uint part = gid % params.split_k;
+
+  uint b = row / params.n_q_heads;
+  uint hq = row % params.n_q_heads;
+  uint repeats = params.n_q_heads / params.n_kv_heads;
+  uint hkv = hq / repeats;
+
+  uint q_base = ((b * params.n_q_heads) + hq) * params.qk_dim;
+  uint k_head_base =
+      (((b * params.n_kv_heads) + hkv) * params.k_len) * params.qk_dim;
+  uint v_head_base =
+      (((b * params.n_kv_heads) + hkv) * params.k_len) * params.v_dim;
+
+  uint chunk = (params.k_len + params.split_k - 1u) / params.split_k;
+  uint start_t = part * chunk;
+  uint end_t = min(params.k_len, start_t + chunk);
+
+  uint partial_idx = row * params.split_k + part;
+  uint partial_o_base = partial_idx * params.v_dim;
+
+  if (lane == 0u) {
+    max_logit_sh = -3.4028235e38;
+    denom_sh = 0.0;
+  }
+  for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
+    accum_sh[dv] = 0.0;
+  }
+  barrier();
+
+  if (start_t >= end_t) {
+    if (lane == 0u) {
+      partial_m_buffer.values[partial_idx] = -3.4028235e38;
+      partial_l_buffer.values[partial_idx] = 0.0;
+    }
+    for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
+      partial_o_buffer.values[partial_o_base + dv] = 0.0;
+    }
+    return;
+  }
+
+  // Pass 1: row max in this split.
+  for (uint t = start_t; t < end_t; ++t) {
+    uint k_base = k_head_base + t * params.qk_dim;
+    float partial = 0.0;
+    for (uint d = lane; d < params.qk_dim; d += WG_SIZE) {
+      partial += load_q(q_base + d) * load_k(k_base + d);
+    }
+    dot_partial[lane] = partial;
+    barrier();
+
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+      if (lane < stride) {
+        dot_partial[lane] += dot_partial[lane + stride];
+      }
+      barrier();
+    }
+
+    if (lane == 0u) {
+      float dot = dot_partial[0] * params.scale;
+      max_logit_sh = max(max_logit_sh, dot);
+    }
+    barrier();
+  }
+
+  // Pass 2: exp sum + weighted V sum in this split.
+  for (uint t = start_t; t < end_t; ++t) {
+    uint k_base = k_head_base + t * params.qk_dim;
+    float partial = 0.0;
+    for (uint d = lane; d < params.qk_dim; d += WG_SIZE) {
+      partial += load_q(q_base + d) * load_k(k_base + d);
+    }
+    dot_partial[lane] = partial;
+    barrier();
+
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+      if (lane < stride) {
+        dot_partial[lane] += dot_partial[lane + stride];
+      }
+      barrier();
+    }
+
+    if (lane == 0u) {
+      weight_sh = exp(dot_partial[0] * params.scale - max_logit_sh);
+      denom_sh += weight_sh;
+    }
+    barrier();
+
+    uint v_base = v_head_base + t * params.v_dim;
+    float w = weight_sh;
+    for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
+      accum_sh[dv] += w * load_v(v_base + dv);
+    }
+    barrier();
+  }
+
+  if (lane == 0u) {
+    partial_m_buffer.values[partial_idx] = max_logit_sh;
+    partial_l_buffer.values[partial_idx] = denom_sh;
+  }
+  for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
+    partial_o_buffer.values[partial_o_base + dv] = accum_sh[dv];
+  }
+}

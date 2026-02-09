@@ -1061,3 +1061,58 @@ python -m unittest discover -v
 1. 新增 decode `split_k` 两阶段 kernel（stage1 + reduce）并接入 `fast::ScaledDotProductAttention::eval_gpu`。
 2. 在 `MLX_VK_SDPA_MAX_K_LEN=16/32` 下复测 `Hi` 20/40 tokens，目标是不再 timeout。
 3. 维持门禁：`test_fast_sdpa.py` + Qwen 中英 10-token + `MLX_VK_DEBUG_SDPA_REJECT=1` 分布对比。
+
+### 2026-02-10 继续推进（SDPA A2 split-k 落地 + 门禁一致性修复）
+
+#### 本轮目标
+- 完成 SDPA A2：decode `split_k` 两阶段 kernel（stage1/reduce）接入 Vulkan 路径。
+- 解决 `MLX_VK_SDPA_MAX_K_LEN=16/32` 实测 timeout。
+
+#### 本轮变更
+1. 新增 SDPA split-k kernel 与注册：
+   - 新增 shader：
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp`
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_reduce.comp`
+   - 新增 SPIR-V 头：
+     - `sdpa_bf16_decode_splitk_stage1_spv.h`
+     - `sdpa_bf16_decode_splitk_reduce_spv.h`
+   - `KernelRegistry` 注册新 kernel：
+     - `SDPA_BF16_DECODE_SPLITK_STAGE1`
+     - `SDPA_BF16_DECODE_SPLITK_REDUCE`
+   - `mlx/backend/vulkan/CMakeLists.txt` 增加新 shader 编译项。
+2. `fast::ScaledDotProductAttention::eval_gpu` 接入 split-k 调度：
+   - 增加 `split_k` 选择逻辑（支持 `MLX_VK_SDPA_SPLIT_K` 强制值）。
+   - `split_k==1` 走原 `SDPA_BF16_DECODE_Q1`。
+   - `split_k>1` 走 `stage1 + reduce` 两次 dispatch。
+3. 修复 SDPA 门禁与运行时条件不一致导致的卡死：
+   - `ScaledDotProductAttention::use_fallback` 增加 `native_disabled` 显式拒绝（`MLX_VK_ENABLE_SDPA_NATIVE=0` 时不创建 fast primitive）。
+   - `use_fallback` 的布局门禁从仅 `row_contiguous flag` 收紧为 `is_row_contiguous_materialized`（与 native can-use 对齐，避免“构图通过、运行时 native 拒绝”）。
+   - 为 native can-use 增加 reject reason（调试输出 `VulkanSDPANativeReject`），用于定位不命中原因。
+4. fast fallback 执行路径去除不必要的 `prepare/sync` 预处理（`RMSNorm/RMSNormVJP/RoPE/SDPA/Quantize`），降低自等待风险。
+
+#### 验证结果
+- 构建：
+  - `cmake --build build_release_vulkan --target mlx -j` ✅
+  - `python3 setup.py build_ext --inplace` ✅（仍有 stubgen `libkompute.so.0` 提示，运行时 `LD_LIBRARY_PATH` 已可正常执行）
+- C++ 门禁：
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+- Python SDPA 门禁：
+  - `python3 python/tests/test_fast_sdpa.py -v` => `16 passed, 1 skipped` ✅
+- Qwen3 正确性冒烟（实卡 Vulkan）：
+  - `prompt="你好啊", max_tokens=10` ✅（正常中文输出）
+  - `prompt="Hi what is your name", max_tokens=10` ✅（正常英文输出）
+- timeout 回归复测（实卡 Vulkan）：
+  - `MLX_VK_SDPA_MAX_K_LEN=16, prompt="Hi", max_tokens=20`：不再 timeout，`2.581 tok/s` ✅
+  - `MLX_VK_SDPA_MAX_K_LEN=32, prompt="Hi", max_tokens=40`：不再 timeout，`2.429 tok/s` ✅
+- 命中分布诊断：
+  - decode 阶段主要拒绝为 `reason=row_contiguous`（`k/v` 为 cache view，`data_size != size`），说明当前 Qwen3 主路径仍大多未命中 native SDPA。
+
+#### 当前状态
+- ✅ A2 split-k kernel 已经落地并完成编译/注册/调度闭环。
+- ✅ `k_len=16/32` timeout 阻塞已解除（通过门禁一致性修复与拒绝路径稳定化）。
+- ⚠️ 当前 Qwen3 decode 主路径仍以 fallback 为主，SDPA native 命中率仍低，性能收益有限。
+
+#### 下一步（精确）
+1. 扩展 SDPA decode native 支持到 cache view 布局（支持 `data_size != size` 的连续切片/stride 形态），提升 Qwen3 实际命中率。
+2. 在命中率提升后再做 `split_k` 规模与阈值调优（`MIN_K_LEN/TARGET_CHUNK/MAX_PARTS`），复测 `20/40` token 吞吐。
+3. 继续推进 prefill 路径（mask/causal）能力拆分，按 Metal 双路径方案逐步解禁并保持 `ctest + test_fast_sdpa + Qwen 中英 10 token` 门禁。
