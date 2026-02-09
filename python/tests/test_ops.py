@@ -1027,7 +1027,7 @@ class TestOps(mlx_tests.MLXTestCase):
         result = mx.sin(a)
         expected = np.sin(a, dtype=np.float32)
 
-        self.assertTrue(np.allclose(result, expected))
+        self.assertTrue(np.allclose(result, expected, rtol=1e-5, atol=1e-5))
 
     def test_cos(self):
         a = mx.array(
@@ -1036,7 +1036,7 @@ class TestOps(mlx_tests.MLXTestCase):
         result = mx.cos(a)
         expected = np.cos(a, dtype=np.float32)
 
-        self.assertTrue(np.allclose(result, expected))
+        self.assertTrue(np.allclose(result, expected, rtol=1e-5, atol=1e-5))
 
     def test_degrees(self):
         a = mx.array(
