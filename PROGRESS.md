@@ -822,3 +822,51 @@ python -m unittest discover -v
 1. 进入 `RMSNorm native + RoPE native` decode 组合问题根治（目标：解除 `RMSNorm native` 默认关闭门禁）。
 2. 在根治后复跑门禁：`ctest 223/223` + Python 关键集 + Qwen 1/10 token。
 3. 再评估是否放宽更多 native 覆盖（优先不牺牲正确性）。
+
+### 2026-02-10 凌晨增量（RMSNorm+RoPE 组合正确性修复并解禁）✅
+
+#### 本轮目标
+- 根治 `RMSNorm native + RoPE native` decode 组合下的 `NaN/'!'` 回归，恢复 `RMSNorm native` 默认启用。
+
+#### 根因定位
+- 继续排查后确认：不仅 `tensor_needs_sync_device/sync_array_to_host_if_needed` 需要 alias 感知，
+  `Device::get_tensor` 与 `mark_tensor_host_dirty` 也存在“仅按 `array.id` 查缓存”的缺陷。
+- 在 `view/reshape` 形成新 `array.id` 时：
+  - `get_tensor` 会误建新 tensor（绑定旧 host 指针），丢失已有 device 新鲜数据语义；
+  - `mark_tensor_host_dirty` 会因 key miss 漏标记 dirty。
+- 该问题在 native->native 链路（尤其 `RMSNorm -> RoPE`）中会触发 decode 错误。
+
+#### 修复内容
+1. `Device::get_tensor` 增强 alias 回退匹配：
+   - key 失配时按 `data_ptr/nbytes/dtype/data_ref` 扫描复用已有 tensor。  
+   - 文件：`mlx/backend/vulkan/device.cpp`。
+2. `Device::mark_tensor_host_dirty` 增强 alias 回退匹配：
+   - key miss 时同样按底层 data 元信息定位并打脏。  
+   - 文件：`mlx/backend/vulkan/device.cpp`。
+3. `RMSNorm native` 默认门禁解禁：
+   - `MLX_VK_ENABLE_RMSNORM_NATIVE` 默认由 `OFF` 改回 `ON`。  
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`。
+
+#### Qwen3 输出正确性测试（按要求）
+- 默认配置（实卡 Vulkan）：
+  - `prompt="Hi what is your name", max_tokens=1` => 输出 `<think>`
+  - `prompt="Hi what is your name", max_tokens=10` => 输出 `<think>\nOkay, the user asked, \"Hi ...`（正常文本）
+  - `prompt="Hi 你好", max_tokens=10` => 输出 `<think>\nOkay, the user wrote \"Hi ...`（正常文本）
+- 强制组合复测：
+  - `MLX_VK_ENABLE_RMSNORM_NATIVE=1 MLX_VK_ENABLE_ROPE_NATIVE=1` 下
+    `split prefill` 恢复 `finite=True argmax=30('?')`，`max_tokens=1` 输出 `<think>`。
+
+#### 回归门禁
+- C++ 全量：`ctest --test-dir build --output-on-failure --timeout 120` => `223/223` 通过。
+- Python 关键集（GPU）：`test_fast/test_fast_sdpa/test_eval/test_ops` => 全通过（`1` skip）。
+
+#### 当前状态
+- ✅ `QMM native` 默认开启（上一轮已修）。
+- ✅ `RMSNorm native` 默认重新开启（本轮解禁）。
+- ✅ `RoPE native` 默认开启。
+- ✅ Qwen3 输出正确性在默认配置下通过。
+
+#### 下一步
+1. 继续收敛 `test_quantized` 历史容差边界失败（非当前 Vulkan native 覆盖项）并区分平台/精度期望。
+2. 聚焦 SDPA decode/prefill 主路径优化（先诊断卡住原因，再小步放宽 gate）。
+3. 在每次放宽后保持 `Qwen3` 1/10 token 正确性冒烟 + `ctest`/Python 门禁。

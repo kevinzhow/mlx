@@ -130,11 +130,8 @@ inline bool native_qmm_enabled() {
 }
 
 inline bool native_rmsnorm_enabled() {
-  // Decode path has a known correctness issue when native RMSNorm and native
-  // RoPE are both enabled. Keep RMSNorm native opt-in until that interaction
-  // is fixed.
   static const bool enabled =
-      env_flag_default_false("MLX_VK_ENABLE_RMSNORM_NATIVE");
+      env_flag_default_true("MLX_VK_ENABLE_RMSNORM_NATIVE");
   return enabled;
 }
 

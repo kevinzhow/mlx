@@ -326,18 +326,35 @@ std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
 
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+    auto matches_entry = [&](const TensorCacheEntry& entry) {
+      return entry.data_ptr == data_ptr && entry.nbytes == nbytes &&
+          entry.dtype == dtype && !entry.data_ref.expired() &&
+          entry.data_ref.lock() == data_ref;
+    };
+
     auto it = tensor_cache_.find(key);
+    if (it != tensor_cache_.end() && !matches_entry(it->second)) {
+      tensor_cache_.erase(it);
+      it = tensor_cache_.end();
+    }
     if (it != tensor_cache_.end()) {
-      const bool same_meta =
-          it->second.data_ptr == data_ptr && it->second.nbytes == nbytes &&
-          it->second.dtype == dtype && !it->second.data_ref.expired() &&
-          it->second.data_ref.lock() == data_ref;
-      if (same_meta) {
-        if (auto tensor = it->second.tensor.lock()) {
-          return tensor;
-        }
+      if (auto tensor = it->second.tensor.lock()) {
+        return tensor;
       }
       tensor_cache_.erase(it);
+    }
+
+    // Alias/view fallback: multiple arrays can share identical backing storage
+    // but have different array ids. Reuse the existing tensor cache entry.
+    for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end();) {
+      if (!matches_entry(scan->second)) {
+        ++scan;
+        continue;
+      }
+      if (auto tensor = scan->second.tensor.lock()) {
+        return tensor;
+      }
+      scan = tensor_cache_.erase(scan);
     }
   }
 
@@ -374,16 +391,30 @@ void Device::mark_tensor_host_dirty(const array& arr, int stream_index) {
   const auto data_ref = arr.data_shared_ptr();
 
   std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+  auto matches_entry = [&](const TensorCacheEntry& entry) {
+    return entry.data_ptr == data_ptr && entry.nbytes == nbytes &&
+        entry.dtype == dtype && !entry.data_ref.expired() &&
+        entry.data_ref.lock() == data_ref;
+  };
+
   auto it = tensor_cache_.find(key);
+  if (it != tensor_cache_.end() && !matches_entry(it->second)) {
+    tensor_cache_.erase(it);
+    it = tensor_cache_.end();
+  }
+  if (it == tensor_cache_.end()) {
+    for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end(); ++scan) {
+      if (matches_entry(scan->second)) {
+        it = scan;
+        break;
+      }
+    }
+  }
   if (it == tensor_cache_.end()) {
     return;
   }
-  const bool same_meta =
-      it->second.data_ptr == data_ptr && it->second.nbytes == nbytes &&
-      it->second.dtype == dtype && !it->second.data_ref.expired() &&
-      it->second.data_ref.lock() == data_ref;
   auto tensor = it->second.tensor.lock();
-  if (!same_meta || !tensor) {
+  if (!tensor) {
     tensor_cache_.erase(it);
     return;
   }
