@@ -777,3 +777,48 @@ python -m unittest discover -v
    - `ctest 223/223`
    - Python 关键集
    - `Qwen` 1/10 token 冒烟与速度口径对比。
+
+### 2026-02-10 凌晨增量（QMM native 根因定位与修复）✅
+
+#### 本轮目标
+- 修复 `QMM native` 在真实模型路径中的 `NaN/!` 风险，并恢复默认启用条件下的正确性与吞吐。
+
+#### 关键定位
+- 独立 `quantized_matmul` 对拍（`Affine + bf16 + bits=4 + g128 + transpose=true`）中，GPU 与 CPU 结果一致（`max_abs≈0.005~0.008`），说明 kernel 算术本身不是主因。
+- 真实模型中 `only_qmm` 失败的关键在于 **tensor cache 只按 `array.id` 查找**：
+  - 遇到 `view/reshape` 等别名数组时，`host_dirty` 状态丢失；
+  - 下游会错误执行 H2D（把旧 host 覆盖到新 device）或漏做 D2H（CPU fallback 读到脏 host）。
+
+#### 修复内容
+1. `Device::tensor_needs_sync_device` 增强：
+   - `id` 未命中或元信息不匹配时，回退按底层 `data_ptr/nbytes/dtype/data_ref` 扫描匹配 cache entry。
+   - 文件：`mlx/backend/vulkan/device.cpp`。
+2. `Device::sync_array_to_host_if_needed` 增强：
+   - 同样支持按底层 data 元信息回退匹配，确保 alias 输入也能正确 D2H。
+   - 文件：`mlx/backend/vulkan/device.cpp`。
+3. `QMM native` 默认门禁恢复为开启：
+   - `MLX_VK_ENABLE_QMM_NATIVE` 默认 `ON`（保留 env 可关）。
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`。
+
+#### 验证结果
+- 最小诊断：
+  - `split prefill`（Qwen decode 路径）在 `QMM=1, RMSNorm=0, RoPE=1` 下恢复：`finite=True argmax=30('?')`。
+- 模型冒烟（默认配置）
+  - `prompt="Hi what is your name", max_tokens=1`：输出 `<think>`；
+  - `prompt="Hi what is your name", max_tokens=10`：输出 `<think>\nOkay, ...`；
+  - 吞吐：`Generation ≈ 1.771 tokens-per-sec`（此前默认 QMM 关时约 `0.278 tokens-per-sec`）。
+  - `prompt="Hi 你好", max_tokens=1`：输出 `<think>`。
+- 回归门禁：
+  - C++ 全量：`ctest --test-dir build --output-on-failure --timeout 120` => `223/223` 通过。
+  - Python 子集：`test_fast/test_eval/test_ops` 通过；
+  - `test_quantized.TestQuantized.test_qmm` 出现 1 个历史容差边界失败（`group_size=64,bits=8,transpose=False`，`0.00170898 > 0.0015`），不属于当前 Vulkan native QMM 覆盖（当前仅 `bits=4,g128,transpose=true,bf16`）。
+
+#### 当前状态
+- ✅ `QMM native` 相关主正确性阻塞已解除，可在默认配置下启用。
+- ✅ `Qwen` 从 `!!!!!!!!!!` 回归到正常文本输出。
+- ⚠️ `RMSNorm native + RoPE native` decode 组合问题仍在（当前通过 `RMSNorm native` 默认关闭规避）。
+
+#### 下一步
+1. 进入 `RMSNorm native + RoPE native` decode 组合问题根治（目标：解除 `RMSNorm native` 默认关闭门禁）。
+2. 在根治后复跑门禁：`ctest 223/223` + Python 关键集 + Qwen 1/10 token。
+3. 再评估是否放宽更多 native 覆盖（优先不牺牲正确性）。

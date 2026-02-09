@@ -401,17 +401,26 @@ bool Device::tensor_needs_sync_device(const array& arr) {
   const auto data_ref = arr.data_shared_ptr();
 
   std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-  auto it = tensor_cache_.find(key);
-  if (it == tensor_cache_.end()) {
-    return true;
-  }
+  auto matches_entry = [&](const TensorCacheEntry& entry) {
+    return entry.data_ptr == data_ptr && entry.nbytes == nbytes &&
+        entry.dtype == dtype && !entry.data_ref.expired() &&
+        entry.data_ref.lock() == data_ref;
+  };
 
-  const bool same_meta =
-      it->second.data_ptr == data_ptr && it->second.nbytes == nbytes &&
-      it->second.dtype == dtype && !it->second.data_ref.expired() &&
-      it->second.data_ref.lock() == data_ref;
-  if (!same_meta) {
+  auto it = tensor_cache_.find(key);
+  if (it != tensor_cache_.end() && !matches_entry(it->second)) {
     tensor_cache_.erase(it);
+    it = tensor_cache_.end();
+  }
+  if (it == tensor_cache_.end()) {
+    for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end(); ++scan) {
+      if (matches_entry(scan->second)) {
+        it = scan;
+        break;
+      }
+    }
+  }
+  if (it == tensor_cache_.end()) {
     return true;
   }
 
@@ -436,20 +445,33 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
 
   std::shared_ptr<kp::Tensor> tensor;
   int dirty_stream_index = -1;
+  std::uintptr_t matched_key = 0;
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+    auto matches_entry = [&](const TensorCacheEntry& entry) {
+      return entry.data_ptr == data_ptr && entry.nbytes == nbytes &&
+          entry.dtype == dtype && !entry.data_ref.expired() &&
+          entry.data_ref.lock() == data_ref;
+    };
+
     auto it = tensor_cache_.find(key);
+    if (it != tensor_cache_.end() && !matches_entry(it->second)) {
+      tensor_cache_.erase(it);
+      it = tensor_cache_.end();
+    }
+    if (it == tensor_cache_.end()) {
+      for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end(); ++scan) {
+        if (matches_entry(scan->second)) {
+          it = scan;
+          break;
+        }
+      }
+    }
     if (it == tensor_cache_.end()) {
       return;
     }
-    const bool same_meta =
-        it->second.data_ptr == data_ptr && it->second.nbytes == nbytes &&
-        it->second.dtype == dtype && !it->second.data_ref.expired() &&
-        it->second.data_ref.lock() == data_ref;
-    if (!same_meta) {
-      tensor_cache_.erase(it);
-      return;
-    }
+
+    matched_key = it->first;
     if (!it->second.host_dirty) {
       return;
     }
@@ -477,7 +499,7 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
   }
 
   std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-  auto it = tensor_cache_.find(key);
+  auto it = tensor_cache_.find(matched_key);
   if (it != tensor_cache_.end()) {
     if (auto cur = it->second.tensor.lock(); cur && cur == tensor) {
       it->second.host_dirty = false;

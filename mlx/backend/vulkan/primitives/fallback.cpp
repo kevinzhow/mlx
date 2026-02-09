@@ -125,10 +125,7 @@ inline bool env_flag_default_false(const char* name) {
 }
 
 inline bool native_qmm_enabled() {
-  // Default off for safety: current qmm native path has known correctness risk
-  // on real-model workloads and should be explicitly enabled for experiments.
-  static const bool enabled =
-      env_flag_default_false("MLX_VK_ENABLE_QMM_NATIVE");
+  static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_QMM_NATIVE");
   return enabled;
 }
 
