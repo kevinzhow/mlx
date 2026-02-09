@@ -1159,3 +1159,38 @@ python -m unittest discover -v
 #### 下一步（精确）
 1. 提交本轮 CMake 修复（含 `PROGRESS.md`），避免后续回退。
 2. 继续回到主线目标：提升 SDPA native 命中率（尤其 cache view 布局）并复测 Qwen 20/40 token 吞吐。
+
+### 2026-02-10 深夜增量（SDPA cache-view 命中与稳定性边界复测）⚠️
+
+#### 本轮目标
+- 验证 `cache-view (data_size != size)` 放开后的真实命中情况，并评估能否提升默认 `MLX_VK_SDPA_MAX_K_LEN` 以提高 Qwen 命中率。
+
+#### 本轮结论（实测）
+1. `cache-view` 门禁放开本身已生效：
+   - 在 `MLX_VK_SDPA_MAX_K_LEN=1024` + `MLX_VK_DEBUG_SDPA_REJECT=1` 下，Qwen decode 拒绝主因不再是 `row_contiguous`，仅偶发 `k_layout`（说明 `data_size != size` 的常见布局已可命中）。
+2. 但 `k_len` 放宽存在稳定性断点：
+   - `k_len_cap=13`（及以上）在 Qwen 10-token 冒烟中可稳定复现超时（`exit_code=124`）或明显输出异常；
+   - `k_len_cap=12` 在英文 prompt 可过，但中文 prompt 仍可超时；
+   - `k_len_cap=9` 对部分短 prompt 可过，但 `prompt="Hi"` 10-token 仍可超时；
+   - `k_len_cap=8` 维持稳定（中英 Qwen 10-token 正常）。
+3. 结论：当前实现下，**默认 `MLX_VK_SDPA_MAX_K_LEN` 不能安全上调**，继续保持 `8` 是正确选择。
+
+#### 本轮验证
+- `python/tests/test_fast_sdpa.py -v`（GPU）：`16 passed, 1 skipped`。
+- Qwen3 冒烟（实卡 Vulkan，默认配置）：
+  - `prompt="Hi what is your name", max_tokens=10`：正常输出（`Generation: 2.679 tok/s`）。
+  - `prompt="你好啊", max_tokens=10`：正常输出（`Generation: 2.609 tok/s`）。
+- 变更门限 A/B（仅用于边界探测）：
+  - `MLX_VK_SDPA_MAX_K_LEN=13`：`exit_code=124`；
+  - `MLX_VK_SDPA_MAX_K_LEN=10/12`：存在场景性超时；
+  - `MLX_VK_SDPA_MAX_K_LEN=8`：稳定通过。
+
+#### 当前状态
+- ✅ `cache-view(data_size!=size)` 常见 decode 布局已可进入 native gate（不再被旧 `row_contiguous` 规则系统性拦截）。
+- ⚠️ `k_len>=9` 仍有未解决稳定性风险，暂不适合默认放开。
+- ✅ 默认配置维持稳定正确性（中英 Qwen 10-token + `test_fast_sdpa` 均通过）。
+
+#### 下一步（精确）
+1. 先定位 `k_len>=9` 卡死/异常的根因（优先检查 decode `q1` 与 split-k 在真实 KV cache 布局下的数值与同步语义）。
+2. 在根因修复前，保持默认 `MLX_VK_SDPA_MAX_K_LEN=8`，仅通过环境变量做受控实验。
+3. 增加一条最小复现门禁（`prompt="Hi"`, `max_tokens=10`）作为 `k_len` 放宽前置检查，避免再次把不稳定门限带入默认路径。
