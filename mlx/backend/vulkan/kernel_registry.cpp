@@ -9,6 +9,8 @@
 
 // 嵌入的 SPIR-V shader
 #include "shaders/add_spv.h"
+#include "shaders/sin_spv.h"
+#include "shaders/cos_spv.h"
 
 namespace mlx::core::vulkan {
 
@@ -18,6 +20,8 @@ const char* KernelRegistry::ADD_F16 = "add_f16";
 const char* KernelRegistry::MUL_F32 = "mul_f32";
 const char* KernelRegistry::SUB_F32 = "sub_f32";
 const char* KernelRegistry::DIV_F32 = "div_f32";
+const char* KernelRegistry::SIN_F32 = "sin_f32";
+const char* KernelRegistry::COS_F32 = "cos_f32";
 
 KernelRegistry& KernelRegistry::instance() {
   static KernelRegistry registry;
@@ -40,8 +44,17 @@ void KernelRegistry::register_builtin_shaders() {
   // 将嵌入的 add_spv 转换为 vector<uint32_t>
   std::vector<uint32_t> add_spirv((add_spv_len + 3) / 4);
   std::memcpy(add_spirv.data(), add_spv, add_spv_len);
-  
   shaders_[ADD_F32] = std::move(add_spirv);
+  
+  // 注册 sin_spv
+  std::vector<uint32_t> sin_spirv((mlx_backend_vulkan_shaders_sin_spv_len + 3) / 4);
+  std::memcpy(sin_spirv.data(), mlx_backend_vulkan_shaders_sin_spv, mlx_backend_vulkan_shaders_sin_spv_len);
+  shaders_[SIN_F32] = std::move(sin_spirv);
+  
+  // 注册 cos_spv
+  std::vector<uint32_t> cos_spirv((cos_spv_len + 3) / 4);
+  std::memcpy(cos_spirv.data(), cos_spv, cos_spv_len);
+  shaders_[COS_F32] = std::move(cos_spirv);
 }
 
 const std::vector<uint32_t>& KernelRegistry::get_shader(const std::string& name) {

@@ -52,6 +52,8 @@ class KernelRegistry {
   static const char* MUL_F32;
   static const char* SUB_F32;
   static const char* DIV_F32;
+  static const char* SIN_F32;
+  static const char* COS_F32;
   
  private:
   KernelRegistry() = default;
