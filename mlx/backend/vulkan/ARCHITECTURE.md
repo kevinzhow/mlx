@@ -459,3 +459,17 @@ public:
 ### 8.4 当前限制
 - 非上述量化配置（例如其他 `bits/group_size/mode`）仍走 CPU fallback。
 - 当前实现以“先可用、再扩覆盖”为策略，优先降低实际推理中的 fallback 占比。
+
+## 9. Binary（bf16）当前覆盖
+
+### 9.1 已原生化算子
+- `Add::eval_gpu`：已支持 `float32` 与 `bfloat16` 行连续同形状输入。
+- `Multiply::eval_gpu`：已支持 `bfloat16` 行连续同形状输入。
+
+### 9.2 Shader
+- `mlx/backend/vulkan/shaders/add_bf16.comp`
+- `mlx/backend/vulkan/shaders/mul_bf16.comp`
+
+### 9.3 策略
+- 命中条件时走 Vulkan kernel；
+- 不命中条件时保持显式 CPU fallback，确保语义与正确性优先。

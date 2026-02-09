@@ -81,6 +81,8 @@
   - `bits=4`，`group_size=128`，`transpose=true`
   - `w/scales/biases` 为 2D 且行连续（主推理权重布局）
   对不满足条件的 case 仍走原 CPU fallback，保证正确性。
+- ✅ 启动二元算子去 fallback（第 1 步）：  
+  新增 Vulkan 原生 `bf16 Add` 与 `bf16 Multiply`（packed-bf16 shader 路径），覆盖行连续同形状输入；不命中条件时保持 CPU fallback。
 
 ### 新性能验证（实卡 Vulkan + Release）
 - 命令（1 token 诊断）：
@@ -137,6 +139,13 @@
   结果：`223/223` 通过，`Total Test time (real) = 9.56 sec`。  
   命令：`DEVICE=gpu PYTHONPATH=python python3 python/tests/test_quantized.py -v`。  
   结果：执行用例 `10/10` 通过，其余用例按测试文件内条件跳过（`skip`），无新增失败。
+- ✅ `bf16 Add/Multiply` 原生路径落地后复测通过（`2026-02-09`）  
+  命令：`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`。  
+  结果：`223/223` 通过，`Total Test time (real) = 9.46 sec`。  
+  命令：`DEVICE=gpu PYTHONPATH=../ python3 -m unittest -v test_ops.TestOps.test_add test_ops.TestOps.test_multiply`（`python/tests` 目录）。  
+  结果：`2/2` 通过。  
+  命令：`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 PYTHONPATH=python python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi what is your name" --max-tokens 10 --temp 0`。  
+  结果：生成成功，`Generation: 10 tokens, 2.511 tokens-per-sec`。
 - ✅ Python `async_eval` GPU 挂起修复（`2026-02-09`）  
   复现定位：`DEVICE=gpu` 下 `test_eval.TestEval.test_async_eval` 卡在 `mx.async_eval(x)`；`gdb` 栈指向 `prepare_inputs_for_cpu_fallback -> Add::eval_gpu -> async_eval`。  
   根因：Vulkan fallback 在输入已绑定同 stream 未 signal event 时调用 `array::wait()`，等待同轮 `eval_impl(async)` 尾部才 signal 的 event，形成自等待死锁。  
@@ -169,6 +178,7 @@
 - `pip install -e .` 在 `CMAKE_ARGS='-DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF'` 下失败：`install(EXPORT "MLXTargets" ...) includes target "mlx" which requires target "kompute" that is not in any export set`。
 - 运行环境差异已确认：沙箱内对 `/dev/dri/renderD128` 缺少 `O_RDWR` 权限会退化到 `llvmpipe`；非沙箱可见硬件 Radeon。
 - `python/tests` 在 `DEVICE=gpu` 下的 `test_quantized` 仍有历史问题（`GatherMM` float32 限制与 1 个 qmm 精度阈值失败）；`DEVICE=cpu` 下 `test_quantized` 全通过。该项需单独梳理 Vulkan fallback 与 dtype 契约。
+- 模型端吞吐已从早期 `0.339 tok/s` 提升到 `~2.5 tok/s`，但仍明显偏慢；下一步主要瓶颈转向 `fast::RMSNorm` / `fast::RoPE` / `fast::ScaledDotProductAttention` 的 fallback 与频繁同步。
 
 ## 下一步计划（从“修错”转向“降级 fallback 占比”）
 
@@ -280,8 +290,8 @@
 - 常见 `bf16` 二元算子中 `Multiply` 仍为 CPU fallback。
 
 ### 立即执行动作
-1. 先实现 Vulkan 原生 `bf16 Add + bf16 Multiply`，减少残差/MLP 路径 fallback。
-2. 随后推进 `fast::RMSNorm` 与 `fast::RoPE` 原生实现。
+1. ✅ 已完成 Vulkan 原生 `bf16 Add + bf16 Multiply`，减少残差/MLP 路径 fallback。
+2. 继续推进 `fast::RMSNorm` 与 `fast::RoPE` 原生实现（当前最高优先级）。
 3. 再扩 `QuantizedMatmul` 到 `bits=8 / group_size=64 / transpose=false` 等组合，并回收 `test_qmm` 历史失败。
 
 ## 下一步（执行入口）

@@ -49,7 +49,9 @@ class KernelRegistry {
   // 内置 kernel 名称
   static const char* ADD_F32;
   static const char* ADD_F16;
+  static const char* ADD_BF16;
   static const char* MUL_F32;
+  static const char* MUL_BF16;
   static const char* SUB_F32;
   static const char* DIV_F32;
   static const char* SIN_F32;

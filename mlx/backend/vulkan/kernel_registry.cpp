@@ -9,6 +9,8 @@
 
 // 嵌入的 SPIR-V shader
 #include "shaders/add_spv.h"
+#include "shaders/add_bf16_spv.h"
+#include "shaders/mul_bf16_spv.h"
 #include "shaders/sin_spv.h"
 #include "shaders/cos_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_spv.h"
@@ -18,7 +20,9 @@ namespace mlx::core::vulkan {
 // 静态 kernel 名称定义
 const char* KernelRegistry::ADD_F32 = "add_f32";
 const char* KernelRegistry::ADD_F16 = "add_f16";
+const char* KernelRegistry::ADD_BF16 = "add_bf16";
 const char* KernelRegistry::MUL_F32 = "mul_f32";
+const char* KernelRegistry::MUL_BF16 = "mul_bf16";
 const char* KernelRegistry::SUB_F32 = "sub_f32";
 const char* KernelRegistry::DIV_F32 = "div_f32";
 const char* KernelRegistry::SIN_F32 = "sin_f32";
@@ -48,6 +52,14 @@ void KernelRegistry::register_builtin_shaders() {
   std::vector<uint32_t> add_spirv((add_spv_len + 3) / 4);
   std::memcpy(add_spirv.data(), add_spv, add_spv_len);
   shaders_[ADD_F32] = std::move(add_spirv);
+
+  std::vector<uint32_t> add_bf16_spirv((add_bf16_spv_len + 3) / 4);
+  std::memcpy(add_bf16_spirv.data(), add_bf16_spv, add_bf16_spv_len);
+  shaders_[ADD_BF16] = std::move(add_bf16_spirv);
+
+  std::vector<uint32_t> mul_bf16_spirv((mul_bf16_spv_len + 3) / 4);
+  std::memcpy(mul_bf16_spirv.data(), mul_bf16_spv, mul_bf16_spv_len);
+  shaders_[MUL_BF16] = std::move(mul_bf16_spirv);
   
   // 注册 sin_spv
   std::vector<uint32_t> sin_spirv((mlx_backend_vulkan_shaders_sin_spv_len + 3) / 4);
