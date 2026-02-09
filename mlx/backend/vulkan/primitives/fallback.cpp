@@ -1,7 +1,10 @@
 // Copyright © 2026 MLX Vulkan Backend
 
 #include <stdexcept>
+#include <unordered_set>
+#include <utility>
 
+#include "mlx/backend/cpu/encoder.h"
 #include "mlx/distributed/primitives.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
@@ -20,21 +23,76 @@ inline void prepare_inputs_for_cpu_fallback(const std::vector<mlx::core::array>&
   }
 }
 
+inline void collect_keepalive_buffers(
+    const mlx::core::array& arr,
+    std::unordered_set<std::shared_ptr<mlx::core::array::Data>>& buffers) {
+  if (auto data = arr.data_shared_ptr()) {
+    buffers.insert(std::move(data));
+  }
+  for (const auto& sib : arr.siblings()) {
+    if (auto sib_data = sib.data_shared_ptr()) {
+      buffers.insert(std::move(sib_data));
+    }
+  }
+}
+
+template <typename OutputCollector>
+inline void finalize_cpu_fallback(
+    const std::vector<mlx::core::array>& inputs,
+    OutputCollector&& collect_outputs) {
+  auto cpu_stream = mlx::core::default_stream(mlx::core::Device::cpu);
+  auto& encoder = mlx::core::cpu::get_command_encoder(cpu_stream);
+
+  std::unordered_set<std::shared_ptr<mlx::core::array::Data>> buffers;
+  for (const auto& in : inputs) {
+    collect_keepalive_buffers(in, buffers);
+  }
+  collect_outputs(buffers);
+
+  // Mirror cpu::eval() keepalive semantics for fallback-dispatched CPU tasks.
+  encoder.dispatch(
+      [buffers = std::move(buffers),
+       temps = std::move(encoder.temporaries())]() mutable {});
+  mlx::core::synchronize(cpu_stream);
+}
+
+template <typename EvalFn>
+inline void run_cpu_fallback_single(
+    const std::vector<mlx::core::array>& inputs,
+    mlx::core::array& out,
+    EvalFn&& eval_fn) {
+  prepare_inputs_for_cpu_fallback(inputs);
+  std::forward<EvalFn>(eval_fn)();
+  finalize_cpu_fallback(inputs, [&](auto& buffers) {
+    collect_keepalive_buffers(out, buffers);
+  });
+}
+
+template <typename EvalFn>
+inline void run_cpu_fallback_multi(
+    const std::vector<mlx::core::array>& inputs,
+    std::vector<mlx::core::array>& outputs,
+    EvalFn&& eval_fn) {
+  prepare_inputs_for_cpu_fallback(inputs);
+  std::forward<EvalFn>(eval_fn)();
+  finalize_cpu_fallback(inputs, [&](auto& buffers) {
+    for (const auto& out : outputs) {
+      collect_keepalive_buffers(out, buffers);
+    }
+  });
+}
+
 } // namespace
 
 #define VULKAN_CPU_FALLBACK_MULTI(func)                               \
   void func::eval_gpu(                                                \
       const std::vector<array>& inputs, std::vector<array>& outputs) { \
-    prepare_inputs_for_cpu_fallback(inputs);                          \
-    eval_cpu(inputs, outputs);                                        \
-    synchronize(default_stream(Device::cpu));                         \
+    run_cpu_fallback_multi(inputs, outputs, [&]() { eval_cpu(inputs, outputs); }); \
   }
 
 #define VULKAN_CPU_FALLBACK(func)                                     \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    prepare_inputs_for_cpu_fallback(inputs);                          \
-    eval_cpu(inputs, out);                                            \
-    synchronize(default_stream(Device::cpu));                         \
+    run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }); \
   }
 
 #define VULKAN_NO_GPU_MULTI(func)                                     \

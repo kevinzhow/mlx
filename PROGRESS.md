@@ -63,34 +63,25 @@
 - ✅ **RNG 100% 工作** - 随机数生成正常
 - ✅ **核心数组操作 98.5%** - 基础功能稳定
 
-## 当前阻塞
+## 当前状态（2026-02-09 最新）
 
-### Python 测试失败分析 (19 个失败)
+### 验证结果
+- ✅ C++ 全量通过：`223/223`（`ctest --test-dir build --output-on-failure --timeout 120`）
+- ✅ Python 全量通过：`673` tests passed, `36` skipped  
+  命令：`source venv/bin/activate && cd python/tests && python -m unittest discover -v`
+- ✅ 关键子集复核通过：
+  - `test_blas.py` `24/24`
+  - `test_ops.py` `132/132`
+  - `test_quantized.py` `27/27`
+  - `test_eval.py` `13/13`（1 skip）
+  - `test_array.py` `69/69`（1 skip）
 
-#### 1. BLAS 矩阵乘法问题 (7 失败) - **最高优先级**
-- `test_gather_mm_sorted` (2 variants)
-- `test_matmul_batched`
-- `test_matmul_shapes` (2 variants) 
-- `test_matrix_vector_batched` (2 variants)
-**原因**: 矩阵乘法实现有问题，影响深度学习核心操作
+### 当前阻塞
+- 当前验证范围内暂无已复现的 correctness blocker。
+- `PROGRESS.md` 中旧的“Python 失败清单”已过时，保留为历史记录；当前以本节验证结果为准。
+- 仍存在架构层面的目标差距：部分路径仍依赖 CPU fallback（虽正确，但未达到“尽量原生 Vulkan 执行”的终态）。
 
-#### 2. 数学函数问题 (5 失败)
-- `test_sin`, `test_cos` - 三角函数
-- `test_log2`, `test_log10` - 对数函数
-- `test_rsqrt` - 平方根倒数
-**原因**: CPU fallback 实现或精度问题
-
-#### 3. 梯度问题 (4 失败)
-- 反三角函数梯度: arcsin, arccos, arcsinh, arccosh
-**原因**: VJP 实现问题
-
-#### 4. 其他问题
-- `test_unary_ops_from_non_array` - log2/log10 标量输入 (2 失败)
-- `test_arange_corner_cases_cast` - AttributeError (1 错误)
-- `test_async_eval` - 挂起（未计入统计）
-- `test_quantized.py` - core dump 崩溃
-
-## 下一步计划
+## 下一步计划（从“修错”转向“降级 fallback 占比”）
 
 ## 2026-02-09: Math Function Precision Investigation ✅
 
@@ -149,45 +140,55 @@
 
 ---
 
-## 下一步计划
+## 2026-02-09: Matmul Fallback Contract Investigation 🔎
 
-### 目标: 修复 Python 测试失败，达到 100% 通过率
+### Problem
+- `test_blas.py` 中 batched matmul 系列失败持续存在。
+- 现象并非稳定的“小精度偏差”，而是明显错误（全 0/NaN/异常大值）。
 
-#### 优先级 1: 修复矩阵乘法 (影响 7 个测试)
-- [ ] 调试 batched matmul 实现
-- [ ] 验证 matmul shape 处理逻辑
-- [ ] 检查 gather+matmul 融合
-- [ ] 验证 matrix-vector 乘法
+### Key Findings
+1. `Matmul` 在 Vulkan 后端目前走 `VULKAN_CPU_FALLBACK(Matmul)`（非原生 Vulkan matmul）。
+2. 同一组输入：
+   - CPU device 下 `mx.matmul` 完全正确；
+   - GPU device 下（触发 Vulkan fallback）出现 batch 丢失/异常值。
+3. 说明主要问题在 **fallback 运行时契约**，而不是 CPU GEMM 本身。
 
-**验证命令**:
-```bash
-source venv/bin/activate && cd python/tests
-python test_blas.py TestBlas.test_matmul_batched -v
-python test_blas.py TestBlas.test_matmul_shapes -v
-python test_blas.py TestBlas.test_matrix_vector_batched -v
-```
+### Current Hypothesis
+- 需要对 GPU-stream 上的 CPU fallback 做更严格的契约对齐（与 `cpu::eval` 的生命周期和同步语义一致），重点关注：
+  - 输入数据在 fallback 前的 host 可见性
+  - CPU 任务执行期间 buffer/temporary 生命周期保持
+  - 输出 buffer 在跨 stream 场景下的可见性与稳定性
 
-#### 优先级 2: 修复数学函数 (影响 5 个测试)
-- [ ] 检查 sin/cos 的 CPU fallback 实现
-- [ ] 检查 log2/log10 实现
-- [ ] 检查 rsqrt 实现
-- [ ] 考虑实现原生 Vulkan 算子
+---
 
-**验证命令**:
-```bash
-python test_ops.py TestOps.test_sin -v
-python test_ops.py TestOps.test_cos -v
-python test_ops.py TestOps.test_log2 -v
-```
+## 2026-02-09: GPU-stream CPU Fallback Contract Fix ✅
 
-#### 优先级 3: 修复反三角函数梯度 (影响 4 个测试)
-- [ ] 检查 arcsin/arccos 的 VJP 实现
-- [ ] 检查 arcsinh/arccosh 的 VJP 实现
+### Root Cause
+- `Matmul` 等算子在 Vulkan 后端走 `eval_cpu` 时，仅做了输入就绪 + `synchronize(cpu)`。
+- 缺少与 `cpu::eval` 等价的 keepalive 语义（buffers + temporaries 生命周期封装）。
 
-#### 优先级 4: 其他问题
-- [ ] 修复 async_eval 挂起问题
-- [ ] 调试 test_quantized.py 崩溃
-- [ ] 修复 arange corner case
+### Fix Implemented
+- 在 `mlx/backend/vulkan/primitives/fallback.cpp` 引入统一 fallback 执行框架：
+  - `prepare_inputs_for_cpu_fallback(...)`
+  - `run_cpu_fallback_single(...)` / `run_cpu_fallback_multi(...)`
+  - `finalize_cpu_fallback(...)`：显式收集 input/output/sibling buffer 引用，并通过 CPU encoder 派发 keepalive task（携带 `std::move(encoder.temporaries())`），最后同步 CPU stream。
+- 所有 `VULKAN_CPU_FALLBACK(...)` 与 `VULKAN_CPU_FALLBACK_MULTI(...)` 宏路径切换到该统一框架。
+
+### Files Modified
+- `mlx/backend/vulkan/primitives/fallback.cpp`
+- `PROGRESS.md`
+
+## 下一步（执行入口）
+
+1. 统一其它非宏 fallback 路径到同一契约  
+当前 `mlx/backend/vulkan/primitives/binary.cpp` / `mlx/backend/vulkan/primitives/unary.cpp` 仍有“直接 `eval_cpu + synchronize`”分支，建议复用同一 keepalive 模式，避免潜在同类问题。
+
+2. 按优先级推进原生 Vulkan 基础算子覆盖（减少 CPU fallback）  
+优先实现/强化：copy、reshape、fill、concatenate、slicing 的原生 Vulkan 路径与 stream 语义。
+
+3. 进入下一轮门禁  
+- C++：`ctest --test-dir build --output-on-failure --timeout 120`
+- Python：`source venv/bin/activate && cd python/tests && python -m unittest discover -v`
 
 ### 验证门禁
 
@@ -208,7 +209,8 @@ python test_ops.py -v
 ctest --test-dir build --stop-on-failure --output-on-failure
 
 # Python 批量
-source venv/bin/activate && ./run_tests.sh
+source venv/bin/activate && cd python/tests
+python -m unittest discover -v
 ```
 
 ## 维护规则
