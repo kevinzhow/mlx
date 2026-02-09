@@ -722,3 +722,58 @@ python -m unittest discover -v
 ### 结论
 - 现阶段仅放宽 `k_len` 上限（即使是 `<=12`）仍有较高回归风险，不能直接进入主线。  
 - 后续 SDPA 优化需先补“为什么 decode native path 会卡住”的机制诊断（例如 dispatch/同步/descriptor 生命周期），再谈门禁放量。  
+
+### 2026-02-09 深夜增量（Qwen 输出 `!!!!!!!!!!` 正确性修复）✅
+
+#### 新问题复现
+- 现象：`Qwen/Qwen3-0.6B-MLX-4bit` 在 `--prompt "Hi 你好"` / `"Hi what is your name"` 下生成 `!!!!!!!!!!`。
+- 关键诊断：
+  - `full prefill`（单次前向）logits `finite=True`；
+  - `split prefill`（与 `mlx_lm.generate_step` 一致：先预填 `N-1` token，再 decode `1` token）在 GPU 下 `finite=False`，`argmax=0('!')`。
+
+#### 根因定位
+1. **GPU/Host 同步契约问题（已修）**
+   - 原生 Vulkan 路径对输入做无条件 `record_tensor_sync_device`（H2D）。
+   - 当输入来自上游 native kernel 输出时，`host_dirty=true`（device 最新），无条件 H2D 会把旧 host 数据反向覆盖到 device，导致 NaN/错误值。
+2. **decode 组合正确性问题（临时门禁）**
+   - 在 `QMM=off` 情况下，`split prefill` 仅当 `RMSNorm native=1 && RoPE native=1` 同时开启时复现 NaN。
+   - 单独开启 `RMSNorm` 或 `RoPE`（另一个关闭）均可保持 `finite=True`。
+3. **QMM native 仍有独立正确性风险（保留禁用）**
+   - `only_qmm` 组合仍可复现 `finite=False`，说明 `QuantizedMatmul` 原生 kernel 仍需单独修复。
+
+#### 本轮修复
+- 新增 `Device::tensor_needs_sync_device(const array&)`（`device.{h,cpp}`）。
+  - 语义：若 `host_dirty=true`（device 更新）则返回 `false`，避免无条件 H2D 覆盖 device 新鲜数据。
+- 将以下原生路径改为“**按输入状态选择性 H2D**”：
+  - `mlx/backend/vulkan/primitives/binary.cpp`
+  - `mlx/backend/vulkan/primitives/unary.cpp`
+  - `mlx/backend/vulkan/primitives/fallback.cpp`（`QMM/RMSNorm/RoPE/SDPA`）
+- 默认门禁调整（保守优先正确性）：
+  - `MLX_VK_ENABLE_QMM_NATIVE`：默认 `OFF`（保留可显式开启）
+  - `MLX_VK_ENABLE_RMSNORM_NATIVE`：默认 `OFF`（规避与 RoPE decode 组合问题）
+  - `MLX_VK_ENABLE_ROPE_NATIVE`：默认 `ON`
+
+#### 本轮验证
+- 组合诊断：
+  - `split prefill` 默认配置：`finite=True argmax=30('?')`
+  - `RMSNorm=0, RoPE=1`：`finite=True`
+  - `RMSNorm=1, RoPE=1`：可复现 `finite=False`
+- 模型冒烟（默认配置）：
+  - `--max-tokens 1`：输出 `<think>`（不再是 `!`）
+  - `--max-tokens 10`：输出 `<think>\nOkay, the user said ...`（不再是 `!!!!!!!!!!`）
+- 回归门禁：
+  - C++：`ctest --test-dir build --output-on-failure --timeout 120` -> `223/223` 通过
+  - Python 关键子集（GPU）：`test_fast/test_fast_sdpa/test_eval.test_async_eval/test_ops add/multiply` -> `17` 通过（`1` skip）
+
+#### 当前状态
+- ✅ `Qwen` 输出 `!!!!!!!!!!` 的主正确性回归已解除（默认配置）。
+- ✅ GPU/Host 同步方向错误（device 新鲜数据被 host 覆盖）已修复。
+- ⚠️ `QMM native` 与 `RMSNorm+RoPE decode` 组合仍保留为“默认禁用/门禁”状态，待后续根治后再放开。
+
+#### 下一步（精确）
+1. 复现实例化并修复 `QMM native` 数值错误（先最小 case，再回归 Qwen）。
+2. 定位 `RMSNorm native + RoPE native` decode 组合错误（优先检查 decode T=1 场景下的布局/同步/中间值）。
+3. 在问题修复后，逐项解除门禁并复测：
+   - `ctest 223/223`
+   - Python 关键集
+   - `Qwen` 1/10 token 冒烟与速度口径对比。

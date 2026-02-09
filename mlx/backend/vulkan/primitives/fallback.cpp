@@ -98,6 +98,71 @@ inline bool sdpa_debug_reject_enabled() {
   return enabled;
 }
 
+inline bool env_flag_default_true(const char* name) {
+  const char* v = std::getenv(name);
+  if (!v) {
+    return true;
+  }
+  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+      std::strcmp(v, "off") == 0) {
+    return false;
+  }
+  return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+      std::strcmp(v, "on") == 0;
+}
+
+inline bool env_flag_default_false(const char* name) {
+  const char* v = std::getenv(name);
+  if (!v) {
+    return false;
+  }
+  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+      std::strcmp(v, "off") == 0) {
+    return false;
+  }
+  return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+      std::strcmp(v, "on") == 0;
+}
+
+inline bool native_qmm_enabled() {
+  // Default off for safety: current qmm native path has known correctness risk
+  // on real-model workloads and should be explicitly enabled for experiments.
+  static const bool enabled =
+      env_flag_default_false("MLX_VK_ENABLE_QMM_NATIVE");
+  return enabled;
+}
+
+inline bool native_rmsnorm_enabled() {
+  // Decode path has a known correctness issue when native RMSNorm and native
+  // RoPE are both enabled. Keep RMSNorm native opt-in until that interaction
+  // is fixed.
+  static const bool enabled =
+      env_flag_default_false("MLX_VK_ENABLE_RMSNORM_NATIVE");
+  return enabled;
+}
+
+inline bool native_rope_enabled() {
+  static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_ROPE_NATIVE");
+  return enabled;
+}
+
+inline bool native_sdpa_enabled() {
+  static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_SDPA_NATIVE");
+  return enabled;
+}
+
+inline bool native_rope_hs_transposed_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_ENABLE_ROPE_HS_TRANSPOSED");
+    if (!v) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
 inline void log_rope_reject(
     const std::vector<mlx::core::array>& inputs,
     const std::vector<mlx::core::array>& outputs,
@@ -527,8 +592,9 @@ inline bool can_use_native_rope_bf16(
     return reject("dtype_or_shape_mismatch");
   }
   const bool in_row_contiguous = is_row_contiguous_materialized(in);
+  const bool allow_hs_transposed = native_rope_hs_transposed_enabled();
   const bool in_hs_transposed =
-      !in_row_contiguous && in.data_size() == in.size() &&
+      allow_hs_transposed && !in_row_contiguous && in.data_size() == in.size() &&
       is_rope_head_seq_transposed_layout(in);
   if ((!in_row_contiguous && !in_hs_transposed) || !out.flags().row_contiguous ||
       in.ndim() < 2) {
@@ -835,7 +901,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto stream = out.primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, stream);
 
-  if (can_use_native_affine_bf16_quantized_matmul(
+  if (native_qmm_enabled() && can_use_native_affine_bf16_quantized_matmul(
           inputs, out, group_size_, bits_, transpose_, mode_)) {
     try {
       if (!out.data_shared_ptr()) {
@@ -870,7 +936,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           encode_push_constant_u32(w_words_per_col)};
 
       // Output tensor is fully overwritten by the kernel; no need to upload it.
-      std::vector<std::shared_ptr<kp::Tensor>> sync_tensors{x_tensor};
+      std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+      if (device.tensor_needs_sync_device(inputs[0])) {
+        sync_tensors.push_back(x_tensor);
+      }
       if (w_cached.needs_sync) {
         sync_tensors.push_back(w_cached.tensor);
       }
@@ -880,7 +949,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       if (biases_cached.needs_sync) {
         sync_tensors.push_back(biases_cached.tensor);
       }
-      encoder.record_tensor_sync_device(sync_tensors);
+      if (!sync_tensors.empty()) {
+        encoder.record_tensor_sync_device(sync_tensors);
+      }
       if (w_cached.cacheable && w_cached.needs_sync) {
         mark_qmm_const_tensor_uploaded(w_cached.key);
       }
@@ -1082,7 +1153,7 @@ void fast::RMSNorm::eval_gpu(
   uint32_t n_rows = 0;
   uint32_t axis_size = 0;
   uint32_t w_stride = 0;
-  if (can_use_native_rmsnorm_bf16(
+  if (native_rmsnorm_enabled() && can_use_native_rmsnorm_bf16(
           inputs, outputs, n_rows, axis_size, w_stride)) {
     try {
       auto& out = outputs[0];
@@ -1105,7 +1176,16 @@ void fast::RMSNorm::eval_gpu(
           encode_push_constant_f32(eps_)};
 
       // Output tensor is write-only in this dispatch.
-      encoder.record_tensor_sync_device({x_tensor, w_tensor});
+      std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+      if (device.tensor_needs_sync_device(inputs[0])) {
+        sync_tensors.push_back(x_tensor);
+      }
+      if (device.tensor_needs_sync_device(inputs[1])) {
+        sync_tensors.push_back(w_tensor);
+      }
+      if (!sync_tensors.empty()) {
+        encoder.record_tensor_sync_device(sync_tensors);
+      }
       encoder.record_algo_dispatch(
           vulkan::KernelRegistry::RMSNORM_BF16,
           {x_tensor, w_tensor, out_tensor},
@@ -1156,7 +1236,7 @@ void fast::RoPE::eval_gpu(
   uint32_t n_heads = 0;
   bool with_freqs = false;
   const char* rope_reject_reason = nullptr;
-  if (can_use_native_rope_bf16(
+  if (native_rope_enabled() && can_use_native_rope_bf16(
           inputs,
           outputs,
           dims_,
@@ -1210,8 +1290,19 @@ void fast::RoPE::eval_gpu(
             encode_push_constant_u32(forward_flag)};
 
         // Output tensor is written by the kernel; skip redundant upload.
-        encoder.record_tensor_sync_device(
-            {in_tensor, freqs_tensor, offset_tensor});
+        std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+        if (device.tensor_needs_sync_device(inputs[0])) {
+          sync_tensors.push_back(in_tensor);
+        }
+        if (device.tensor_needs_sync_device(inputs[2])) {
+          sync_tensors.push_back(freqs_tensor);
+        }
+        if (device.tensor_needs_sync_device(inputs[1])) {
+          sync_tensors.push_back(offset_tensor);
+        }
+        if (!sync_tensors.empty()) {
+          encoder.record_tensor_sync_device(sync_tensors);
+        }
         encoder.record_algo_dispatch(
             vulkan::KernelRegistry::ROPE_BF16_FREQS,
             {in_tensor, out_tensor, freqs_tensor, offset_tensor},
@@ -1236,8 +1327,16 @@ void fast::RoPE::eval_gpu(
             encode_push_constant_u32(forward_flag)};
 
         // Output tensor is written by the kernel; skip redundant upload.
-        encoder.record_tensor_sync_device(
-            {in_tensor, offset_tensor});
+        std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+        if (device.tensor_needs_sync_device(inputs[0])) {
+          sync_tensors.push_back(in_tensor);
+        }
+        if (device.tensor_needs_sync_device(inputs[1])) {
+          sync_tensors.push_back(offset_tensor);
+        }
+        if (!sync_tensors.empty()) {
+          encoder.record_tensor_sync_device(sync_tensors);
+        }
         encoder.record_algo_dispatch(
             vulkan::KernelRegistry::ROPE_BF16_T1,
             {in_tensor, out_tensor, offset_tensor},
@@ -1272,7 +1371,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
   uint32_t k_len = 0;
   uint32_t qk_dim = 0;
   uint32_t v_dim = 0;
-  if (can_use_native_sdpa_bf16_decode_q1(
+  if (native_sdpa_enabled() && can_use_native_sdpa_bf16_decode_q1(
           inputs,
           outputs,
           do_causal_,
@@ -1310,7 +1409,19 @@ void fast::ScaledDotProductAttention::eval_gpu(
           encode_push_constant_f32(scale_)};
 
       // Output tensor is write-only in this decode kernel.
-      encoder.record_tensor_sync_device({q_tensor, k_tensor, v_tensor});
+      std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+      if (device.tensor_needs_sync_device(inputs[0])) {
+        sync_tensors.push_back(q_tensor);
+      }
+      if (device.tensor_needs_sync_device(inputs[1])) {
+        sync_tensors.push_back(k_tensor);
+      }
+      if (device.tensor_needs_sync_device(inputs[2])) {
+        sync_tensors.push_back(v_tensor);
+      }
+      if (!sync_tensors.empty()) {
+        encoder.record_tensor_sync_device(sync_tensors);
+      }
       encoder.record_algo_dispatch(
           vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1,
           {q_tensor, k_tensor, v_tensor, out_tensor},

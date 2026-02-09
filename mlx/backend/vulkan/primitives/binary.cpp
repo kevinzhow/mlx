@@ -89,6 +89,29 @@ inline bool native_add_f32_enabled() {
       std::strcmp(env, "on") == 0;
 }
 
+inline bool env_flag_default_true(const char* name) {
+  const char* env = std::getenv(name);
+  if (!env) {
+    return true;
+  }
+  if (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 ||
+      std::strcmp(env, "off") == 0) {
+    return false;
+  }
+  return std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
+      std::strcmp(env, "on") == 0;
+}
+
+inline bool native_add_bf16_enabled() {
+  static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_ADD_BF16");
+  return enabled;
+}
+
+inline bool native_mul_bf16_enabled() {
+  static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_MUL_BF16");
+  return enabled;
+}
+
 inline bool dispatch_native_binary(
     Stream stream,
     const array& a,
@@ -114,8 +137,17 @@ inline bool dispatch_native_binary(
     const uint32_t groups_x = std::max<uint32_t>(1, (work_items + 255u) / 256u);
     const std::vector<uint32_t> push_consts{encode_push_constant_u32(n)};
 
-    // Output tensor is write-only for these kernels; avoid redundant H2D upload.
-    encoder.record_tensor_sync_device({a_tensor, b_tensor});
+    // Output tensor is write-only. Upload only host-authoritative inputs.
+    std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+    if (device.tensor_needs_sync_device(a)) {
+      sync_tensors.push_back(a_tensor);
+    }
+    if (device.tensor_needs_sync_device(b)) {
+      sync_tensors.push_back(b_tensor);
+    }
+    if (!sync_tensors.empty()) {
+      encoder.record_tensor_sync_device(sync_tensors);
+    }
     encoder.record_algo_dispatch(
         kernel_name,
         {a_tensor, b_tensor, out_tensor},
@@ -160,7 +192,8 @@ void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
   }
 
-  if (can_use_native_binary_bf16(inputs[0], inputs[1], out) &&
+  if (native_add_bf16_enabled() &&
+      can_use_native_binary_bf16(inputs[0], inputs[1], out) &&
       out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
     const uint32_t n = static_cast<uint32_t>(out.size());
     const uint32_t n_words = (n + 1u) / 2u;
@@ -199,7 +232,8 @@ void Multiply::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto s = out.primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, s);
 
-  if (can_use_native_binary_bf16(inputs[0], inputs[1], out) &&
+  if (native_mul_bf16_enabled() &&
+      can_use_native_binary_bf16(inputs[0], inputs[1], out) &&
       out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
     const uint32_t n = static_cast<uint32_t>(out.size());
     const uint32_t n_words = (n + 1u) / 2u;

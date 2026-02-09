@@ -393,6 +393,40 @@ void Device::mark_tensor_host_dirty(const array& arr, int stream_index) {
   it->second.pinned_tensor = std::move(tensor);
 }
 
+bool Device::tensor_needs_sync_device(const array& arr) {
+  const auto key = arr.id();
+  const auto data_ptr = arr.data<void>();
+  const auto nbytes = arr.nbytes();
+  const auto dtype = arr.dtype();
+  const auto data_ref = arr.data_shared_ptr();
+
+  std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+  auto it = tensor_cache_.find(key);
+  if (it == tensor_cache_.end()) {
+    return true;
+  }
+
+  const bool same_meta =
+      it->second.data_ptr == data_ptr && it->second.nbytes == nbytes &&
+      it->second.dtype == dtype && !it->second.data_ref.expired() &&
+      it->second.data_ref.lock() == data_ref;
+  if (!same_meta) {
+    tensor_cache_.erase(it);
+    return true;
+  }
+
+  auto tensor = it->second.pinned_tensor ? it->second.pinned_tensor
+                                         : it->second.tensor.lock();
+  if (!tensor) {
+    tensor_cache_.erase(it);
+    return true;
+  }
+
+  // host_dirty=true means device has the newest contents; uploading host memory
+  // would overwrite fresh device results with stale host data.
+  return !it->second.host_dirty;
+}
+
 void Device::sync_array_to_host_if_needed(const array& arr) {
   const auto key = arr.id();
   const auto data_ptr = arr.data<void>();

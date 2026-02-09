@@ -159,6 +159,7 @@ class MLX_API Device {
   std::shared_ptr<kp::Tensor> create_tensor(size_t size);
   void invalidate_tensor(const array& arr);
   void mark_tensor_host_dirty(const array& arr, int stream_index);
+  bool tensor_needs_sync_device(const array& arr);
   void sync_array_to_host_if_needed(const array& arr);
   void sync_dirty_tensors_for_stream(int stream_index);
   

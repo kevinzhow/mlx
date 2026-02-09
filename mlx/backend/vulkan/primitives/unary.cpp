@@ -95,7 +95,13 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
       const uint32_t groups_x = std::max<uint32_t>(1, (n + 255u) / 256u);
       const std::vector<uint32_t> push_consts{encode_push_constant_u32(n)};
 
-      encoder.record_tensor_sync_device({in_tensor, out_tensor});
+      std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+      if (device.tensor_needs_sync_device(inputs[0])) {
+        sync_tensors.push_back(in_tensor);
+      }
+      if (!sync_tensors.empty()) {
+        encoder.record_tensor_sync_device(sync_tensors);
+      }
       encoder.record_algo_dispatch(
           vulkan::KernelRegistry::SIN_F32,
           {in_tensor, out_tensor},
@@ -153,7 +159,13 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
       const uint32_t groups_x = std::max<uint32_t>(1, (n + 255u) / 256u);
       const std::vector<uint32_t> push_consts{encode_push_constant_u32(n)};
 
-      encoder.record_tensor_sync_device({in_tensor, out_tensor});
+      std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+      if (device.tensor_needs_sync_device(inputs[0])) {
+        sync_tensors.push_back(in_tensor);
+      }
+      if (!sync_tensors.empty()) {
+        encoder.record_tensor_sync_device(sync_tensors);
+      }
       encoder.record_algo_dispatch(
           vulkan::KernelRegistry::COS_F32,
           {in_tensor, out_tensor},
