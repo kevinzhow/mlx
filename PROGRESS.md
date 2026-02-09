@@ -564,3 +564,40 @@ python -m unittest discover -v
 1. 以 Metal `rope.cpp` 为蓝本，设计 Vulkan RoPE 的**正确寻址方案**（先覆盖 head/seq transpose，避免直接放宽门禁）。  
 2. 为该布局补充最小回归用例（至少覆盖 `shape=[B,H,T,D]` + transposed strides），门禁通过后再放量。  
 3. 在 RoPE 稳定后继续压缩 `Compiled/Matmul/Softmax` fallback 链路（目前仍是 decode 阶段稳定热点）。  
+
+---
+
+## 2026-02-09 深夜增量（ADD_F32 回归隔离修复）🛠️
+
+### 本轮变更
+1. 修复一处高风险正确性回归：暂时关闭 Vulkan 原生 `ADD_F32` 派发路径。  
+   - 现象：`DEVICE=gpu` 下 `float32` 加法出现随机值/`NaN`，连带导致 `test_fast` 中 `layer_norm`/`rms_norm_grad` 失败。  
+   - 处理：在 `mlx/backend/vulkan/primitives/binary.cpp` 中移除 `ADD_F32` 原生分支入口，保留现有 fallback 与 `bf16` 原生路径。  
+   - 备注：已加 `TODO`，后续在定位清楚根因后再重启 `ADD_F32`。
+
+### 关键验证结果
+1. 最小复现（`float32` add）恢复正确：  
+   - 修复前：`max_abs=nan`、`finite=False`  
+   - 修复后：`max_abs=0.0`、`finite=True`
+2. Python 关键失败项恢复：  
+   - `test_fast.TestFast.test_layer_norm`：通过  
+   - `test_fast.TestFast.test_layer_norm_grad`：通过  
+   - `test_fast.TestFast.test_rms_norm_grad`：通过  
+   - `test_fast.TestFast.test_rope` / `test_rope_with_freqs`：通过
+3. `test_fast.py` 全文件复测：仅剩历史 `custom_kernel` 相关错误（非本轮引入）。
+4. C++ 全量回归：  
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`  
+   - 结果：`223/223` 通过（`Total Test time (real) = 9.00 sec`）。
+5. 外部模型冒烟（实卡 Vulkan）：  
+   - `Qwen/Qwen3-0.6B-MLX-4bit`，`prompt="Hi what is your name"`，`max-tokens=10`  
+   - 结果：`Generation: 10 tokens, 3.284 tokens-per-sec`。
+
+### 当前状态
+- ✅ 当前分支下 `layer_norm` / `rms_norm_grad` correctness blocker 已解除。  
+- ⚠️ `ADD_F32` 暂时回退到非原生路径，吞吐最优性不是当前优先目标。  
+- ⚠️ `test_quantized` 的历史问题仍在（`GatherMM` float32 限制 + 1 项 `qmm` 阈值失败），与本轮修复无新增耦合。
+
+### 下一步（精确）
+1. 为 `ADD_F32` 建立最小 C++/Python 回归基准，定位 descriptor 绑定或 host/device 同步交互问题，修复后再放开原生路径。  
+2. 按 Metal 对照推进 `fast::RoPE` transposed layout（`[B,H,T,D]` + 特定 strides）正确寻址实现。  
+3. 继续用 `MLX_VK_PROFILE=1` 复盘热点，优先压缩 `fast::RoPE` / `fast::SDPA` fallback 占比。  

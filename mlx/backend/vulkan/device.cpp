@@ -174,7 +174,7 @@ void CommandEncoder::record_algo_dispatch(
     const std::string& kernel_name,
     const std::vector<std::shared_ptr<kp::Tensor>>& tensors,
     const std::vector<uint32_t>& workgroup,
-    const std::vector<float>& push_consts) {
+    const std::vector<uint32_t>& push_consts) {
   if (!encoding_begun_) begin_encoding();
   
   // Insert barrier if needed
@@ -398,6 +398,7 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
   const auto data_ref = arr.data_shared_ptr();
 
   std::shared_ptr<kp::Tensor> tensor;
+  int dirty_stream_index = -1;
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
     auto it = tensor_cache_.find(key);
@@ -415,11 +416,18 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
     if (!it->second.host_dirty) {
       return;
     }
+    dirty_stream_index = it->second.dirty_stream_index;
     tensor = it->second.tensor.lock();
     if (!tensor) {
       tensor_cache_.erase(it);
       return;
     }
+  }
+
+  // Ensure pending work on the producing stream is submitted before host sync.
+  if (dirty_stream_index >= 0) {
+    end_encoding(dirty_stream_index);
+    commit_command_buffer(dirty_stream_index);
   }
 
   auto seq = manager_->sequence();

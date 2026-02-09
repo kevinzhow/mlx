@@ -75,11 +75,8 @@ inline bool can_use_native_binary_bf16(
       is_row_contiguous_materialized(b) && out.flags().row_contiguous;
 }
 
-inline float encode_push_constant_u32(uint32_t value) {
-  float encoded = 0.0f;
-  static_assert(sizeof(float) == sizeof(uint32_t));
-  std::memcpy(&encoded, &value, sizeof(uint32_t));
-  return encoded;
+inline uint32_t encode_push_constant_u32(uint32_t value) {
+  return value;
 }
 
 inline bool dispatch_native_binary(
@@ -105,7 +102,7 @@ inline bool dispatch_native_binary(
 
     const uint32_t n = static_cast<uint32_t>(out.size());
     const uint32_t groups_x = std::max<uint32_t>(1, (work_items + 255u) / 256u);
-    const std::vector<float> push_consts{encode_push_constant_u32(n)};
+    const std::vector<uint32_t> push_consts{encode_push_constant_u32(n)};
 
     // Output tensor is write-only for these kernels; avoid redundant H2D upload.
     encoder.record_tensor_sync_device({a_tensor, b_tensor});
@@ -114,9 +111,7 @@ inline bool dispatch_native_binary(
         {a_tensor, b_tensor, out_tensor},
         {groups_x, 1, 1},
         push_consts);
-    if (out.data<void>() != out_tensor->rawData()) {
-      device.mark_tensor_host_dirty(out, stream.index);
-    }
+    device.mark_tensor_host_dirty(out, stream.index);
     return true;
   } catch (const std::exception&) {
     return false;
@@ -140,20 +135,8 @@ void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto s = out.primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, s);
 
-  if (can_use_native_binary_f32(inputs[0], inputs[1], out) &&
-      out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
-    const uint32_t n = static_cast<uint32_t>(out.size());
-    if (dispatch_native_binary(
-            s,
-            inputs[0],
-            inputs[1],
-            out,
-            vulkan::KernelRegistry::ADD_F32,
-            n,
-            &profile)) {
-      return;
-    }
-  }
+  // TODO(vulkan): Re-enable native ADD_F32 once host/device sync and descriptor
+  // binding semantics are fully validated across fallback boundaries.
 
   if (can_use_native_binary_bf16(inputs[0], inputs[1], out) &&
       out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {

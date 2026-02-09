@@ -1,6 +1,7 @@
 // Copyright © 2026 MLX Vulkan Backend
 #include "mlx/backend/vulkan/kernel_registry.h"
 
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -122,10 +123,20 @@ std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
     kp::Manager& manager,
     const std::vector<std::shared_ptr<kp::Tensor>>& params,
     const kp::Workgroup& workgroup,
-    const std::vector<float>& push_consts) {
+    const std::vector<uint32_t>& push_consts) {
   
   // 构建 cache key
-  std::string cache_key = build_algorithm_key(kernel_name, params.size(), workgroup, push_consts);
+  std::stringstream cache_key_ss;
+  cache_key_ss
+      << build_algorithm_key(kernel_name, params.size(), workgroup, push_consts);
+  // Algorithm objects capture descriptor sets bound to specific Tensor objects.
+  // Include Tensor identity in cache key to avoid reusing pipelines with stale
+  // buffer bindings across different arrays.
+  for (const auto& tensor : params) {
+    cache_key_ss << "_t" << std::hex
+                 << reinterpret_cast<std::uintptr_t>(tensor.get());
+  }
+  std::string cache_key = cache_key_ss.str();
   
   {
     std::lock_guard<std::mutex> lock(algorithms_mutex_);
@@ -149,7 +160,7 @@ std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
   if (push_consts.empty()) {
     algo = manager.algorithm(params, spirv, workgroup);
   } else {
-    algo = manager.algorithm(params, spirv, workgroup, {}, push_consts);
+    algo = manager.algorithm(params, spirv, workgroup, std::vector<float>{}, push_consts);
   }
   
   // 缓存 algorithm
@@ -196,13 +207,11 @@ std::string build_algorithm_key(
     const std::string& kernel_name,
     size_t num_params,
     const kp::Workgroup& workgroup,
-    const std::vector<float>& push_consts) {
+    const std::vector<uint32_t>& push_consts) {
   std::stringstream ss;
   ss << kernel_name << "_" << num_params << "_"
      << workgroup[0] << "_" << workgroup[1] << "_" << workgroup[2];
-  for (float f : push_consts) {
-    uint32_t u;
-    std::memcpy(&u, &f, sizeof(uint32_t));
+  for (uint32_t u : push_consts) {
     ss << "_" << std::hex << std::setw(8) << std::setfill('0') << u;
   }
   return ss.str();

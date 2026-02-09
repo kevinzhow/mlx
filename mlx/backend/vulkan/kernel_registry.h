@@ -2,6 +2,7 @@
 #pragma once
 
 #include <kompute/Kompute.hpp>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -41,7 +42,7 @@ class KernelRegistry {
       kp::Manager& manager,
       const std::vector<std::shared_ptr<kp::Tensor>>& params,
       const kp::Workgroup& workgroup = kp::Workgroup({256, 1, 1}),
-      const std::vector<float>& push_consts = {});
+      const std::vector<uint32_t>& push_consts = {});
   
   // 清理缓存
   void clear_cache();
@@ -84,6 +85,6 @@ std::string build_algorithm_key(
     const std::string& kernel_name,
     size_t num_params,
     const kp::Workgroup& workgroup,
-    const std::vector<float>& push_consts = {});
+    const std::vector<uint32_t>& push_consts = {});
 
 } // namespace mlx::core::vulkan

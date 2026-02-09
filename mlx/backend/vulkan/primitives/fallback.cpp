@@ -237,11 +237,15 @@ inline void mark_qmm_const_tensor_uploaded(std::uintptr_t key) {
   }
 }
 
-inline float encode_push_constant_u32(uint32_t value) {
-  float encoded = 0.0f;
+inline uint32_t encode_push_constant_u32(uint32_t value) {
+  return value;
+}
+
+inline uint32_t encode_push_constant_f32(float value) {
+  uint32_t bits = 0;
   static_assert(sizeof(float) == sizeof(uint32_t));
-  std::memcpy(&encoded, &value, sizeof(uint32_t));
-  return encoded;
+  std::memcpy(&bits, &value, sizeof(uint32_t));
+  return bits;
 }
 
 inline bool can_use_native_affine_bf16_quantized_matmul(
@@ -744,7 +748,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       const uint32_t out_words = out_elems / 2u;
       const uint32_t groups_x = std::max<uint32_t>(1, (out_words + 63u) / 64u);
 
-      const std::vector<float> push_consts{
+      const std::vector<uint32_t> push_consts{
           encode_push_constant_u32(out_elems),
           encode_push_constant_u32(n),
           encode_push_constant_u32(k),
@@ -781,9 +785,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
            out_tensor},
           {groups_x, 1, 1},
           push_consts);
-      if (out.data<void>() != out_tensor->rawData()) {
-        device.mark_tensor_host_dirty(out, stream.index);
-      }
+      device.mark_tensor_host_dirty(out, stream.index);
       return;
     } catch (const std::exception&) {
       // Fall through to CPU fallback.
@@ -976,11 +978,11 @@ void fast::RMSNorm::eval_gpu(
       auto w_tensor = device.get_tensor(inputs[1]);
       auto out_tensor = device.get_tensor(out);
 
-      const std::vector<float> push_consts{
+      const std::vector<uint32_t> push_consts{
           encode_push_constant_u32(n_rows),
           encode_push_constant_u32(axis_size),
           encode_push_constant_u32(w_stride),
-          eps_};
+          encode_push_constant_f32(eps_)};
 
       // Output tensor is write-only in this dispatch.
       encoder.record_tensor_sync_device({x_tensor, w_tensor});
@@ -989,9 +991,7 @@ void fast::RMSNorm::eval_gpu(
           {x_tensor, w_tensor, out_tensor},
           {n_rows, 1, 1},
           push_consts);
-      if (out.data<void>() != out_tensor->rawData()) {
-        device.mark_tensor_host_dirty(out, stream.index);
-      }
+      device.mark_tensor_host_dirty(out, stream.index);
       return;
     } catch (const std::exception&) {
       // Fall through to fallback path.
@@ -1063,7 +1063,7 @@ void fast::RoPE::eval_gpu(
       const uint32_t traditional_flag = traditional_ ? 1u : 0u;
       if (with_freqs) {
         auto freqs_tensor = device.get_tensor(inputs[2]);
-        const std::vector<float> push_consts{
+        const std::vector<uint32_t> push_consts{
             encode_push_constant_u32(n_rows),
             encode_push_constant_u32(half_dims),
             encode_push_constant_u32(row_stride),
@@ -1071,7 +1071,7 @@ void fast::RoPE::eval_gpu(
             encode_push_constant_u32(rows_per_batch),
             encode_push_constant_u32(offset_is_vector),
             encode_push_constant_u32(traditional_flag),
-            scale_,
+            encode_push_constant_f32(scale_),
             encode_push_constant_u32(forward_flag)};
 
         // Output tensor is written by the kernel; skip redundant upload.
@@ -1083,7 +1083,7 @@ void fast::RoPE::eval_gpu(
             {n_rows, 1, 1},
             push_consts);
       } else {
-        const std::vector<float> push_consts{
+        const std::vector<uint32_t> push_consts{
             encode_push_constant_u32(n_rows),
             encode_push_constant_u32(half_dims),
             encode_push_constant_u32(row_stride),
@@ -1091,8 +1091,8 @@ void fast::RoPE::eval_gpu(
             encode_push_constant_u32(rows_per_batch),
             encode_push_constant_u32(offset_is_vector),
             encode_push_constant_u32(traditional_flag),
-            scale_,
-            std::log2(base_),
+            encode_push_constant_f32(scale_),
+            encode_push_constant_f32(std::log2(base_)),
             encode_push_constant_u32(forward_flag)};
 
         // Output tensor is written by the kernel; skip redundant upload.
@@ -1104,9 +1104,7 @@ void fast::RoPE::eval_gpu(
             {n_rows, 1, 1},
             push_consts);
       }
-      if (out.data<void>() != out_tensor->rawData()) {
-        device.mark_tensor_host_dirty(out, stream.index);
-      }
+      device.mark_tensor_host_dirty(out, stream.index);
       return;
     } catch (const std::exception&) {
       // Fall through to fallback path.
@@ -1162,14 +1160,14 @@ void fast::ScaledDotProductAttention::eval_gpu(
       auto out_tensor = device.get_tensor(out);
 
       const uint32_t n_work = batch_size * n_q_heads;
-      const std::vector<float> push_consts{
+      const std::vector<uint32_t> push_consts{
           encode_push_constant_u32(batch_size),
           encode_push_constant_u32(n_q_heads),
           encode_push_constant_u32(n_kv_heads),
           encode_push_constant_u32(k_len),
           encode_push_constant_u32(qk_dim),
           encode_push_constant_u32(v_dim),
-          scale_};
+          encode_push_constant_f32(scale_)};
 
       // Output tensor is write-only in this decode kernel.
       encoder.record_tensor_sync_device({q_tensor, k_tensor, v_tensor});
@@ -1178,9 +1176,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
           {q_tensor, k_tensor, v_tensor, out_tensor},
           {n_work, 1, 1},
           push_consts);
-      if (out.data<void>() != out_tensor->rawData()) {
-        device.mark_tensor_host_dirty(out, stream.index);
-      }
+      device.mark_tensor_host_dirty(out, stream.index);
       return;
     } catch (const std::exception&) {
       // Fall through to fallback path.

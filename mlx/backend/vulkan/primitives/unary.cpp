@@ -57,11 +57,8 @@ inline bool can_use_native_unary_f32(
       in.data_size() == in.size();
 }
 
-inline float encode_push_constant_u32(uint32_t value) {
-  float encoded = 0.0f;
-  static_assert(sizeof(float) == sizeof(uint32_t));
-  std::memcpy(&encoded, &value, sizeof(uint32_t));
-  return encoded;
+inline uint32_t encode_push_constant_u32(uint32_t value) {
+  return value;
 }
 
 } // namespace
@@ -96,7 +93,7 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
 
       const uint32_t n = static_cast<uint32_t>(out.size());
       const uint32_t groups_x = std::max<uint32_t>(1, (n + 255u) / 256u);
-      const std::vector<float> push_consts{encode_push_constant_u32(n)};
+      const std::vector<uint32_t> push_consts{encode_push_constant_u32(n)};
 
       encoder.record_tensor_sync_device({in_tensor, out_tensor});
       encoder.record_algo_dispatch(
@@ -154,7 +151,7 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
 
       const uint32_t n = static_cast<uint32_t>(out.size());
       const uint32_t groups_x = std::max<uint32_t>(1, (n + 255u) / 256u);
-      const std::vector<float> push_consts{encode_push_constant_u32(n)};
+      const std::vector<uint32_t> push_consts{encode_push_constant_u32(n)};
 
       encoder.record_tensor_sync_device({in_tensor, out_tensor});
       encoder.record_algo_dispatch(

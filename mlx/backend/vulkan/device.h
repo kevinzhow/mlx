@@ -47,7 +47,7 @@ struct MLX_API CommandEncoder {
       const std::string& kernel_name,
       const std::vector<std::shared_ptr<kp::Tensor>>& tensors,
       const std::vector<uint32_t>& workgroup = {256, 1, 1},
-      const std::vector<float>& push_consts = {});
+      const std::vector<uint32_t>& push_consts = {});
 
   // Dispatch (triggers actual recording to sequence)
   void dispatch_threadgroups(uint32_t groups_x, uint32_t groups_y = 1, uint32_t groups_z = 1);
