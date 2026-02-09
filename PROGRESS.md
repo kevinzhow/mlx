@@ -870,3 +870,13 @@ python -m unittest discover -v
 1. 继续收敛 `test_quantized` 历史容差边界失败（非当前 Vulkan native 覆盖项）并区分平台/精度期望。
 2. 聚焦 SDPA decode/prefill 主路径优化（先诊断卡住原因，再小步放宽 gate）。
 3. 在每次放宽后保持 `Qwen3` 1/10 token 正确性冒烟 + `ctest`/Python 门禁。
+
+### 2026-02-10 凌晨增量（运行参数文档固化）📝
+
+- 已在 `AGENTS.md` 新增 `Runtime Parameters (Vulkan + Qwen3)` 小节，固化实卡 Vulkan 运行参数与标准命令：
+  - `LD_LIBRARY_PATH`（Kompute 动态库路径）
+  - `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json`
+  - `MESA_VK_DEVICE_SELECT=1002:1900`
+  - `PYTHONPATH=python`、`TARGET_DEVICE=gpu`
+- 已记录标准 Qwen3 正确性命令（含 `prompt="你好啊"`、`max_tokens=10`）与 split-prefill 检查命令。
+- 已记录常用 debug 环境变量与 native gate 开关，便于后续快速复现实验。

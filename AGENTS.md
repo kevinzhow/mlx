@@ -68,6 +68,41 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - GPU path links and initializes with Vulkan enabled.
   - Covered operators match CPU results.
 
+## Runtime Parameters (Vulkan + Qwen3)
+
+- Use this baseline runtime env for real-GPU Vulkan validation:
+  - `LD_LIBRARY_PATH=build/temp.linux-x86_64-cpython-312/mlx.core/_deps/kompute-build/src:$LD_LIBRARY_PATH`
+  - `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json`
+  - `MESA_VK_DEVICE_SELECT=1002:1900`
+  - `PYTHONPATH=python`
+  - `TARGET_DEVICE=gpu`
+- Default native gates expected on current mainline:
+  - `MLX_VK_ENABLE_QMM_NATIVE=1` (default ON)
+  - `MLX_VK_ENABLE_RMSNORM_NATIVE=1` (default ON)
+  - `MLX_VK_ENABLE_ROPE_NATIVE=1` (default ON)
+  - `MLX_VK_ENABLE_SDPA_NATIVE=1` (default ON, still narrow gate in code)
+
+### Standard Qwen3 correctness checks
+
+- 10-token check (Chinese prompt):
+  - `timeout 180s env LD_LIBRARY_PATH=build/temp.linux-x86_64-cpython-312/mlx.core/_deps/kompute-build/src:$LD_LIBRARY_PATH VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 PYTHONPATH=python TARGET_DEVICE=gpu python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "你好啊" --max-tokens 10 --temp 0`
+- 10-token check (English prompt):
+  - `timeout 180s env LD_LIBRARY_PATH=build/temp.linux-x86_64-cpython-312/mlx.core/_deps/kompute-build/src:$LD_LIBRARY_PATH VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 PYTHONPATH=python TARGET_DEVICE=gpu python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi what is your name" --max-tokens 10 --temp 0`
+- Split-prefill finite check helper:
+  - `timeout 180s env LD_LIBRARY_PATH=build/temp.linux-x86_64-cpython-312/mlx.core/_deps/kompute-build/src:$LD_LIBRARY_PATH VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 PYTHONPATH=python TARGET_DEVICE=gpu python3 /tmp/check_split_prefill.py`
+
+### Optional debug env (only when bisecting)
+
+- `MLX_VK_DEBUG_ROPE_REJECT=1`
+- `MLX_VK_DEBUG_SDPA_REJECT=1`
+- Native gate toggles for isolation:
+  - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
+  - `MLX_VK_ENABLE_RMSNORM_NATIVE=0|1`
+  - `MLX_VK_ENABLE_ROPE_NATIVE=0|1`
+  - `MLX_VK_ENABLE_SDPA_NATIVE=0|1`
+  - `MLX_VK_ENABLE_ADD_BF16=0|1`
+  - `MLX_VK_ENABLE_MUL_BF16=0|1`
+
 ## Definition of Done
 
 - `mlx` builds and links cleanly with `MLX_BUILD_VULKAN=ON`.
