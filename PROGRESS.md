@@ -65,6 +65,30 @@
 
 ## 当前状态（2026-02-09 最新）
 
+### 2026-02-09 晚间增量（性能专项）
+- ✅ 识别并修复了“首 token 超慢”的关键构建因素：`build/CMakeCache.txt` 中 `CMAKE_BUILD_TYPE` 为空（无优化编译），导致 CPU fallback 热点性能严重退化。  
+  处理：新增 `build_release_vulkan`，使用  
+  `-DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF -DMLX_BUILD_PYTHON_BINDINGS=ON -DCMAKE_BUILD_TYPE=Release` 重新构建 `core`。
+- ✅ 关闭 Kompute 运行时日志（减少噪声与额外开销）：  
+  `mlx/backend/vulkan/CMakeLists.txt` 增加  
+  `set(KOMPUTE_OPT_LOG_LEVEL "Off" CACHE STRING "" FORCE)`。
+- ✅ 基于 gdb 栈采样命中 `cpu/quantized.cpp::_qmm_t<...>` 热点后，完成 CPU 量化 matmul 转置路径并行化：  
+  在 `mlx/backend/cpu/quantized.cpp` 为 `_qmm_t` / `_qmm_t_simd` / `fp_qmm_t` / `fp_qmm_t_simd` 增加按输出列切分的多线程执行（`std::thread`，带最小工作量阈值）。
+
+### 新性能验证（实卡 Vulkan + Release）
+- 命令（1 token 诊断）：
+  `TARGET_DEVICE=gpu VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 PYTHONPATH=python venv/bin/python /tmp/profile_first_token_device.py`
+- 结果：
+  - `load_done_sec=0.984`
+  - `first_token_sec=6.178`（仅 Release + 日志关闭，未并行 qmm）
+  - `first_token_sec=1.866`（并行 qmm 后，GPU）
+  - `first_token_sec=1.914`（并行 qmm 后，CPU）
+- 命令（40 token 速度）：
+  `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 PYTHONPATH=python venv/bin/python -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi" --max-tokens 40 --temp 0`
+- 结果：
+  - 变更前（Release 未并行 qmm）：`Generation: 0.339 tokens-per-sec`
+  - 变更后（并行 qmm）：`Generation: 1.700 tokens-per-sec`（约 5.0x）
+
 ### 验证结果
 - ✅ C++ 全量通过：`223/223`（`ctest --test-dir build --output-on-failure --timeout 120`）
 - ✅ Python 全量通过：`673` tests passed, `36` skipped  
@@ -75,11 +99,59 @@
   - `test_quantized.py` `27/27`
   - `test_eval.py` `13/13`（1 skip）
   - `test_array.py` `69/69`（1 skip）
+- ✅ 外部模型加载冒烟通过（`2026-02-09`）  
+  命令：`PYTHONPATH=python python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi" --max-tokens 1 --temp 0`  
+  结果：模型成功加载并生成 `1` token（输出为 `<think>`）。
+- ✅ 外部模型 40-token 速度冒烟通过（`2026-02-09`）  
+  命令：`PYTHONPATH=python python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi" --max-tokens 40 --temp 0`  
+  结果：`Generation: 40 tokens, 0.395 tokens-per-sec`（Prompt: `9 tokens, 0.465 tokens-per-sec`，Peak memory: `0.347 GB`）。
+- ✅ 强制 Vulkan Python 构建链路验证（`2026-02-09`）  
+  命令：`cmake -S . -B build -DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF -DMLX_BUILD_PYTHON_BINDINGS=ON`，随后 `cmake --build build --target core -j`。  
+  运行时：`mx.default_device() == Device(gpu, 0)`，`mx.device_info(mx.Device(mx.gpu,0)) == {'architecture': 'vulkan', 'device_name': 'Vulkan GPU (Kompute)'}`。  
+  构建修复：去除 `mlx/backend/vulkan/primitives/fallback.cpp` 中 `VULKAN_CPU_FALLBACK(Sin)` 重复定义，消除 `core` 链接期 duplicate symbol。  
+  备注：在受限沙箱内可能退化到 `llvmpipe`；在非沙箱权限下可枚举到硬件 `AMD Radeon Graphics (RADV PHOENIX)`。
+- ✅ `ctest` 实卡识别验证通过（`2026-02-09`）  
+  命令：`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 strace -f -e trace=openat,access -o /tmp/ctest_gpu_strace.log ctest --test-dir build -R "test device placement" --output-on-failure --timeout 180`。  
+  结果：`test device placement` 通过；`strace` 显示测试进程打开 `/usr/share/vulkan/icd.d/radeon_icd.json`、加载 `/lib/x86_64-linux-gnu/libvulkan_radeon.so`，并以 `O_RDWR` 打开 `/dev/dri/renderD128`。  
+  结论：`ctest` 进程可在 Vulkan 配置下识别并访问真实显卡（非 llvmpipe 路径）。
+- ✅ 实卡环境全量 `ctest` 通过（`2026-02-09`）  
+  命令：`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json MESA_VK_DEVICE_SELECT=1002:1900 ctest --test-dir build --output-on-failure --timeout 120`。  
+  结果：`100% tests passed, 0 tests failed out of 223`，`Total Test time (real) = 12.43 sec`。  
+- ✅ Release 构建 + 并行 qmm 版本 C++ 全量通过（`2026-02-09`）  
+  命令：`ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`（实卡 Vulkan 环境）。  
+  结果：`223/223` 通过，`Total Test time (real) = 9.46 sec`。
+- ✅ Python `async_eval` GPU 挂起修复（`2026-02-09`）  
+  复现定位：`DEVICE=gpu` 下 `test_eval.TestEval.test_async_eval` 卡在 `mx.async_eval(x)`；`gdb` 栈指向 `prepare_inputs_for_cpu_fallback -> Add::eval_gpu -> async_eval`。  
+  根因：Vulkan fallback 在输入已绑定同 stream 未 signal event 时调用 `array::wait()`，等待同轮 `eval_impl(async)` 尾部才 signal 的 event，形成自等待死锁。  
+  修复：将 `prepare_inputs_for_cpu_fallback` 改为 stream-aware 策略（`binary.cpp` / `unary.cpp` / `fallback.cpp`）：  
+  - `unscheduled` 输入仍 `eval()`；  
+  - event 已 signaled 则 `detach_event()`；  
+  - 仅在 event 属于不同 stream 时 `event.wait(stream)`；  
+  - 同 stream 未 signaled event 不阻塞。  
+  验证：  
+  - 最小复现脚本通过：`mx.async_eval(x)` 正常返回；  
+  - `python -m unittest -v test_eval.TestEval.test_async_eval`（`DEVICE=gpu`）通过；  
+  - `python/tests/test_eval.py` 全量通过：`13/13`；  
+  - 修复后实卡全量 `ctest` 复测通过：`223/223`（`Total Test time (real) = 11.08 sec`）。  
+  备注：验证时需确保 `python/mlx/core.cpython-312-x86_64-linux-gnu.so` 与 `build/core.cpython-312-x86_64-linux-gnu.so` 同步，避免误加载旧扩展。
+- ⚠️ Vulkan 路径 1-token 性能冒烟未在时限内完成（`2026-02-09`）  
+  命令：`timeout 60s env PYTHONPATH=python python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi" --max-tokens 1 --temp 0`  
+  结果：`exit_code=124`（60 秒超时，未输出 Prompt/Generation 统计）。
+- ⚠️ 非沙箱（硬件 Vulkan）1-token 本地路径基准仍未在时限内完成（`2026-02-09`）  
+  环境：`vulkaninfo` 显示 `GPU0 = AMD Radeon Graphics (RADV PHOENIX)`。  
+  命令：`timeout 180s env PYTHONPATH=python python3 /tmp/bench_vulkan_1tok.py`（本地快照路径，绕过网络）。  
+  结果：`default_device=Device(gpu,0)`、`gpu_available=True`、`load_done_sec=0.924`，但 180 秒内未返回首 token（`exit_code=124`）。
+- ✅ 首 token 阻塞已解除（`2026-02-09` 晚）  
+  旧问题来源于未优化构建 + qmm 单核热点；修复后首 token 在 2 秒量级完成（见上方“新性能验证”）。
 
 ### 当前阻塞
 - 当前验证范围内暂无已复现的 correctness blocker。
 - `PROGRESS.md` 中旧的“Python 失败清单”已过时，保留为历史记录；当前以本节验证结果为准。
 - 仍存在架构层面的目标差距：部分路径仍依赖 CPU fallback（虽正确，但未达到“尽量原生 Vulkan 执行”的终态）。
+- `async_eval` GPU 死锁与首 token 超时问题已修复；当前主要 runtime blocker 转为“Vulkan 路径仍高度依赖 CPU fallback（尤其 QuantizedMatmul）”，GPU 与 CPU 首 token 速度接近（约 1.9s），说明原生 Vulkan 算子覆盖仍不足。
+- `pip install -e .` 在 `CMAKE_ARGS='-DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF'` 下失败：`install(EXPORT "MLXTargets" ...) includes target "mlx" which requires target "kompute" that is not in any export set`。
+- 运行环境差异已确认：沙箱内对 `/dev/dri/renderD128` 缺少 `O_RDWR` 权限会退化到 `llvmpipe`；非沙箱可见硬件 Radeon。
+- `python/tests` 在 `DEVICE=gpu` 下的 `test_quantized` 仍有历史问题（`GatherMM` float32 限制与 1 个 qmm 精度阈值失败）；`DEVICE=cpu` 下 `test_quantized` 全通过。该项需单独梳理 Vulkan fallback 与 dtype 契约。
 
 ## 下一步计划（从“修错”转向“降级 fallback 占比”）
 
@@ -181,10 +253,19 @@
 ## 下一步（执行入口）
 
 1. 统一其它非宏 fallback 路径到同一契约  
-当前 `mlx/backend/vulkan/primitives/binary.cpp` / `mlx/backend/vulkan/primitives/unary.cpp` 仍有“直接 `eval_cpu + synchronize`”分支，建议复用同一 keepalive 模式，避免潜在同类问题。
+已完成第一阶段（死锁修复）：`binary.cpp` / `unary.cpp` / `fallback.cpp` 的输入准备逻辑已改为 stream-aware，避免 `async_eval` 同轮 event 自等待。  
+下一阶段：将 `binary.cpp` / `unary.cpp` 中“直接 `eval_cpu (+ synchronize)`”路径进一步收敛到 `fallback.cpp` 同款 keepalive 框架，减少语义分叉。
 
 2. 按优先级推进原生 Vulkan 基础算子覆盖（减少 CPU fallback）  
 优先实现/强化：copy、reshape、fill、concatenate、slicing 的原生 Vulkan 路径与 stream 语义。
+
+3. 聚焦 runtime 性能阻塞（首 token）  
+在 `-DMLX_BUILD_VULKAN=ON` + 实卡环境下，对 `Qwen3-0.6B-MLX-4bit` 做首 token profiling，定位高耗时 fallback/同步热点并优先替换。
+已完成首轮定位与缓解：`qmm` CPU 热点并行化后吞吐显著提升。  
+下一阶段聚焦：
+- 优先推进 `QuantizedMatmul` 原生 Vulkan 实现（或等价高性能路径），降低 CPU fallback 占比；
+- 梳理 `DEVICE=gpu` 下 `test_quantized` 失败项（`GatherMM` dtype 限制、qmm 精度阈值）并分离“历史问题”与“新回归”；
+- 统一使用 Release 构建基线做性能对比，避免无优化构建造成误判。
 
 3. 进入下一轮门禁  
 - C++：`ctest --test-dir build --output-on-failure --timeout 120`

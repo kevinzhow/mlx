@@ -12,11 +12,22 @@
 
 namespace {
 
-inline void prepare_inputs_for_cpu_fallback(const std::vector<mlx::core::array>& inputs) {
+inline void prepare_inputs_for_cpu_fallback(
+    const std::vector<mlx::core::array>& inputs,
+    mlx::core::Stream stream) {
   for (const auto& in : inputs) {
     auto& mutable_in = const_cast<mlx::core::array&>(in);
     if (mutable_in.status() == mlx::core::array::Status::unscheduled) {
       mutable_in.eval();
+      continue;
+    }
+
+    if (mutable_in.event().valid()) {
+      if (mutable_in.event().is_signaled()) {
+        mutable_in.detach_event();
+      } else if (mutable_in.event().stream() != stream) {
+        mutable_in.event().wait(stream);
+      }
     } else {
       mutable_in.wait();
     }
@@ -61,7 +72,7 @@ inline void run_cpu_fallback_single(
     const std::vector<mlx::core::array>& inputs,
     mlx::core::array& out,
     EvalFn&& eval_fn) {
-  prepare_inputs_for_cpu_fallback(inputs);
+  prepare_inputs_for_cpu_fallback(inputs, out.primitive().stream());
   std::forward<EvalFn>(eval_fn)();
   finalize_cpu_fallback(inputs, [&](auto& buffers) {
     collect_keepalive_buffers(out, buffers);
@@ -73,7 +84,9 @@ inline void run_cpu_fallback_multi(
     const std::vector<mlx::core::array>& inputs,
     std::vector<mlx::core::array>& outputs,
     EvalFn&& eval_fn) {
-  prepare_inputs_for_cpu_fallback(inputs);
+  auto stream = outputs.empty() ? mlx::core::default_stream(mlx::core::default_device())
+                                : outputs.front().primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
   std::forward<EvalFn>(eval_fn)();
   finalize_cpu_fallback(inputs, [&](auto& buffers) {
     for (const auto& out : outputs) {
@@ -173,7 +186,7 @@ VULKAN_CPU_FALLBACK(SegmentedMM)
 VULKAN_CPU_FALLBACK(Select)
 VULKAN_CPU_FALLBACK(Sigmoid)
 VULKAN_CPU_FALLBACK(Sign)
-VULKAN_CPU_FALLBACK(Sin)
+// VULKAN_CPU_FALLBACK(Sin)  // Native Vulkan implementation in unary.cpp
 VULKAN_CPU_FALLBACK(Sinh)
 VULKAN_CPU_FALLBACK(Softmax)
 VULKAN_CPU_FALLBACK(Sort)
@@ -236,7 +249,9 @@ VULKAN_NO_GPU_MULTI(fast::CustomKernel)
 void fast::Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  prepare_inputs_for_cpu_fallback(inputs);
+  auto stream = outputs.empty() ? default_stream(default_device())
+                                : outputs.front().primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
   auto fallback_outputs = fallback_(inputs);
   if (fallback_outputs.size() != outputs.size()) {
     throw std::runtime_error(

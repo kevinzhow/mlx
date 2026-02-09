@@ -17,11 +17,22 @@ namespace mlx::core {
 
 namespace {
 
-inline void prepare_inputs_for_cpu_fallback(const std::vector<array>& inputs) {
+inline void prepare_inputs_for_cpu_fallback(
+    const std::vector<array>& inputs,
+    Stream stream) {
   for (const auto& in : inputs) {
     auto& mutable_in = const_cast<array&>(in);
     if (mutable_in.status() == array::Status::unscheduled) {
       mutable_in.eval();
+      continue;
+    }
+
+    if (mutable_in.event().valid()) {
+      if (mutable_in.event().is_signaled()) {
+        mutable_in.detach_event();
+      } else if (mutable_in.event().stream() != stream) {
+        mutable_in.event().wait(stream);
+      }
     } else {
       mutable_in.wait();
     }
@@ -59,7 +70,8 @@ void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
     throw std::runtime_error("Vulkan not available");
   }
   
-  prepare_inputs_for_cpu_fallback(inputs);
+  auto s = out.primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, s);
 
   if (can_use_native_add_f32(inputs[0], inputs[1], out) &&
       out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
@@ -68,7 +80,6 @@ void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
         out.set_data(allocator::malloc(out.nbytes()));
       }
 
-      auto s = out.primitive().stream();
       auto& device = vulkan::device(s.device);
       auto& encoder = device.get_command_encoder(s.index);
       encoder.begin_encoding();
@@ -111,7 +122,7 @@ void Multiply::eval_gpu(const std::vector<array>& inputs, array& out) {
     throw std::runtime_error("Vulkan not available");
   }
   
-  prepare_inputs_for_cpu_fallback(inputs);
+  prepare_inputs_for_cpu_fallback(inputs, out.primitive().stream());
   eval_cpu(inputs, out);
   synchronize(default_stream(Device::cpu));
 }
@@ -121,7 +132,7 @@ void Subtract::eval_gpu(const std::vector<array>& inputs, array& out) {
     throw std::runtime_error("Vulkan not available");
   }
   
-  prepare_inputs_for_cpu_fallback(inputs);
+  prepare_inputs_for_cpu_fallback(inputs, out.primitive().stream());
   eval_cpu(inputs, out);
   synchronize(default_stream(Device::cpu));
 }
@@ -131,7 +142,7 @@ void Divide::eval_gpu(const std::vector<array>& inputs, array& out) {
     throw std::runtime_error("Vulkan not available");
   }
   
-  prepare_inputs_for_cpu_fallback(inputs);
+  prepare_inputs_for_cpu_fallback(inputs, out.primitive().stream());
   eval_cpu(inputs, out);
   synchronize(default_stream(Device::cpu));
 }

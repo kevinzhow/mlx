@@ -58,6 +58,7 @@ if(NOT TARGET kompute::kompute)
   set(KOMPUTE_OPT_BUILD_SINGLE_HEADER OFF CACHE BOOL "" FORCE)
   set(KOMPUTE_OPT_USE_BUILT_IN_SPDLOG OFF CACHE BOOL "" FORCE)
   set(KOMPUTE_OPT_USE_BUILT_IN_FMT OFF CACHE BOOL "" FORCE)  # Use MLX's fmt
+  set(KOMPUTE_OPT_LOG_LEVEL "Off" CACHE STRING "" FORCE)
   
   FetchContent_MakeAvailable(kompute)
   message(STATUS "Kompute fetched successfully")

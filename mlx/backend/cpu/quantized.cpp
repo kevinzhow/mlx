@@ -10,6 +10,8 @@
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
 
+#include <thread>
+
 namespace mlx::core {
 
 namespace {
@@ -67,6 +69,53 @@ inline constexpr short get_pack_factor(int bits, int wsize = 8) {
 inline constexpr short get_bytes_per_pack(int bits, int wsize = 8) {
   auto power_of_2_bits = (bits & (bits - 1)) == 0;
   return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
+}
+
+template <typename Fn>
+void parallel_for_outputs(int total_outputs, int min_outputs_per_thread, Fn&& fn) {
+  if (total_outputs <= 0) {
+    return;
+  }
+
+  int max_threads = static_cast<int>(std::thread::hardware_concurrency());
+  if (max_threads <= 1 || total_outputs <= min_outputs_per_thread) {
+    for (int i = 0; i < total_outputs; ++i) {
+      fn(i);
+    }
+    return;
+  }
+
+  int num_threads =
+      std::min(max_threads, (total_outputs + min_outputs_per_thread - 1) /
+                                min_outputs_per_thread);
+  if (num_threads <= 1) {
+    for (int i = 0; i < total_outputs; ++i) {
+      fn(i);
+    }
+    return;
+  }
+
+  int block_size = (total_outputs + num_threads - 1) / num_threads;
+  std::vector<std::thread> workers;
+  workers.reserve(num_threads - 1);
+
+  auto worker = [&](int start, int end) {
+    for (int i = start; i < end; ++i) {
+      fn(i);
+    }
+  };
+
+  int start = 0;
+  for (int t = 1; t < num_threads; ++t) {
+    int end = std::min(total_outputs, start + block_size);
+    workers.emplace_back(worker, start, end);
+    start = end;
+  }
+
+  worker(start, total_outputs);
+  for (auto& th : workers) {
+    th.join();
+  }
 }
 
 template <typename T, int bits>
@@ -174,49 +223,52 @@ void _qmm_t(
   constexpr int pack_factor = get_pack_factor(bits, 8);
   constexpr int bytes_per_pack = get_bytes_per_pack(bits);
   constexpr int packs_in_group = group_size / pack_factor;
+  const int groups_per_col = K / group_size;
+  const int w_bytes_per_col = groups_per_col * packs_in_group * bytes_per_pack;
+  const int total_outputs = M * N;
 
-  for (int m = 0; m < M; m++) {
-    const uint8_t* w_local = (const uint8_t*)w;
-    const T* scales_local = scales;
-    const T* biases_local = biases;
+  parallel_for_outputs(total_outputs, 128, [&](int out_idx) {
+    int m = out_idx / N;
+    int n = out_idx % N;
 
-    for (int n = 0; n < N; n++) {
-      const T* x_local = x;
-      T sum = 0;
-      for (int k = 0; k < K; k += group_size) {
-        T scale = *scales_local++;
-        T bias = *biases_local++;
+    auto* result_ptr = result + static_cast<size_t>(m) * N + n;
+    auto* x_local = x + static_cast<size_t>(m) * K;
+    auto* w_local = reinterpret_cast<const uint8_t*>(w) +
+        static_cast<size_t>(n) * w_bytes_per_col;
+    auto* scales_local = scales + static_cast<size_t>(n) * groups_per_col;
+    auto* biases_local = biases + static_cast<size_t>(n) * groups_per_col;
 
-        for (int kw = 0; kw < packs_in_group; kw++) {
-          if constexpr (bits == 3 || bits == 5 || bits == 6) {
-            T wl[pack_factor];
-            extract_bits<T, bits>(w_local, wl);
+    T sum = 0;
+    for (int k = 0; k < K; k += group_size) {
+      T scale = *scales_local++;
+      T bias = *biases_local++;
+
+      for (int kw = 0; kw < packs_in_group; kw++) {
+        if constexpr (bits == 3 || bits == 5 || bits == 6) {
+          T wl[pack_factor];
+          extract_bits<T, bits>(w_local, wl);
 #pragma clang loop unroll(full)
-            for (int p = 0; p < pack_factor; p++) {
-              sum += x_local[p] * (scale * wl[p] + bias);
-            }
-            w_local += bytes_per_pack;
-            x_local += pack_factor;
+          for (int p = 0; p < pack_factor; p++) {
+            sum += x_local[p] * (scale * wl[p] + bias);
+          }
+          w_local += bytes_per_pack;
+          x_local += pack_factor;
 
-          } else {
-            uint8_t wi = *w_local++;
+        } else {
+          uint8_t wi = *w_local++;
 #pragma clang loop unroll(full)
-            for (int p = 0; p < pack_factor; p++) {
-              sum +=
-                  (*x_local++) * (scale * static_cast<T>(wi & bitmask) + bias);
-              if (bits != 8) {
-                wi >>= bits;
-              }
+          for (int p = 0; p < pack_factor; p++) {
+            sum += (*x_local++) * (scale * static_cast<T>(wi & bitmask) + bias);
+            if (bits != 8) {
+              wi >>= bits;
             }
           }
         }
       }
-      *result = sum;
-      result++;
     }
 
-    x += K;
-  }
+    *result_ptr = sum;
+  });
 }
 
 template <int bits, int S>
@@ -260,35 +312,38 @@ void _qmm_t_simd(
   static_assert(
       S % pack_factor == 0, "SIMD size must be divisible by pack factor");
   constexpr int packs_per_simd = S / pack_factor;
+  const int groups_per_col = K / group_size;
+  const int w_words_per_col = groups_per_col * packs_in_group;
+  const int total_outputs = M * N;
 
-  for (int m = 0; m < M; m++) {
-    const uint32_t* w_local = w;
-    const T* scales_local = scales;
-    const T* biases_local = biases;
+  parallel_for_outputs(total_outputs, 128, [&](int out_idx) {
+    int m = out_idx / N;
+    int n = out_idx % N;
 
-    for (int n = 0; n < N; n++) {
-      simd::Simd<float, S> acc(0);
-      auto x_local = x;
-      for (int k = 0; k < K; k += group_size) {
-        T scale = *scales_local++;
-        T bias = *biases_local++;
+    auto* result_ptr = result + static_cast<size_t>(m) * N + n;
+    auto* x_local = x + static_cast<size_t>(m) * K;
+    auto* w_local = w + static_cast<size_t>(n) * w_words_per_col;
+    auto* scales_local = scales + static_cast<size_t>(n) * groups_per_col;
+    auto* biases_local = biases + static_cast<size_t>(n) * groups_per_col;
 
-        for (int kw = 0; kw < packs_in_group; kw += packs_per_simd) {
-          auto wf = simd::Simd<float, S>(extract_bits_simd<bits, S>(w_local));
-          w_local += packs_per_simd;
-          wf = wf * scale;
-          wf = wf + bias;
-          simd::Simd<float, S> x_simd = simd::load<T, S>(x_local);
-          acc = acc + x_simd * wf;
-          x_local += S;
-        }
+    simd::Simd<float, S> acc(0);
+    for (int k = 0; k < K; k += group_size) {
+      T scale = *scales_local++;
+      T bias = *biases_local++;
+
+      for (int kw = 0; kw < packs_in_group; kw += packs_per_simd) {
+        auto wf = simd::Simd<float, S>(extract_bits_simd<bits, S>(w_local));
+        w_local += packs_per_simd;
+        wf = wf * scale;
+        wf = wf + bias;
+        simd::Simd<float, S> x_simd = simd::load<T, S>(x_local);
+        acc = acc + x_simd * wf;
+        x_local += S;
       }
-
-      *result = T(simd::sum(acc));
-      result++;
     }
-    x += K;
-  }
+
+    *result_ptr = T(simd::sum(acc));
+  });
 }
 
 template <typename T, int bits, int group_size>
@@ -507,37 +562,41 @@ void fp_qmm_t(
     int K) {
   constexpr int pack_factor = get_pack_factor(bits, 8);
   constexpr int packs_in_group = group_size / pack_factor;
+  const int groups_per_col = K / group_size;
+  const int w_bytes_per_col = groups_per_col * packs_in_group;
+  const int total_outputs = M * N;
 
-  for (int m = 0; m < M; m++) {
-    const uint8_t* w_local = (const uint8_t*)w;
-    const uint8_t* scales_local = scales;
+  parallel_for_outputs(total_outputs, 128, [&](int out_idx) {
+    int m = out_idx / N;
+    int n = out_idx % N;
 
-    for (int n = 0; n < N; n++) {
-      const T* x_local = x;
-      T sum = 0;
-      for (int k = 0; k < K; k += group_size) {
-        T scale = dequantize_scale<T, group_size>(*scales_local++);
+    auto* result_ptr = result + static_cast<size_t>(m) * N + n;
+    auto* x_local = x + static_cast<size_t>(m) * K;
+    auto* w_local = reinterpret_cast<const uint8_t*>(w) +
+        static_cast<size_t>(n) * w_bytes_per_col;
+    auto* scales_local = scales + static_cast<size_t>(n) * groups_per_col;
 
-        T gsum = 0;
-        for (int kw = 0; kw < packs_in_group; kw++) {
-          if constexpr (bits == 4) {
-            gsum += (*x_local++) * static_cast<T>(FP4_LUT[w_local[0] & 0xf]);
-            gsum +=
-                (*x_local++) * static_cast<T>(FP4_LUT[(w_local[0] >> 4) & 0xf]);
-          } else {
-            gsum +=
-                (*x_local++) * static_cast<T>(detail::FromFP8{}(w_local[0]));
-          }
-          w_local++;
+    T sum = 0;
+    for (int k = 0; k < K; k += group_size) {
+      T scale = dequantize_scale<T, group_size>(*scales_local++);
+
+      T gsum = 0;
+      for (int kw = 0; kw < packs_in_group; kw++) {
+        if constexpr (bits == 4) {
+          gsum += (*x_local++) * static_cast<T>(FP4_LUT[w_local[0] & 0xf]);
+          gsum +=
+              (*x_local++) * static_cast<T>(FP4_LUT[(w_local[0] >> 4) & 0xf]);
+        } else {
+          gsum +=
+              (*x_local++) * static_cast<T>(detail::FromFP8{}(w_local[0]));
         }
-        sum += scale * gsum;
+        w_local++;
       }
-      *result = sum;
-      result++;
+      sum += scale * gsum;
     }
 
-    x += K;
-  }
+    *result_ptr = sum;
+  });
 }
 
 template <int S, int bits>
@@ -577,34 +636,36 @@ void fp_qmm_t_simd(
   static_assert(
       S % pack_factor == 0, "SIMD size must be divisible by pack factor");
   constexpr int packs_per_simd = S / pack_factor;
+  const int groups_per_col = K / group_size;
+  const int w_words_per_col = groups_per_col * packs_in_group;
+  const int total_outputs = M * N;
 
-  for (int m = 0; m < M; m++) {
-    const uint32_t* w_local = w;
-    const uint8_t* scales_local = scales;
+  parallel_for_outputs(total_outputs, 128, [&](int out_idx) {
+    int m = out_idx / N;
+    int n = out_idx % N;
 
-    for (int n = 0; n < N; n++) {
-      simd::Simd<float, S> acc(0);
-      auto x_local = x;
-      for (int k = 0; k < K; k += group_size) {
-        T scale = dequantize_scale<T, group_size>(*scales_local++);
+    auto* result_ptr = result + static_cast<size_t>(m) * N + n;
+    auto* x_local = x + static_cast<size_t>(m) * K;
+    auto* w_local = w + static_cast<size_t>(n) * w_words_per_col;
+    auto* scales_local = scales + static_cast<size_t>(n) * groups_per_col;
 
-        simd::Simd<float, S> g_acc(0);
-        for (int kw = 0; kw < packs_in_group; kw += packs_per_simd) {
-          // Extract bits
-          auto wf = fp_extract_bits_simd<S, bits>(w_local);
-          w_local += packs_per_simd;
-          simd::Simd<float, S> x_simd = simd::load<T, S>(x_local);
-          g_acc = g_acc + x_simd * wf;
-          x_local += S;
-        }
-        acc = acc + scale * g_acc;
+    simd::Simd<float, S> acc(0);
+    for (int k = 0; k < K; k += group_size) {
+      T scale = dequantize_scale<T, group_size>(*scales_local++);
+
+      simd::Simd<float, S> g_acc(0);
+      for (int kw = 0; kw < packs_in_group; kw += packs_per_simd) {
+        auto wf = fp_extract_bits_simd<S, bits>(w_local);
+        w_local += packs_per_simd;
+        simd::Simd<float, S> x_simd = simd::load<T, S>(x_local);
+        g_acc = g_acc + x_simd * wf;
+        x_local += S;
       }
-
-      *result = T(simd::sum(acc));
-      result++;
+      acc = acc + scale * g_acc;
     }
-    x += K;
-  }
+
+    *result_ptr = T(simd::sum(acc));
+  });
 }
 
 template <typename T, int group_size, int bits>
