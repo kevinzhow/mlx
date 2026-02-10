@@ -14,8 +14,8 @@
 - 流程约束（新增）：Qwen3 `mlx_lm generate` 正确性/性能口径需串行执行；任意 C++/Vulkan/shader 变更后，Python 侧验证前必须先执行 `python3 setup.py build_ext --inplace`，避免旧扩展产物导致误判。
 - 近期吞吐（实卡 Vulkan，串行口径）：
   - 10-token（EN）：约 `4.63 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=1`）
-  - 40-token（EN）：约 `3.67 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1`，默认 ON）
-  - 80-token（EN）：约 `2.96 tok/s`（同口径）
+  - 40-token（EN）：约 `3.65 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1`，默认 ON）
+  - 80-token（EN）：约 `2.97 tok/s`（同口径）
 - decode 主线 fallback 占比（同口径 profile）：
   - 由 `18.40%` 降到 `13.50%`
 - RoPE 回退状态（Qwen3 EN 40-token 样本）：
@@ -195,12 +195,29 @@
   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
   - Qwen3 ZH 10-token 正确性：输出正常，无乱码，约 `4.648 tok/s`。
 - 吞吐 A/B（实卡 Vulkan，串行，EN）：
-  - 40-token：`3.669 tok/s`（subgroup ON） vs `3.632 tok/s`（subgroup OFF），`+1.0%`。
-  - 80-token：`2.959 tok/s`（subgroup ON） vs `2.915 tok/s`（subgroup OFF），`+1.5%`。
+  - 40-token：`3.646 tok/s`（subgroup ON） vs `3.611 tok/s`（subgroup OFF），`+1.0%`。
+  - 80-token：`2.974 tok/s`（subgroup ON） vs `2.924 tok/s`（subgroup OFF），`+1.7%`。
   - 命中确认：`qmm_affine_bf16_t4_g128_m1_reduce_subgroup` 覆盖 `rows=1` 主桶（`8077/15957`）。
 - 结论：
   - subgroup 路径带来小幅稳定正收益，说明方向正确。
   - 但距离“性能蜕变”仍远，下一阶段必须进入更激进的架构级重构（不仅是微调）。
+
+### D-9.9a：QMM subgroup 核 `scale/bias` 共享缓存（已完成）
+- 背景（Metal/Ollama 对照）：
+  - 二者的高性能路径都强调“减少重复全局访存”，尤其在 decode 小 batch 场景下避免同一参数被 lane 重复加载。
+  - 原 subgroup 核中同一 `g` 的 `scale/bias` 被 `ww` 维度重复读取（最多 16x 重复）。
+- 变更：
+  - 在 `qmm_affine_bf16_t4_g128_m1_reduce_subgroup.comp` 引入 workgroup 级 `shared` 缓存：
+    - `scale0/bias0/scale1/bias1` 按 `groups_per_col` 预加载一次，再在主循环复用。
+  - 对 subgroup 核增加安全条件：仅 `groups_per_col <= 256` 走该路径，避免共享缓存越界。
+  - 维持 dispatch 失败自动降级到 `M1_REDUCE` 的安全护栏。
+- 验证：
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `ctest` 全量 `223/223` 通过。
+  - `python/tests/test_fast_sdpa.py -v` 通过（`20 passed, 1 skipped`）。
+  - Qwen3 ZH 10-token 正确性通过，无乱码。
+- 结果：
+  - 与 `M1_REDUCE` 对照仍是小幅正收益（约 `+1% ~ +1.7%`），说明访存复用方向有效，但尚不足以带来量级跃迁。
 
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  

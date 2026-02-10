@@ -35,8 +35,13 @@ layout(push_constant) uniform PushConstants {
   uint w_words_per_col;
 } params;
 
+const uint MAX_GROUPS_PER_COL = 256u;
 shared float subgroup_reduce0[64];
 shared float subgroup_reduce1[64];
+shared float scale0_cache[MAX_GROUPS_PER_COL];
+shared float bias0_cache[MAX_GROUPS_PER_COL];
+shared float scale1_cache[MAX_GROUPS_PER_COL];
+shared float bias1_cache[MAX_GROUPS_PER_COL];
 
 float bf16_to_f32(uint bf16_bits) {
   return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
@@ -70,6 +75,22 @@ void main() {
   float partial0 = 0.0;
   float partial1 = 0.0;
 
+  for (uint g = lane; g < params.groups_per_col; g += 64u) {
+    const uint scale_bias_idx0 = out_elem_0 * params.groups_per_col + g;
+    scale0_cache[g] = load_bf16_from_packed(
+        scale_buffer.words[scale_bias_idx0 >> 1u], scale_bias_idx0);
+    bias0_cache[g] = load_bf16_from_packed(
+        bias_buffer.words[scale_bias_idx0 >> 1u], scale_bias_idx0);
+    if (has_out_1) {
+      const uint scale_bias_idx1 = out_elem_1 * params.groups_per_col + g;
+      scale1_cache[g] = load_bf16_from_packed(
+          scale_buffer.words[scale_bias_idx1 >> 1u], scale_bias_idx1);
+      bias1_cache[g] = load_bf16_from_packed(
+          bias_buffer.words[scale_bias_idx1 >> 1u], scale_bias_idx1);
+    }
+  }
+  barrier();
+
   const uint total_units = params.groups_per_col * 16u;
   const uint group_size = 128u;
 
@@ -77,21 +98,10 @@ void main() {
     const uint g = unit >> 4u;
     const uint ww = unit & 0xFu;
 
-    const uint scale_bias_idx = out_elem_0 * params.groups_per_col + g;
-    const float scale0 = load_bf16_from_packed(
-        scale_buffer.words[scale_bias_idx >> 1u], scale_bias_idx);
-    const float bias0 = load_bf16_from_packed(
-        bias_buffer.words[scale_bias_idx >> 1u], scale_bias_idx);
-
-    float scale1 = 0.0;
-    float bias1 = 0.0;
-    if (has_out_1) {
-      const uint scale_bias_idx1 = out_elem_1 * params.groups_per_col + g;
-      scale1 = load_bf16_from_packed(
-          scale_buffer.words[scale_bias_idx1 >> 1u], scale_bias_idx1);
-      bias1 = load_bf16_from_packed(
-          bias_buffer.words[scale_bias_idx1 >> 1u], scale_bias_idx1);
-    }
+    const float scale0 = scale0_cache[g];
+    const float bias0 = bias0_cache[g];
+    const float scale1 = has_out_1 ? scale1_cache[g] : 0.0;
+    const float bias1 = has_out_1 ? bias1_cache[g] : 0.0;
 
     const uint w_word_idx0 = out_elem_0 * params.w_words_per_col + g * 16u + ww;
     const uint wi0 = w_buffer.words[w_word_idx0];

@@ -2261,7 +2261,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       const bool use_m1_reduce_kernel =
           native_qmm_m1_reduce_enabled() && (rows == 1u);
       const bool use_m1_reduce_subgroup_kernel =
-          use_m1_reduce_kernel && native_qmm_m1_reduce_subgroup_enabled();
+          use_m1_reduce_kernel && native_qmm_m1_reduce_subgroup_enabled() &&
+          (groups_per_col <= 256u);
       const bool use_m16_kernel =
           native_qmm_m16_enabled() && (rows > 8u) && (rows <= 16u);
       const bool use_m2_kernel = native_qmm_m2_enabled() && (rows == 2u);
