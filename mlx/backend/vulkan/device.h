@@ -209,6 +209,7 @@ class MLX_API Device {
     std::weak_ptr<array::Data> data_ref;
     const void* data_ptr{nullptr};
     size_t nbytes{0};
+    size_t elem_count{0};
     Dtype dtype{float32};
     bool host_dirty{false};
     int dirty_stream_index{-1};

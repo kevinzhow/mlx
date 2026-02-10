@@ -498,7 +498,10 @@ public:
   - 位置索引按 `offset + (row % T)` 计算，覆盖 decode 与 prefill 常见形态
 - `ScaledDotProductAttention`（当前首版）
   - `dtype=bfloat16`
-  - `q/k/v` 均为 4D 行连续
+  - `q/out` 为 4D 密集行主序
+  - `k/v` 支持两类布局：
+    - 4D 密集行主序
+    - KV cache-view（`stride[-1]==1`，`batch/head` 维紧邻，`seq` 维可跨大步长，允许 `data_size != size`）
   - `Q_len=1`
   - 无 mask / 无 sinks / 非训练
   - `k_len<=MLX_VK_SDPA_MAX_K_LEN`（默认 `8`，可通过环境变量调节）

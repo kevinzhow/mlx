@@ -4,7 +4,9 @@
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernel_registry.h"
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <vulkan/vulkan.h>
 
 namespace mlx::core::vulkan {
@@ -74,6 +76,10 @@ inline kp::Tensor::TensorDataTypes to_kompute_dtype(Dtype dtype) {
       return kp::Tensor::TensorDataTypes::eDouble;
   }
   return kp::Tensor::TensorDataTypes::eFloat;
+}
+
+inline size_t tensor_element_count(const array& arr) {
+  return std::max(arr.size(), arr.data_size());
 }
 
 } // namespace
@@ -321,19 +327,20 @@ std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
   const auto key = arr.id();
   const auto data_ptr = arr.data<void>();
   const auto nbytes = arr.nbytes();
+  const auto elem_count = tensor_element_count(arr);
   const auto dtype = arr.dtype();
   const auto data_ref = arr.data_shared_ptr();
 
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-    auto matches_entry = [&](const TensorCacheEntry& entry) {
-      return entry.data_ptr == data_ptr && entry.nbytes == nbytes &&
-          entry.dtype == dtype && !entry.data_ref.expired() &&
+    auto matches_request = [&](const TensorCacheEntry& entry) {
+      return entry.data_ptr == data_ptr && entry.dtype == dtype &&
+          entry.elem_count >= elem_count && !entry.data_ref.expired() &&
           entry.data_ref.lock() == data_ref;
     };
 
     auto it = tensor_cache_.find(key);
-    if (it != tensor_cache_.end() && !matches_entry(it->second)) {
+    if (it != tensor_cache_.end() && !matches_request(it->second)) {
       tensor_cache_.erase(it);
       it = tensor_cache_.end();
     }
@@ -345,29 +352,45 @@ std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
     }
 
     // Alias/view fallback: multiple arrays can share identical backing storage
-    // but have different array ids. Reuse the existing tensor cache entry.
+    // but have different array ids. Reuse the largest compatible tensor view.
+    std::shared_ptr<kp::Tensor> best_tensor;
+    size_t best_elem_count = 0;
     for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end();) {
-      if (!matches_entry(scan->second)) {
+      if (!matches_request(scan->second)) {
         ++scan;
         continue;
       }
       if (auto tensor = scan->second.tensor.lock()) {
-        return tensor;
+        if (scan->second.elem_count >= best_elem_count) {
+          best_elem_count = scan->second.elem_count;
+          best_tensor = std::move(tensor);
+        }
+        ++scan;
+        continue;
       }
       scan = tensor_cache_.erase(scan);
     }
+    if (best_tensor) {
+      return best_tensor;
+    }
+  }
+
+  if (elem_count >
+      static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    throw std::runtime_error(
+        "[Vulkan Device] Tensor element count exceeds uint32 range.");
   }
 
   auto tensor = manager_->tensor(
       const_cast<void*>(data_ptr),
-      static_cast<uint32_t>(arr.size()),
+      static_cast<uint32_t>(elem_count),
       static_cast<uint32_t>(arr.itemsize()),
       to_kompute_dtype(dtype));
 
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
     tensor_cache_[key] = TensorCacheEntry{
-        tensor, nullptr, data_ref, data_ptr, nbytes, dtype, false, -1};
+        tensor, nullptr, data_ref, data_ptr, nbytes, elem_count, dtype, false, -1};
   }
 
   return tensor;
@@ -386,27 +409,29 @@ void Device::invalidate_tensor(const array& arr) {
 void Device::mark_tensor_host_dirty(const array& arr, int stream_index) {
   const auto key = arr.id();
   const auto data_ptr = arr.data<void>();
-  const auto nbytes = arr.nbytes();
+  const auto elem_count = tensor_element_count(arr);
   const auto dtype = arr.dtype();
   const auto data_ref = arr.data_shared_ptr();
 
   std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-  auto matches_entry = [&](const TensorCacheEntry& entry) {
-    return entry.data_ptr == data_ptr && entry.nbytes == nbytes &&
-        entry.dtype == dtype && !entry.data_ref.expired() &&
+  auto matches_request = [&](const TensorCacheEntry& entry) {
+    return entry.data_ptr == data_ptr && entry.dtype == dtype &&
+        entry.elem_count >= elem_count && !entry.data_ref.expired() &&
         entry.data_ref.lock() == data_ref;
   };
 
   auto it = tensor_cache_.find(key);
-  if (it != tensor_cache_.end() && !matches_entry(it->second)) {
+  if (it != tensor_cache_.end() && !matches_request(it->second)) {
     tensor_cache_.erase(it);
     it = tensor_cache_.end();
   }
   if (it == tensor_cache_.end()) {
+    size_t best_elem_count = 0;
     for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end(); ++scan) {
-      if (matches_entry(scan->second)) {
+      if (matches_request(scan->second) &&
+          scan->second.elem_count >= best_elem_count) {
+        best_elem_count = scan->second.elem_count;
         it = scan;
-        break;
       }
     }
   }
@@ -427,27 +452,29 @@ void Device::mark_tensor_host_dirty(const array& arr, int stream_index) {
 bool Device::tensor_needs_sync_device(const array& arr) {
   const auto key = arr.id();
   const auto data_ptr = arr.data<void>();
-  const auto nbytes = arr.nbytes();
+  const auto elem_count = tensor_element_count(arr);
   const auto dtype = arr.dtype();
   const auto data_ref = arr.data_shared_ptr();
 
   std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-  auto matches_entry = [&](const TensorCacheEntry& entry) {
-    return entry.data_ptr == data_ptr && entry.nbytes == nbytes &&
-        entry.dtype == dtype && !entry.data_ref.expired() &&
+  auto matches_request = [&](const TensorCacheEntry& entry) {
+    return entry.data_ptr == data_ptr && entry.dtype == dtype &&
+        entry.elem_count >= elem_count && !entry.data_ref.expired() &&
         entry.data_ref.lock() == data_ref;
   };
 
   auto it = tensor_cache_.find(key);
-  if (it != tensor_cache_.end() && !matches_entry(it->second)) {
+  if (it != tensor_cache_.end() && !matches_request(it->second)) {
     tensor_cache_.erase(it);
     it = tensor_cache_.end();
   }
   if (it == tensor_cache_.end()) {
+    size_t best_elem_count = 0;
     for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end(); ++scan) {
-      if (matches_entry(scan->second)) {
+      if (matches_request(scan->second) &&
+          scan->second.elem_count >= best_elem_count) {
+        best_elem_count = scan->second.elem_count;
         it = scan;
-        break;
       }
     }
   }
@@ -471,6 +498,7 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
   const auto key = arr.id();
   const auto data_ptr = arr.data<void>();
   const auto nbytes = arr.nbytes();
+  const auto elem_count = tensor_element_count(arr);
   const auto dtype = arr.dtype();
   const auto data_ref = arr.data_shared_ptr();
 
@@ -479,22 +507,24 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
   std::uintptr_t matched_key = 0;
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-    auto matches_entry = [&](const TensorCacheEntry& entry) {
-      return entry.data_ptr == data_ptr && entry.nbytes == nbytes &&
-          entry.dtype == dtype && !entry.data_ref.expired() &&
+    auto matches_request = [&](const TensorCacheEntry& entry) {
+      return entry.data_ptr == data_ptr && entry.dtype == dtype &&
+          entry.elem_count >= elem_count && !entry.data_ref.expired() &&
           entry.data_ref.lock() == data_ref;
     };
 
     auto it = tensor_cache_.find(key);
-    if (it != tensor_cache_.end() && !matches_entry(it->second)) {
+    if (it != tensor_cache_.end() && !matches_request(it->second)) {
       tensor_cache_.erase(it);
       it = tensor_cache_.end();
     }
     if (it == tensor_cache_.end()) {
+      size_t best_elem_count = 0;
       for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end(); ++scan) {
-        if (matches_entry(scan->second)) {
+        if (matches_request(scan->second) &&
+            scan->second.elem_count >= best_elem_count) {
+          best_elem_count = scan->second.elem_count;
           it = scan;
-          break;
         }
       }
     }

@@ -38,6 +38,10 @@ layout(push_constant) uniform PushConstants {
   uint k_len;
   uint qk_dim;
   uint v_dim;
+  uint k_head_stride;
+  uint k_seq_stride;
+  uint v_head_stride;
+  uint v_seq_stride;
   uint split_k;
   float scale;
 } params;
@@ -96,10 +100,9 @@ void main() {
   uint hkv = hq / repeats;
 
   uint q_base = ((b * params.n_q_heads) + hq) * params.qk_dim;
-  uint k_head_base =
-      (((b * params.n_kv_heads) + hkv) * params.k_len) * params.qk_dim;
-  uint v_head_base =
-      (((b * params.n_kv_heads) + hkv) * params.k_len) * params.v_dim;
+  uint kvh = (b * params.n_kv_heads) + hkv;
+  uint k_head_base = kvh * params.k_head_stride;
+  uint v_head_base = kvh * params.v_head_stride;
 
   uint chunk = (params.k_len + params.split_k - 1u) / params.split_k;
   uint start_t = part * chunk;
@@ -130,7 +133,7 @@ void main() {
 
   // Pass 1: row max in this split.
   for (uint t = start_t; t < end_t; ++t) {
-    uint k_base = k_head_base + t * params.qk_dim;
+    uint k_base = k_head_base + t * params.k_seq_stride;
     float partial = 0.0;
     for (uint d = lane; d < params.qk_dim; d += WG_SIZE) {
       partial += load_q(q_base + d) * load_k(k_base + d);
@@ -154,7 +157,7 @@ void main() {
 
   // Pass 2: exp sum + weighted V sum in this split.
   for (uint t = start_t; t < end_t; ++t) {
-    uint k_base = k_head_base + t * params.qk_dim;
+    uint k_base = k_head_base + t * params.k_seq_stride;
     float partial = 0.0;
     for (uint d = lane; d < params.qk_dim; d += WG_SIZE) {
       partial += load_q(q_base + d) * load_k(k_base + d);
@@ -175,7 +178,7 @@ void main() {
     }
     barrier();
 
-    uint v_base = v_head_base + t * params.v_dim;
+    uint v_base = v_head_base + t * params.v_seq_stride;
     float w = weight_sh;
     for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
       accum_sh[dv] += w * load_v(v_base + dv);

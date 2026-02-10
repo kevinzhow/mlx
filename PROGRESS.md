@@ -1194,3 +1194,58 @@ python -m unittest discover -v
 1. 先定位 `k_len>=9` 卡死/异常的根因（优先检查 decode `q1` 与 split-k 在真实 KV cache 布局下的数值与同步语义）。
 2. 在根因修复前，保持默认 `MLX_VK_SDPA_MAX_K_LEN=8`，仅通过环境变量做受控实验。
 3. 增加一条最小复现门禁（`prompt="Hi"`, `max_tokens=10`）作为 `k_len` 放宽前置检查，避免再次把不稳定门限带入默认路径。
+
+### 2026-02-10 深夜增量（SDPA decode 支持 KV cache-view stride 原生读取）✅
+
+#### 本轮目标
+- 解决 `k_layout` 拒绝的真实根因：Qwen decode 阶段 `k/v` 为 cache-view（`shape=[1,8,9,128]`，`strides=[262144,32768,128,1]`，`data_size=230528`）导致 native gate 失败与超时。
+
+#### 本轮变更
+1. 扩展 SDPA decode gate 到 cache-view 布局：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `can_use_native_sdpa_bf16_decode_q1` 从“`q/k/v/out` 全密集行主序”调整为：
+     - `q/out` 仍要求密集行主序；
+     - `k/v` 支持 cache-view stride 布局（`stride[-1]==1`、`batch/head` 紧邻、`seq` 可大步长）。
+   - 增加 `k/v` 可寻址范围校验（按 `head_stride/seq_stride` 计算最大索引，要求 `< data_size`）。
+2. SDPA decode shader 改为 stride-aware 读取：
+   - 文件：
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp`
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp`
+   - 新增 push constants：`k_head_stride/k_seq_stride/v_head_stride/v_seq_stride`；
+   - kernel 索引从连续布局改为按 `head_stride + t*seq_stride + d` 读取。
+3. 运行时 Tensor 覆盖范围修复（避免 cache-view 越界）：
+   - 文件：`mlx/backend/vulkan/device.cpp` / `mlx/backend/vulkan/device.h`
+   - `Device::get_tensor` 改为按 `max(size, data_size)` 创建 Kompute Tensor；
+   - Tensor cache 元信息新增 `elem_count`，alias 匹配改为基于同一底层 buffer（`data_ptr/data_ref`）+ 足够 `elem_count`，避免 cache-view `size` 变化时丢失 `host_dirty` 状态。
+4. 文档同步：
+   - 文件：`mlx/backend/vulkan/ARCHITECTURE.md`
+   - SDPA 覆盖条件更新为：`k/v` 支持 cache-view stride 布局（允许 `data_size != size`）。
+
+#### 验证结果
+- 构建：
+  - `cmake --build build_release_vulkan --target mlx -j` ✅
+  - `CMAKE_ARGS='... -DMLX_BUILD_VULKAN=ON ... -DCMAKE_BUILD_TYPE=Release' python3 setup.py build_ext --inplace` ✅
+- C++ 回归：
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+- Python SDPA 回归：
+  - `python/tests/test_fast_sdpa.py` => `16 passed, 1 skipped` ✅
+- Qwen 实卡验证（Vulkan）：
+  - 复现用例（此前会卡住）：
+    - `MLX_VK_SDPA_MAX_K_LEN=9`, `prompt="Hi"`, `max_tokens=1`：由 timeout 恢复为稳定完成 ✅
+  - cache-view 命中日志：
+    - 出现 `VulkanSDPAHit`，且 `k/v` 为 `strides=[262144,32768,128,1]`, `data_size=230528`, `size=9216` ✅
+  - 中英 10-token 冒烟：
+    - `MLX_VK_SDPA_MAX_K_LEN=13`, `prompt="Hi what is your name"` ✅
+    - `MLX_VK_SDPA_MAX_K_LEN=13`, `prompt="你好啊"` ✅（可完成，未出现超时）
+- 数值对照（cache-view synthetic）：
+  - 同一输入下 native（无 mask）vs fallback（零 mask 强制 fallback）`max_abs_diff=0.0` ✅
+
+#### 当前状态
+- ✅ SDPA decode 已支持真实 KV cache-view 布局的 native 读取，`k_layout` 主阻塞已打通。
+- ✅ 之前 `k_len=9` 场景的卡死复现已解除。
+- ⚠️ 在 `k_len_cap=13` 下长生成（例如 `Hi`, `max_tokens=40`）仍观察到与 `k_len_cap=8` 明显不同的文本质量，默认门限继续保持 `MLX_VK_SDPA_MAX_K_LEN=8`。
+
+#### 下一步（精确）
+1. 在 `k_len_cap=13/16` 下追加更长序列门禁（`Hi`, `max_tokens=20/40`）并统计超时率与输出质量（含 token-level 对比）。
+2. 若稳定，再讨论上调默认 `MLX_VK_SDPA_MAX_K_LEN`；若仍有波动，继续限定默认并优化 split-k 路径。
+3. 继续推进 SDPA v3：`mask/causal` native 覆盖（对齐 Metal vector/full 语义）。
