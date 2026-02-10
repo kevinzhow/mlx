@@ -1396,3 +1396,196 @@ python -m unittest discover -v
 #### 当前状态
 - ✅ `cap=13` 相比 `cap=8` 在本次 10-token 案例中生成速度小幅提升（约 +3.4%）。
 - ✅ 本次 A/B 未观察到输出质量回归（同 prompt 前缀一致）。
+
+### 2026-02-10 激进门限实验（`cap=128` + `timeout=20s`）✅
+
+#### 本轮目标
+- 在更激进门限下快速验证是否出现超时或明显质量回退。
+
+#### 验证命令
+- `timeout 20s env PYTHONPATH=python TARGET_DEVICE=gpu MLX_VK_SDPA_MAX_K_LEN=128 python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi what is your name" --max-tokens 10 --temp 0`
+- `timeout 20s env PYTHONPATH=python TARGET_DEVICE=gpu MLX_VK_SDPA_MAX_K_LEN=128 python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "你好啊" --max-tokens 10 --temp 0`
+
+#### 验证结果
+- 退出码：
+  - 英文：`en_exit=0`（未超时）
+  - 中文：`zh_exit=0`（未超时）
+- 英文：
+  - `Prompt: 13 tokens, 8.081 tokens-per-sec`
+  - `Generation: 10 tokens, 3.156 tokens-per-sec`
+- 中文：
+  - `Prompt: 10 tokens, 7.537 tokens-per-sec`
+  - `Generation: 10 tokens, 3.142 tokens-per-sec`
+- 输出前缀均正常（`<think> ...`）。
+
+#### 当前状态
+- ✅ 在当前实卡环境与该短序列场景中，`cap=128` 未触发 20 秒超时，且速度与 `cap=13` 同量级。
+
+### 2026-02-10 主线推进（40-token 基线 + 默认 cap 上调到 13）✅
+
+#### 本轮目标
+- 完成 `max_tokens=40` 的 `cap=8/13/16` 串行基线，基于实测决定是否上调默认 `MLX_VK_SDPA_MAX_K_LEN`。
+
+#### 本轮变更
+1. 长序列实测（实卡默认路径：`PYTHONPATH=python TARGET_DEVICE=gpu`）：
+   - `prompt="Hi"` 和 `prompt="你好啊"` 各跑 `max_tokens=40`；
+   - 覆盖 `cap=8/13/16`（串行执行）。
+2. 默认门限上调（保守）：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `native_sdpa_max_k_len()` 默认值从 `8` 调整到 `13`（仍支持 `MLX_VK_SDPA_MAX_K_LEN` 环境覆盖）。
+
+#### 验证结果
+1. 40-token 基线（全部 `exit=0`）：
+   - `cap=8`
+     - EN generation: `2.404 tok/s`
+     - ZH generation: `2.399 tok/s`
+   - `cap=13`
+     - EN generation: `2.426 tok/s`
+     - ZH generation: `2.418 tok/s`
+   - `cap=16`
+     - EN generation: `2.428 tok/s`
+     - ZH generation: `2.399 tok/s`
+   - 输出前缀在三组 cap 下保持一致（中英文均未见乱码/异常文本）。
+2. 默认 cap=13 生效确认（不设 `MLX_VK_SDPA_MAX_K_LEN`）：
+   - `k_len=9` synthetic decode 出现 `VulkanSDPAHit`（已命中 native）。
+3. 回归：
+   - `python -m unittest -v test_fast_sdpa` => `17 passed, 1 skipped`。
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` 通过。
+   - Qwen 冒烟（默认 cap=13）：
+     - EN 10-token generation: `3.079 tok/s`
+     - ZH 10-token generation: `3.126 tok/s`
+
+#### 当前状态
+- ✅ 已完成默认 cap 从 `8 -> 13` 的保守上调，并通过 C++/Python/Qwen 回归。
+- ✅ `cap=13` 在 40-token 实测下较 `cap=8` 略有收益且未见质量回归。
+- ⚠️ `cap=16` 在中文 40-token 未体现额外收益，暂不作为默认值。
+
+#### 下一步（精确）
+1. 继续主线 SDPA v3：推进 `mask/causal` native 覆盖（对齐 Metal vector/full 语义）。
+2. 对 `split-k` 阈值做专项调优（`MIN_K_LEN/TARGET_CHUNK/MAX_PARTS`），优先优化长序列 decode 吞吐。
+3. 在 `cap=13` 默认值下补一条稳定性门禁（建议 `prompt="Hi", max_tokens=40`）防止后续退化。
+
+### 2026-02-10 主线推进（SDPA causal decode native 覆盖）✅
+
+#### 本轮目标
+- 在保持正确性的前提下，推进 SDPA v3 的第一步：让 `mask="causal"` 在 decode 场景（`q_len=1`）命中 Vulkan native，而不是无条件 fallback。
+
+#### 本轮变更
+1. 放宽 Vulkan SDPA fallback gate（仅 decode causal）：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `fast::ScaledDotProductAttention::use_fallback` 调整为：
+     - 允许 `do_causal=true` 进入 native gate（`q_len==1`）；
+     - 仍然拒绝 `has_arr_mask=true`（显式 array mask 继续 fallback）；
+     - 保持训练/trace/logsumexp 路径 fallback。
+2. 新增回归用例：
+   - 文件：`python/tests/test_fast_sdpa.py`
+   - 新增：`test_fast_sdpa_decode_causal_q1`
+   - 覆盖 `k_len in [9, 13]` 的 `bf16` decode，校验：
+     - `mask="causal"` vs `mask=None`
+     - `mask="causal"` vs 显式 `zero mask` fallback
+     - 断言 `allclose(atol=1e-2, rtol=1e-2)`。
+
+#### 验证结果
+1. native 命中确认（debug）：
+   - 在 `mask="causal"` + `q_len=1` + `k_len=13` 下，出现 `VulkanSDPAHit` 日志，确认进入 native。
+2. Python 回归：
+   - 新增单测通过：`test_fast_sdpa_decode_causal_q1` ✅
+   - `python -m unittest -v test_fast_sdpa`：`18 passed, 1 skipped` ✅
+3. Qwen 冒烟（默认 cap=13）：
+   - EN 10-token：`Generation: 3.102 tok/s`
+   - ZH 10-token：`Generation: 3.137 tok/s`
+   - 输出前缀正常（未见乱码/异常）。
+4. C++ 回归：
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` ✅
+
+#### 当前状态
+- ✅ Vulkan SDPA 已支持 decode causal（`q_len=1`）native 命中，进一步对齐 Metal 的 causal 语义。
+- ✅ 显式 array mask 仍保持 fallback，风险可控。
+
+#### 下一步（精确）
+1. 继续 SDPA v3：评估最小可行的 array mask native（先 `q_len=1` / broadcast 形态）。
+2. 同步推进 split-k 阈值调优，针对 `max_tokens=40` 提升 decode 吞吐。
+3. 把 `prompt="Hi", max_tokens=40` 纳入固定性能/稳定性门禁。
+
+### 2026-02-10 主线推进（split-k 阈值 A/B 复测）✅
+
+#### 本轮目标
+- 验证 `MLX_VK_SDPA_SPLITK_MIN_K_LEN` 是否有可立即落地的默认优化空间。
+
+#### 验证命令
+- 固定：`PYTHONPATH=python TARGET_DEVICE=gpu MLX_VK_SDPA_MAX_K_LEN=13`
+- 对比：
+  - `MLX_VK_SDPA_SPLITK_MIN_K_LEN=16`（当前默认）
+  - `MLX_VK_SDPA_SPLITK_MIN_K_LEN=32`
+  - `MLX_VK_SDPA_SPLITK_MIN_K_LEN=64`
+- 负载：`Qwen/Qwen3-0.6B-MLX-4bit`, `prompt="Hi"`, `max_tokens=40`, `temp=0`
+
+#### 验证结果
+- `min=16`：`Generation: 40 tokens, 2.418 tokens-per-sec`
+- `min=32`：`Generation: 40 tokens, 2.402 tokens-per-sec`
+- `min=64`：`Generation: 40 tokens, 2.406 tokens-per-sec`
+- 文本输出前缀一致，均 `exit=0`。
+
+#### 当前状态
+- ✅ 在当前实卡环境下，`splitk_min_k_len=16` 仍是最佳（至少不劣于 32/64）。
+- ✅ 暂不调整 `MLX_VK_SDPA_SPLITK_MIN_K_LEN` 默认值，避免无收益改动。
+
+### 2026-02-10 主线推进（SDPA decode array-mask native 覆盖）✅
+
+#### 本轮目标
+- 把 SDPA decode（`Q_len=1`）的显式 array mask 从 fallback 提升到 Vulkan native，提高真实命中率并保持正确性。
+
+#### 本轮变更
+1. 放宽与细化 SDPA gate（Vulkan）：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `fast::ScaledDotProductAttention::use_fallback` 调整：
+     - 保留 `causal` native；
+     - 新增 `mask_mode="array"` native 入口（仍限制 decode `Q_len=1`）；
+     - `training/logsumexp/sinks` 继续 fallback。
+2. decode mask 参数接入 native dispatch：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `can_use_native_sdpa_bf16_decode_q1` 增加 mask gate 与 stride 解析；
+   - `eval_gpu` dispatch 增加 mask tensor 绑定与 push constants（含 `mask_mode/mask_*_stride`）；
+   - `mask_layout` 拒绝场景补充 copy-repack 重试。
+3. SDPA shader 扩展（array mask）：
+   - 文件：
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp`
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp`
+   - 增加 mask buffer 读取与 logits 融合（additive）；
+   - `denom<=0` 时输出稳定零向量，避免全屏蔽场景未写输出。
+4. bool mask 策略（过渡）：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `supports_bool_mask()` 暂设为 `false`，由 fast 层先把 bool mask 转为 additive，再进入 native kernel。
+5. 回归测试增强：
+   - 文件：`python/tests/test_fast_sdpa.py`
+   - 新增 `test_fast_sdpa_decode_array_mask_q1`；
+   - `test_fast_sdpa_vector_cache_view_strides` 的 `k_len` 从 `[7,8]` 提升到 `[9,13]`，覆盖默认 cap=13。
+6. 同步 SPIR-V 头文件：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_spv.h`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1_spv.h`
+
+#### 验证结果
+1. 构建：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `CMAKE_ARGS='-DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF -DMLX_BUILD_PYTHON_BINDINGS=ON -DCMAKE_BUILD_TYPE=Release' python3 setup.py build_ext --inplace` ✅
+2. Python SDPA 回归：
+   - `python -m unittest -v test_fast_sdpa.TestFastSDPA.test_fast_sdpa_decode_array_mask_q1 test_fast_sdpa.TestFastSDPA.test_fast_sdpa_decode_causal_q1 test_fast_sdpa.TestFastSDPA.test_fast_sdpa_vector_cache_view_strides` ✅
+   - `python -m unittest -v test_fast_sdpa` => `19 passed, 1 skipped` ✅
+3. native 命中确认（debug）：
+   - `MLX_VK_DEBUG_SDPA_HIT=1` 下，`mask_mode=1` 且 `k_len=13` 触发 `VulkanSDPAHit`，确认 array-mask 进入 native ✅
+4. C++ 回归：
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+5. Qwen 冒烟（默认实卡路径）：
+   - EN：`Generation: 10 tokens, 3.100 tok/s`
+   - ZH：`Generation: 10 tokens, 3.053 tok/s`
+   - 输出前缀正常（未见乱码）✅
+
+#### 当前状态
+- ✅ SDPA decode (`Q_len=1`) 已支持 `mask=None` / `mask="causal"` / `mask_mode="array"` native 命中。
+- ✅ cache-view + array-mask 相关门禁已补齐，后续重构风险可控。
+- ⚠️ bool mask 仍为“前置转换到 additive”方案，尚未在 kernel 内直接读取 bool。
+
+#### 下一步（精确）
+1. 继续 SDPA v3：补 `Q_len>1`（小 `Q_len` 向量路径）native，实现与 Metal vector 路径更一致的命中覆盖。
+2. 评估 bool mask kernel 原生支持（移除 `supports_bool_mask=false` 过渡层），减少额外前处理。
+3. 在 `max_tokens=40` 与更长上下文上复测吞吐，确认 array-mask 接入后无长序列回退。

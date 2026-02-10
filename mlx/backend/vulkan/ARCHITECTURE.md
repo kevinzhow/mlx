@@ -503,13 +503,18 @@ public:
     - 4D 密集行主序
     - KV cache-view（`stride[-1]==1`，`batch/head` 维紧邻，`seq` 维可跨大步长，允许 `data_size != size`）
   - `Q_len=1`
-  - 无 mask / 无 sinks / 非训练
-  - `k_len<=MLX_VK_SDPA_MAX_K_LEN`（默认 `8`，可通过环境变量调节）
+  - decode 场景支持三类 mask 语义（均限 `Q_len=1`）：
+    - `mask=None`
+    - `mask="causal"`（`Q_len=1` 时与 no-mask 等价并走 native）
+    - `mask_mode="array"`（additive mask；支持 broadcast 到 `[B,Hq,1,K]`）
+  - bool mask 在当前 Vulkan 路径会先转换为 additive mask，再进入 native
+  - `sinks` / training 仍走 fallback
+  - `k_len<=MLX_VK_SDPA_MAX_K_LEN`（默认 `13`，可通过环境变量调节）
   - `qk_dim<=256`，`v_dim<=256`
 
 ### 10.3 仍走 fallback 的场景
 - `RoPE` 的非连续/非 1D `freqs` 布局
-- `ScaledDotProductAttention` 的主流场景（causal/mask、training、sinks，或 `k_len>MLX_VK_SDPA_MAX_K_LEN`）
+- `ScaledDotProductAttention` 的未覆盖场景（training、sinks、`Q_len>1`，或 `k_len>MLX_VK_SDPA_MAX_K_LEN`）
 
 ### 10.4 SDPA v3 方案（Metal 对齐 + Ollama/ggml Vulkan 参考）
 
@@ -568,7 +573,8 @@ public:
   - bool mask -> `-inf` 屏蔽
   - additive mask -> 直接加到 logits
   - causal 在 `q_len <= k_len` 下与 Metal 同步偏移规则
-- `supports_bool_mask()` 保持 true；训练/VJP 继续 fallback，确保梯度语义不回退。
+- 当前 decode 实现里 `supports_bool_mask()` 为 `false`（在 fast 层先转 additive）；
+  后续可在 kernel 直接支持 bool 后切回 `true`。训练/VJP 继续 fallback，确保梯度语义不回退。
 
 #### 分阶段落地（执行顺序）
 1. `A1`：替换当前 `sdpa_bf16_decode_q1` 为 subgroup 版本，先解除 `k_len<=8` 的性能阻塞。

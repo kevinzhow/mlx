@@ -31,6 +31,10 @@ layout(set = 0, binding = 5) buffer PartialLBuffer {
   float values[];
 } partial_l_buffer;
 
+layout(set = 0, binding = 6) readonly buffer MaskBuffer {
+  uint words[];
+} mask_buffer;
+
 layout(push_constant) uniform PushConstants {
   uint batch_size;
   uint n_q_heads;
@@ -42,6 +46,10 @@ layout(push_constant) uniform PushConstants {
   uint k_seq_stride;
   uint v_head_stride;
   uint v_seq_stride;
+  uint mask_mode;
+  uint mask_batch_stride;
+  uint mask_head_stride;
+  uint mask_seq_stride;
   uint split_k;
   float scale;
 } params;
@@ -79,6 +87,13 @@ float load_v(uint elem_idx) {
   return bf16_to_f32(bf16_bits);
 }
 
+float load_mask(uint elem_idx) {
+  uint packed = mask_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
 void main() {
   uint gid = gl_WorkGroupID.x;
   uint lane = gl_LocalInvocationID.x;
@@ -103,6 +118,7 @@ void main() {
   uint kvh = (b * params.n_kv_heads) + hkv;
   uint k_head_base = kvh * params.k_head_stride;
   uint v_head_base = kvh * params.v_head_stride;
+  uint mask_base = b * params.mask_batch_stride + hq * params.mask_head_stride;
 
   uint chunk = (params.k_len + params.split_k - 1u) / params.split_k;
   uint start_t = part * chunk;
@@ -150,6 +166,9 @@ void main() {
 
     if (lane == 0u) {
       float dot = dot_partial[0] * params.scale;
+      if (params.mask_mode != 0u) {
+        dot += load_mask(mask_base + t * params.mask_seq_stride);
+      }
       max_logit_sh = max(max_logit_sh, dot);
     }
     barrier();
@@ -173,7 +192,11 @@ void main() {
     }
 
     if (lane == 0u) {
-      weight_sh = exp(dot_partial[0] * params.scale - max_logit_sh);
+      float dot = dot_partial[0] * params.scale;
+      if (params.mask_mode != 0u) {
+        dot += load_mask(mask_base + t * params.mask_seq_stride);
+      }
+      weight_sh = exp(dot - max_logit_sh);
       denom_sh += weight_sh;
     }
     barrier();

@@ -20,6 +20,10 @@ layout(set = 0, binding = 3) buffer OutBuffer {
   uint words[];
 } out_buffer;
 
+layout(set = 0, binding = 4) readonly buffer MaskBuffer {
+  uint words[];
+} mask_buffer;
+
 layout(push_constant) uniform PushConstants {
   uint batch_size;
   uint n_q_heads;
@@ -31,6 +35,10 @@ layout(push_constant) uniform PushConstants {
   uint k_seq_stride;
   uint v_head_stride;
   uint v_seq_stride;
+  uint mask_mode;
+  uint mask_batch_stride;
+  uint mask_head_stride;
+  uint mask_seq_stride;
   float scale;
 } params;
 
@@ -74,6 +82,13 @@ float load_v(uint elem_idx) {
   return bf16_to_f32(bf16_bits);
 }
 
+float load_mask(uint elem_idx) {
+  uint packed = mask_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
 void store_out(uint elem_idx, float value) {
   uint word_idx = elem_idx >> 1u;
   uint packed = out_buffer.words[word_idx];
@@ -104,6 +119,7 @@ void main() {
   uint kvh = (b * params.n_kv_heads) + hkv;
   uint k_head_base = kvh * params.k_head_stride;
   uint v_head_base = kvh * params.v_head_stride;
+  uint mask_base = b * params.mask_batch_stride + hq * params.mask_head_stride;
 
   if (lane == 0u) {
     max_logit_sh = -3.4028235e38;
@@ -133,6 +149,9 @@ void main() {
 
     if (lane == 0u) {
       float dot = dot_partial[0] * params.scale;
+      if (params.mask_mode != 0u) {
+        dot += load_mask(mask_base + t * params.mask_seq_stride);
+      }
       max_logit_sh = max(max_logit_sh, dot);
     }
     barrier();
@@ -156,7 +175,11 @@ void main() {
     }
 
     if (lane == 0u) {
-      weight_sh = exp(dot_partial[0] * params.scale - max_logit_sh);
+      float dot = dot_partial[0] * params.scale;
+      if (params.mask_mode != 0u) {
+        dot += load_mask(mask_base + t * params.mask_seq_stride);
+      }
+      weight_sh = exp(dot - max_logit_sh);
       denom_sh += weight_sh;
     }
     barrier();
@@ -170,10 +193,7 @@ void main() {
   }
 
   if (lane == 0u) {
-    if (denom_sh == 0.0) {
-      return;
-    }
-    float inv_denom = 1.0 / denom_sh;
+    float inv_denom = (denom_sh > 0.0) ? (1.0 / denom_sh) : 0.0;
     uint out_base = ((b * params.n_q_heads) + hq) * params.v_dim;
     for (uint dv = 0u; dv < params.v_dim; ++dv) {
       store_out(out_base + dv, accum_sh[dv] * inv_denom);

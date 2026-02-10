@@ -352,9 +352,9 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
         q = mx.random.normal(shape=(B, Hq, 1, D)).astype(mx.bfloat16)
         k_base = mx.random.normal(shape=(B, Hkv, max_kv_len, D)).astype(mx.bfloat16)
         v_base = mx.random.normal(shape=(B, Hkv, max_kv_len, V)).astype(mx.bfloat16)
-        # Keep k_len within default Vulkan native gate (<= 8) so this test
+        # Keep k_len within default Vulkan native gate (<= 13) so this test
         # exercises the decode path without extra env toggles.
-        for k_len in [7, 8]:
+        for k_len in [9, 13]:
             # Slice from a larger KV cache to preserve cache-view layout
             # (data_size > size) with non-compact head stride.
             k = k_base[:, :, :k_len, :]
@@ -370,6 +370,75 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             )
 
             self.assertTrue(mx.allclose(native_out, fallback_out, atol=1e-2, rtol=1e-2))
+
+    def test_fast_sdpa_decode_causal_q1(self):
+        mx.random.seed(0)
+        B = 1
+        Hq = 16
+        Hkv = 8
+        D = 128
+        scale = 1.0 / math.sqrt(D)
+
+        for k_len in [9, 13]:
+            q = mx.random.normal(shape=(B, Hq, 1, D)).astype(mx.bfloat16)
+            k = mx.random.normal(shape=(B, Hkv, k_len, D)).astype(mx.bfloat16)
+            v = mx.random.normal(shape=(B, Hkv, k_len, D)).astype(mx.bfloat16)
+
+            out_no_mask = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+            out_causal = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask="causal"
+            )
+
+            # Explicit additive zero-mask forces fallback in current Vulkan path.
+            zero_mask = mx.zeros((B, 1, 1, k_len), dtype=mx.bfloat16)
+            out_fallback = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask=zero_mask
+            )
+
+            self.assertTrue(mx.allclose(out_causal, out_no_mask, atol=1e-2, rtol=1e-2))
+            self.assertTrue(mx.allclose(out_causal, out_fallback, atol=1e-2, rtol=1e-2))
+
+    def test_fast_sdpa_decode_array_mask_q1(self):
+        mx.random.seed(0)
+        B = 1
+        Hq = 16
+        Hkv = 8
+        D = 128
+        scale = 1.0 / math.sqrt(D)
+
+        for k_len in [9, 13]:
+            q = mx.random.normal(shape=(B, Hq, 1, D)).astype(mx.bfloat16)
+            k = mx.random.normal(shape=(B, Hkv, k_len, D)).astype(mx.bfloat16)
+            v = mx.random.normal(shape=(B, Hkv, k_len, D)).astype(mx.bfloat16)
+
+            # Broadcasted bool mask (`H=1`) keeps stride-0 head dimension.
+            bool_mask = (
+                mx.random.uniform(shape=(B, 1, 1, k_len), dtype=mx.float32) > 0.25
+            )
+            add_mask = mx.where(
+                bool_mask,
+                mx.zeros(bool_mask.shape, dtype=mx.bfloat16),
+                mx.full(bool_mask.shape, -float("inf"), dtype=mx.bfloat16),
+            )
+            bool_mask_full = mx.broadcast_to(bool_mask, (B, Hq, 1, k_len))
+
+            out_bool = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask=bool_mask
+            )
+            out_add = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask=add_mask
+            )
+            out_ref = mlx_primitives_sdpa_with_gqa(
+                q.astype(mx.float32),
+                k.astype(mx.float32),
+                v.astype(mx.float32),
+                scale,
+                mask=bool_mask_full,
+            )
+            out_ref = out_ref.astype(mx.bfloat16)
+
+            self.assertTrue(mx.allclose(out_bool, out_add, atol=1e-2, rtol=1e-2))
+            self.assertTrue(mx.allclose(out_bool, out_ref, atol=2e-2, rtol=2e-2))
 
     def test_fast_sdpa_vector(self):
         D = 64
