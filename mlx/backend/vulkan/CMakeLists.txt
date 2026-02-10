@@ -105,6 +105,8 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/logsumexp_bf16_row1.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m2.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m4.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rmsnorm_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope_bf16_t1.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope_bf16_freqs.comp

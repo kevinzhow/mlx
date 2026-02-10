@@ -89,6 +89,8 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - Default native gates expected on current mainline:
   - `MLX_VK_ENABLE_QMM_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1=1` (default ON, decode `rows==1` 专核路径)
+  - `MLX_VK_ENABLE_QMM_NATIVE_M2=1` (default ON, small-batch `rows==2` 专核路径)
+  - `MLX_VK_ENABLE_QMM_NATIVE_M4=1` (default ON, small-batch `rows==4` 专核路径)
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_ROPE_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_SDPA_NATIVE=1` (default ON, still narrow gate in code)
@@ -127,6 +129,8 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - Native gate toggles for isolation:
   - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1=0|1`
+  - `MLX_VK_ENABLE_QMM_NATIVE_M2=0|1`
+  - `MLX_VK_ENABLE_QMM_NATIVE_M4=0|1`
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=0|1`
   - `MLX_VK_ENABLE_ROPE_NATIVE=0|1`
   - `MLX_VK_ENABLE_SDPA_NATIVE=0|1`
