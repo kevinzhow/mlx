@@ -50,8 +50,11 @@ const float NEG_LARGE = -3.4028235e38;
 
 shared float dot_partial[WG_SIZE];
 shared float max_logit_sh;
-shared float weight_sh;
+shared float alpha_sh;
+shared float beta_sh;
 shared float denom_sh;
+shared uint valid_sh;
+shared float q_sh[256];
 shared float accum_sh[256];
 
 float bf16_to_f32(uint bf16_bits) {
@@ -142,7 +145,8 @@ void main() {
   uint lane = gl_LocalInvocationID.x;
   uint total = params.batch_size * params.n_q_heads * params.q_len;
   if (rowq >= total || params.q_len == 0u || params.v_dim == 0u ||
-      params.v_dim > 256u || params.qk_dim == 0u || params.k_len == 0u ||
+      params.v_dim > 256u || params.qk_dim == 0u || params.qk_dim > 256u ||
+      params.k_len == 0u ||
       params.n_kv_heads == 0u) {
     return;
   }
@@ -165,78 +169,97 @@ void main() {
     max_logit_sh = NEG_LARGE;
     denom_sh = 0.0;
   }
+  for (uint dq = lane; dq < params.qk_dim; dq += WG_SIZE) {
+    q_sh[dq] = load_q(q_base + dq);
+  }
   for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
     accum_sh[dv] = 0.0;
   }
   barrier();
 
-  // Pass 1: find row max for numerically stable softmax.
+  // Single-pass online softmax accumulation on V.
   for (uint t = 0u; t < params.k_len; ++t) {
+    // For causal attention, the upper-triangular invalid region can be
+    // skipped before any QK work.
+    if (params.causal != 0u) {
+      int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
+      if (int(t) > causal_limit) {
+        continue;
+      }
+    }
+
     uint k_base = k_head_base + t * params.k_seq_stride;
     float partial = 0.0;
-    for (uint d = lane; d < params.qk_dim; d += WG_SIZE) {
-      partial += load_q(q_base + d) * load_k(k_base + d);
-    }
-    dot_partial[lane] = partial;
-    barrier();
-
-    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
-      if (lane < stride) {
-        dot_partial[lane] += dot_partial[lane + stride];
-      }
-      barrier();
-    }
-
-    if (lane == 0u) {
-      bool valid = false;
-      float logit = masked_logit(dot_partial[0], q_pos, t, mask_base, valid);
-      if (valid) {
-        max_logit_sh = max(max_logit_sh, logit);
-      }
-    }
-    barrier();
-  }
-
-  // Pass 2: online softmax accumulation on V.
-  for (uint t = 0u; t < params.k_len; ++t) {
-    uint k_base = k_head_base + t * params.k_seq_stride;
-    float partial = 0.0;
-    for (uint d = lane; d < params.qk_dim; d += WG_SIZE) {
-      partial += load_q(q_base + d) * load_k(k_base + d);
-    }
-    dot_partial[lane] = partial;
-    barrier();
-
-    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
-      if (lane < stride) {
-        dot_partial[lane] += dot_partial[lane + stride];
-      }
-      barrier();
-    }
-
-    if (lane == 0u) {
-      bool valid = false;
-      float logit = masked_logit(dot_partial[0], q_pos, t, mask_base, valid);
-      if (!valid || max_logit_sh <= -3.0e38) {
-        weight_sh = 0.0;
+    // Process two bf16 elements when aligned to reduce packed-word loads.
+    for (uint d = lane * 2u; d < params.qk_dim; d += WG_SIZE * 2u) {
+      uint k_idx = k_base + d;
+      if (d + 1u < params.qk_dim && (k_idx & 1u) == 0u) {
+        uint k_packed = k_buffer.words[k_idx >> 1u];
+        float q0 = q_sh[d];
+        float q1 = q_sh[d + 1u];
+        float k0 = bf16_to_f32(k_packed & 0xFFFFu);
+        float k1 = bf16_to_f32(k_packed >> 16u);
+        partial += q0 * k0 + q1 * k1;
       } else {
-        weight_sh = exp(logit - max_logit_sh);
-        denom_sh += weight_sh;
+        partial += q_sh[d] * load_k(k_idx);
+        if (d + 1u < params.qk_dim) {
+          partial += q_sh[d + 1u] * load_k(k_idx + 1u);
+        }
+      }
+    }
+    dot_partial[lane] = partial;
+
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+      barrier();
+      if (lane < stride) {
+        dot_partial[lane] += dot_partial[lane + stride];
+      }
+    }
+
+    if (lane == 0u) {
+      bool valid = false;
+      float logit = masked_logit(dot_partial[0], q_pos, t, mask_base, valid);
+      if (!valid) {
+        alpha_sh = 1.0;
+        beta_sh = 0.0;
+        valid_sh = 0u;
+      } else {
+        float prev_max = max_logit_sh;
+        float next_max = max(prev_max, logit);
+        float alpha = (prev_max <= -3.0e38) ? 0.0 : exp(prev_max - next_max);
+        float beta = exp(logit - next_max);
+        max_logit_sh = next_max;
+        denom_sh = denom_sh * alpha + beta;
+        alpha_sh = alpha;
+        beta_sh = beta;
+        valid_sh = 1u;
       }
     }
     barrier();
 
     uint v_base = v_head_base + t * params.v_seq_stride;
-    float w = weight_sh;
-    for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
-      accum_sh[dv] += w * load_v(v_base + dv);
+    if (valid_sh != 0u) {
+      float alpha = alpha_sh;
+      float beta = beta_sh;
+      for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
+        accum_sh[dv] = accum_sh[dv] * alpha + beta * load_v(v_base + dv);
+      }
     }
     barrier();
   }
 
-  if (lane == 0u) {
-    float inv_denom = (denom_sh > 0.0) ? (1.0 / denom_sh) : 0.0;
-    uint out_base = (((b * params.n_q_heads) + hq) * params.q_len + q_pos) * params.v_dim;
+  float inv_denom = (denom_sh > 0.0) ? (1.0 / denom_sh) : 0.0;
+  uint out_base = (((b * params.n_q_heads) + hq) * params.q_len + q_pos) * params.v_dim;
+  if ((params.v_dim & 1u) == 0u) {
+    uint out_word_base = out_base >> 1u;
+    uint out_word_count = params.v_dim >> 1u;
+    for (uint w = lane; w < out_word_count; w += WG_SIZE) {
+      uint dv = w << 1u;
+      uint lo = f32_to_bf16(accum_sh[dv] * inv_denom) & 0xFFFFu;
+      uint hi = f32_to_bf16(accum_sh[dv + 1u] * inv_denom) & 0xFFFFu;
+      out_buffer.words[out_word_base + w] = lo | (hi << 16u);
+    }
+  } else if (lane == 0u) {
     for (uint dv = 0u; dv < params.v_dim; ++dv) {
       store_out(out_base + dv, accum_sh[dv] * inv_denom);
     }

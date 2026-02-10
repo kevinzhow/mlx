@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -248,9 +249,41 @@ inline const char* sdpa_stage_name(uint32_t q_len) {
   return q_len <= 1u ? "decode" : "prefill";
 }
 
+enum class SdpaNativePathKind { Decode, Prefill };
+
+inline SdpaNativePathKind sdpa_native_path_kind(uint32_t q_len) {
+  return q_len <= 1u ? SdpaNativePathKind::Decode
+                     : SdpaNativePathKind::Prefill;
+}
+
+inline const char* sdpa_native_path_name(SdpaNativePathKind path_kind) {
+  return path_kind == SdpaNativePathKind::Decode ? "decode" : "prefill";
+}
+
 inline std::string sdpa_bucket_key(uint32_t q_len, uint32_t k_len) {
   return std::string("stage=") + sdpa_stage_name(q_len) + " q=" +
       sdpa_len_bucket(q_len) + " k=" + sdpa_len_bucket(k_len);
+}
+
+inline const char* sdpa_native_direct_kernel(
+    SdpaNativePathKind path_kind) {
+  return path_kind == SdpaNativePathKind::Decode
+      ? mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1
+      : mlx::core::vulkan::KernelRegistry::SDPA_BF16_PREFILL_Q1;
+}
+
+inline const char* sdpa_native_splitk_stage1_kernel(
+    SdpaNativePathKind path_kind) {
+  return path_kind == SdpaNativePathKind::Decode
+      ? mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_SPLITK_STAGE1
+      : mlx::core::vulkan::KernelRegistry::SDPA_BF16_PREFILL_SPLITK_STAGE1;
+}
+
+inline const char* sdpa_native_splitk_reduce_kernel(
+    SdpaNativePathKind path_kind) {
+  return path_kind == SdpaNativePathKind::Decode
+      ? mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_SPLITK_REDUCE
+      : mlx::core::vulkan::KernelRegistry::SDPA_BF16_PREFILL_SPLITK_REDUCE;
 }
 
 struct SdpaStatsState {
@@ -468,7 +501,14 @@ inline bool native_sdpa_enabled() {
   return enabled;
 }
 
-inline uint32_t native_sdpa_max_k_len() {
+inline bool env_has_nonempty_value(const char* name) {
+  const char* v = std::getenv(name);
+  return v && v[0] != '\0';
+}
+
+inline uint32_t parse_env_u32(const char* name, uint32_t default_value);
+
+inline uint32_t native_sdpa_max_k_len_global() {
   static const uint32_t max_k_len = []() -> uint32_t {
     // Default widened after K-cap A/B (13/14/16): hit-rate improves on early
     // decode steps while throughput remains neutral in 10/40-token workloads.
@@ -512,6 +552,22 @@ inline uint32_t native_sdpa_max_q_len() {
   return max_q_len;
 }
 
+inline uint32_t native_sdpa_max_q_len_decode() {
+  static const uint32_t value = parse_env_u32("MLX_VK_SDPA_MAX_Q_LEN_DECODE", 1u);
+  return value;
+}
+
+inline uint32_t native_sdpa_max_q_len_prefill() {
+  static const uint32_t value = parse_env_u32(
+      "MLX_VK_SDPA_MAX_Q_LEN_PREFILL", native_sdpa_max_q_len());
+  return value;
+}
+
+inline uint32_t native_sdpa_max_q_len_for_q_len(uint32_t q_len) {
+  return q_len <= 1u ? native_sdpa_max_q_len_decode()
+                     : native_sdpa_max_q_len_prefill();
+}
+
 inline uint32_t parse_env_u32(const char* name, uint32_t default_value) {
   const char* v = std::getenv(name);
   if (!v || v[0] == '\0') {
@@ -526,6 +582,31 @@ inline uint32_t parse_env_u32(const char* name, uint32_t default_value) {
     return std::numeric_limits<uint32_t>::max();
   }
   return static_cast<uint32_t>(parsed);
+}
+
+inline uint32_t native_sdpa_max_k_len_decode() {
+  static const uint32_t value = []() -> uint32_t {
+    // Keep conservative default until staged K-cap A/B is stable across
+    // both 40/80-token workloads; use *_DECODE env for controlled rollouts.
+    constexpr uint32_t kDecodeDefault = 16u;
+    if (env_has_nonempty_value("MLX_VK_SDPA_MAX_K_LEN")) {
+      return parse_env_u32(
+          "MLX_VK_SDPA_MAX_K_LEN_DECODE", native_sdpa_max_k_len_global());
+    }
+    return parse_env_u32("MLX_VK_SDPA_MAX_K_LEN_DECODE", kDecodeDefault);
+  }();
+  return value;
+}
+
+inline uint32_t native_sdpa_max_k_len_prefill() {
+  static const uint32_t value = parse_env_u32(
+      "MLX_VK_SDPA_MAX_K_LEN_PREFILL", native_sdpa_max_k_len_global());
+  return value;
+}
+
+inline uint32_t native_sdpa_max_k_len_for_q_len(uint32_t q_len) {
+  return q_len <= 1u ? native_sdpa_max_k_len_decode()
+                     : native_sdpa_max_k_len_prefill();
 }
 
 inline uint32_t native_sdpa_splitk_min_k_len() {
@@ -560,7 +641,8 @@ inline uint32_t native_sdpa_splitk_min_k_len_decode() {
   static const uint32_t value = std::max<uint32_t>(
       2u,
       parse_env_u32(
-          "MLX_VK_SDPA_SPLITK_MIN_K_LEN_DECODE", native_sdpa_splitk_min_k_len()));
+          "MLX_VK_SDPA_SPLITK_MIN_K_LEN_DECODE",
+          std::max<uint32_t>(24u, native_sdpa_splitk_min_k_len())));
   return value;
 }
 
@@ -608,9 +690,22 @@ inline uint32_t native_sdpa_splitk_max_parts_prefill() {
   return value;
 }
 
+inline uint32_t native_sdpa_splitk_target_workgroups_decode() {
+  static const uint32_t value = std::max<uint32_t>(
+      1u, parse_env_u32("MLX_VK_SDPA_SPLITK_TARGET_WG_DECODE", 64u));
+  return value;
+}
+
+inline uint32_t native_sdpa_splitk_target_workgroups_prefill() {
+  static const uint32_t value = std::max<uint32_t>(
+      1u, parse_env_u32("MLX_VK_SDPA_SPLITK_TARGET_WG_PREFILL", 128u));
+  return value;
+}
+
 struct SdpaSplitKConfig {
   uint32_t min_k_len;
   uint32_t target_chunk;
+  uint32_t target_workgroups;
   uint32_t max_parts;
   const char* stage;
 };
@@ -620,17 +715,19 @@ inline SdpaSplitKConfig select_sdpa_splitk_config(uint32_t q_len) {
     return {
         native_sdpa_splitk_min_k_len_decode(),
         native_sdpa_splitk_target_chunk_decode(),
+        native_sdpa_splitk_target_workgroups_decode(),
         native_sdpa_splitk_max_parts_decode(),
         "decode"};
   }
   return {
       native_sdpa_splitk_min_k_len_prefill(),
       native_sdpa_splitk_target_chunk_prefill(),
+      native_sdpa_splitk_target_workgroups_prefill(),
       native_sdpa_splitk_max_parts_prefill(),
       "prefill"};
 }
 
-inline uint32_t select_sdpa_split_k(uint32_t k_len, uint32_t q_len) {
+inline uint32_t select_sdpa_split_k(uint32_t k_len, uint32_t q_len, uint32_t n_rows) {
   const uint32_t forced = native_sdpa_splitk_forced_parts();
   const auto cfg = select_sdpa_splitk_config(q_len);
   uint32_t split_k = 1u;
@@ -641,6 +738,7 @@ inline uint32_t select_sdpa_split_k(uint32_t k_len, uint32_t q_len) {
                 << "stage=" << cfg.stage
                 << " q_len=" << q_len
                 << " k_len=" << k_len
+                << " n_rows=" << n_rows
                 << " forced=" << forced
                 << " split_k=" << split_k
                 << "\n";
@@ -653,14 +751,42 @@ inline uint32_t select_sdpa_split_k(uint32_t k_len, uint32_t q_len) {
                 << "stage=" << cfg.stage
                 << " q_len=" << q_len
                 << " k_len=" << k_len
+                << " n_rows=" << n_rows
                 << " min_k_len=" << cfg.min_k_len
                 << " split_k=1"
                 << "\n";
     }
     return 1u;
   }
-  split_k = (k_len + cfg.target_chunk - 1u) / cfg.target_chunk;
-  split_k = std::max<uint32_t>(2u, split_k);
+  uint32_t requested_split_k =
+      std::max<uint32_t>(1u, (k_len + cfg.target_chunk - 1u) / cfg.target_chunk);
+  if (n_rows > 0u) {
+    const uint32_t requested_by_parallel = std::max<uint32_t>(
+        1u, (cfg.target_workgroups + n_rows - 1u) / n_rows);
+    const uint32_t boosted_limit =
+        requested_split_k > (std::numeric_limits<uint32_t>::max() / 2u)
+        ? std::numeric_limits<uint32_t>::max()
+        : requested_split_k * 2u;
+    requested_split_k = std::max<uint32_t>(
+        requested_split_k, std::min<uint32_t>(requested_by_parallel, boosted_limit));
+  }
+  if (requested_split_k <= 1u) {
+    if (sdpa_splitk_debug_enabled()) {
+      std::cerr << "[VulkanSDPASplitK] "
+                << "stage=" << cfg.stage
+                << " q_len=" << q_len
+                << " k_len=" << k_len
+                << " n_rows=" << n_rows
+                << " min_k_len=" << cfg.min_k_len
+                << " target_chunk=" << cfg.target_chunk
+                << " target_workgroups=" << cfg.target_workgroups
+                << " max_parts=" << cfg.max_parts
+                << " split_k=1"
+                << "\n";
+    }
+    return 1u;
+  }
+  split_k = requested_split_k;
   split_k = std::min<uint32_t>(split_k, cfg.max_parts);
   split_k = std::min<uint32_t>(split_k, k_len);
   split_k = std::max<uint32_t>(1u, split_k);
@@ -669,8 +795,10 @@ inline uint32_t select_sdpa_split_k(uint32_t k_len, uint32_t q_len) {
               << "stage=" << cfg.stage
               << " q_len=" << q_len
               << " k_len=" << k_len
+              << " n_rows=" << n_rows
               << " min_k_len=" << cfg.min_k_len
               << " target_chunk=" << cfg.target_chunk
+              << " target_workgroups=" << cfg.target_workgroups
               << " max_parts=" << cfg.max_parts
               << " split_k=" << split_k
               << "\n";
@@ -846,6 +974,20 @@ struct QmmConstTensorRef {
   bool cacheable{false};
 };
 
+struct SdpaSplitKTempTensors {
+  std::shared_ptr<kp::Tensor> partial_o_tensor;
+  std::shared_ptr<kp::Tensor> partial_m_tensor;
+  std::shared_ptr<kp::Tensor> partial_l_tensor;
+  size_t partial_o_capacity{0};
+  size_t partial_rows_capacity{0};
+};
+
+struct SdpaSplitKTempTensorRef {
+  std::shared_ptr<kp::Tensor> partial_o_tensor;
+  std::shared_ptr<kp::Tensor> partial_m_tensor;
+  std::shared_ptr<kp::Tensor> partial_l_tensor;
+};
+
 std::mutex& qmm_const_tensor_cache_mutex() {
   static std::mutex mtx;
   return mtx;
@@ -855,6 +997,59 @@ std::unordered_map<std::uintptr_t, CachedQmmConstTensorEntry>&
 qmm_const_tensor_cache() {
   static std::unordered_map<std::uintptr_t, CachedQmmConstTensorEntry> cache;
   return cache;
+}
+
+std::mutex& sdpa_splitk_temp_cache_mutex() {
+  static std::mutex mtx;
+  return mtx;
+}
+
+std::unordered_map<std::uint64_t, SdpaSplitKTempTensors>&
+sdpa_splitk_temp_tensor_cache() {
+  static std::unordered_map<std::uint64_t, SdpaSplitKTempTensors> cache;
+  return cache;
+}
+
+inline std::uint64_t sdpa_splitk_cache_key(const mlx::core::Stream& stream) {
+  const std::uint64_t device_type =
+      static_cast<std::uint64_t>(stream.device.type);
+  const std::uint64_t device_index =
+      static_cast<std::uint64_t>(std::max(stream.device.index, 0));
+  const std::uint64_t stream_index =
+      static_cast<std::uint64_t>(std::max(stream.index, 0));
+  return (device_type << 60u) ^ (device_index << 32u) ^ stream_index;
+}
+
+inline SdpaSplitKTempTensorRef get_sdpa_splitk_temp_tensors(
+    mlx::core::vulkan::Device& device,
+    const mlx::core::Stream& stream,
+    size_t partial_rows,
+    size_t partial_o_elems) {
+  auto manager = device.kompute_manager();
+  if (!manager) {
+    throw std::runtime_error("[Vulkan SDPA] Missing Kompute manager.");
+  }
+
+  std::lock_guard<std::mutex> lock(sdpa_splitk_temp_cache_mutex());
+  auto& cache = sdpa_splitk_temp_tensor_cache();
+  auto& slot = cache[sdpa_splitk_cache_key(stream)];
+
+  if (!slot.partial_o_tensor || slot.partial_o_capacity < partial_o_elems) {
+    slot.partial_o_tensor = manager->tensor(
+        std::vector<float>(partial_o_elems, 0.0f));
+    slot.partial_o_capacity = partial_o_elems;
+  }
+  if (!slot.partial_m_tensor || !slot.partial_l_tensor ||
+      slot.partial_rows_capacity < partial_rows) {
+    slot.partial_m_tensor = manager->tensor(std::vector<float>(partial_rows, 0.0f));
+    slot.partial_l_tensor = manager->tensor(std::vector<float>(partial_rows, 0.0f));
+    slot.partial_rows_capacity = partial_rows;
+  }
+
+  return {
+      slot.partial_o_tensor,
+      slot.partial_m_tensor,
+      slot.partial_l_tensor};
 }
 
 inline QmmConstTensorRef get_qmm_const_tensor(
@@ -1304,10 +1499,12 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
       (hq % hkv) != 0) {
     return reject("dim_nonpositive_or_head_repeat");
   }
-  if (lq > static_cast<int64_t>(native_sdpa_max_q_len())) {
+  if (lq > static_cast<int64_t>(native_sdpa_max_q_len_for_q_len(
+                   static_cast<uint32_t>(lq)))) {
     return reject("q_len_cap");
   }
-  if (lk > static_cast<int64_t>(native_sdpa_max_k_len())) {
+  if (lk > static_cast<int64_t>(native_sdpa_max_k_len_for_q_len(
+                   static_cast<uint32_t>(lq)))) {
     return reject("k_len_cap");
   }
   if (do_causal && lq > lk) {
@@ -1851,7 +2048,9 @@ bool fast::ScaledDotProductAttention::use_fallback(
   if (do_causal && q.shape(2) > k.shape(2)) {
     return reject("causal_qk_len");
   }
-  if (k.shape(2) > static_cast<int64_t>(native_sdpa_max_k_len())) {
+  if (k.shape(2) >
+      static_cast<int64_t>(native_sdpa_max_k_len_for_q_len(
+          static_cast<uint32_t>(q.shape(2))))) {
     return reject("k_len_cap");
   }
   if (q.shape(3) <= 0 || q.shape(3) > 256 ||
@@ -2108,7 +2307,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
   uint32_t mask_q_stride = 0;
   uint32_t mask_k_stride = 0;
   const char* native_reject_reason = nullptr;
-  auto dispatch_native_decode = [&](
+  auto dispatch_native_sdpa = [&](
+                                    SdpaNativePathKind path_kind,
                                     const std::vector<array>& native_inputs,
                                     uint32_t batch_size_local,
                                     uint32_t n_q_heads_local,
@@ -2196,16 +2396,11 @@ void fast::ScaledDotProductAttention::eval_gpu(
             encode_push_constant_f32(scale_)};
 
         encoder.record_algo_dispatch(
-            vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1,
+            sdpa_native_direct_kernel(path_kind),
             {q_tensor, k_tensor, v_tensor, out_tensor, mask_tensor},
             {n_rows, 1, 1},
             push_consts);
       } else {
-        auto manager = device.kompute_manager();
-        if (!manager) {
-          throw std::runtime_error("[Vulkan SDPA] Missing Kompute manager.");
-        }
-
         const uint64_t partial_rows_u64 =
             n_rows_u64 * static_cast<uint64_t>(split_k_local);
         const uint64_t partial_o_elems_u64 =
@@ -2220,9 +2415,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
 
         const size_t partial_rows = static_cast<size_t>(partial_rows_u64);
         const size_t partial_o_elems = static_cast<size_t>(partial_o_elems_u64);
-        auto partial_o_tensor = manager->tensor(std::vector<float>(partial_o_elems, 0.0f));
-        auto partial_m_tensor = manager->tensor(std::vector<float>(partial_rows, 0.0f));
-        auto partial_l_tensor = manager->tensor(std::vector<float>(partial_rows, 0.0f));
+        auto splitk_tensors = get_sdpa_splitk_temp_tensors(
+            device, stream, partial_rows, partial_o_elems);
 
         const std::vector<uint32_t> stage1_push_consts{
             encode_push_constant_u32(batch_size_local),
@@ -2246,13 +2440,13 @@ void fast::ScaledDotProductAttention::eval_gpu(
             encode_push_constant_f32(scale_)};
 
         encoder.record_algo_dispatch(
-            vulkan::KernelRegistry::SDPA_BF16_DECODE_SPLITK_STAGE1,
+            sdpa_native_splitk_stage1_kernel(path_kind),
             {q_tensor,
              k_tensor,
              v_tensor,
-             partial_o_tensor,
-             partial_m_tensor,
-             partial_l_tensor,
+             splitk_tensors.partial_o_tensor,
+             splitk_tensors.partial_m_tensor,
+             splitk_tensors.partial_l_tensor,
              mask_tensor},
             {static_cast<uint32_t>(partial_rows_u64), 1, 1},
             stage1_push_consts);
@@ -2265,8 +2459,11 @@ void fast::ScaledDotProductAttention::eval_gpu(
             encode_push_constant_u32(split_k_local)};
 
         encoder.record_algo_dispatch(
-            vulkan::KernelRegistry::SDPA_BF16_DECODE_SPLITK_REDUCE,
-            {partial_o_tensor, partial_m_tensor, partial_l_tensor, out_tensor},
+            sdpa_native_splitk_reduce_kernel(path_kind),
+            {splitk_tensors.partial_o_tensor,
+             splitk_tensors.partial_m_tensor,
+             splitk_tensors.partial_l_tensor,
+             out_tensor},
             {n_rows, 1, 1},
             reduce_push_consts);
       }
@@ -2277,6 +2474,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
       if (sdpa_debug_reject_enabled() ||
           env_flag_default_false("MLX_VK_DEBUG_SDPA_ERROR")) {
         std::cerr << "[VulkanSDPAError] native path failed: " << e.what()
+                  << " path=" << sdpa_native_path_name(path_kind)
                   << " q_len=" << q_len_local
                   << " split_k=" << split_k_local << " k_len=" << k_len_local
                   << " qk_dim=" << qk_dim_local << " v_dim=" << v_dim_local
@@ -2345,8 +2543,17 @@ void fast::ScaledDotProductAttention::eval_gpu(
           mask_q_stride,
           mask_k_stride,
           &native_reject_reason)) {
-    const uint32_t split_k = select_sdpa_split_k(k_len, q_len);
-    if (dispatch_native_decode(
+    const SdpaNativePathKind path_kind = sdpa_native_path_kind(q_len);
+    const uint64_t n_rows_u64 =
+        static_cast<uint64_t>(batch_size) * static_cast<uint64_t>(n_q_heads) *
+        static_cast<uint64_t>(q_len);
+    const uint32_t n_rows =
+        n_rows_u64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
+        ? std::numeric_limits<uint32_t>::max()
+        : static_cast<uint32_t>(n_rows_u64);
+    const uint32_t split_k = select_sdpa_split_k(k_len, q_len, n_rows);
+    if (dispatch_native_sdpa(
+            path_kind,
             native_inputs,
             batch_size,
             n_q_heads,
@@ -2447,9 +2654,21 @@ void fast::ScaledDotProductAttention::eval_gpu(
               packed_mask_q_stride,
               packed_mask_k_stride,
               &packed_reject_reason)) {
+        const SdpaNativePathKind packed_path_kind =
+            sdpa_native_path_kind(packed_q_len);
+        const uint64_t packed_n_rows_u64 =
+            static_cast<uint64_t>(packed_batch) *
+            static_cast<uint64_t>(packed_q_heads) *
+            static_cast<uint64_t>(packed_q_len);
+        const uint32_t packed_n_rows =
+            packed_n_rows_u64 >
+                static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
+            ? std::numeric_limits<uint32_t>::max()
+            : static_cast<uint32_t>(packed_n_rows_u64);
         const uint32_t packed_split_k =
-            select_sdpa_split_k(packed_k_len, packed_q_len);
-        if (dispatch_native_decode(
+            select_sdpa_split_k(packed_k_len, packed_q_len, packed_n_rows);
+        if (dispatch_native_sdpa(
+                packed_path_kind,
                 packed_native_inputs,
                 packed_batch,
                 packed_q_heads,

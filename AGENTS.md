@@ -108,6 +108,10 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - Global (existing): `MLX_VK_SDPA_SPLITK_MIN_K_LEN`, `MLX_VK_SDPA_SPLITK_TARGET_CHUNK`, `MLX_VK_SDPA_SPLITK_MAX_PARTS`, `MLX_VK_SDPA_SPLIT_K`
   - Decode overrides (`q_len==1`): `MLX_VK_SDPA_SPLITK_MIN_K_LEN_DECODE`, `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE`, `MLX_VK_SDPA_SPLITK_MAX_PARTS_DECODE`
   - Prefill overrides (`q_len>1`): `MLX_VK_SDPA_SPLITK_MIN_K_LEN_PREFILL`, `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_PREFILL`, `MLX_VK_SDPA_SPLITK_MAX_PARTS_PREFILL`
+- K-cap tuning knobs:
+  - Global (backward-compatible): `MLX_VK_SDPA_MAX_K_LEN`
+  - Decode override (`q_len==1`): `MLX_VK_SDPA_MAX_K_LEN_DECODE`
+  - Prefill override (`q_len>1`): `MLX_VK_SDPA_MAX_K_LEN_PREFILL`
 
 ## Definition of Done
 

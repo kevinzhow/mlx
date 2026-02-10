@@ -502,16 +502,21 @@ public:
   - `k/v` 支持两类布局：
     - 4D 密集行主序
     - KV cache-view（`stride[-1]==1`，`batch/head` 维紧邻，`seq` 维可跨大步长，允许 `data_size != size`）
-  - `Q_len` 支持范围：`1..MLX_VK_SDPA_MAX_Q_LEN`（默认 `8`）
+  - `Q_len` 支持范围：`1..MLX_VK_SDPA_MAX_Q_LEN`（默认 `16`）
   - decode/vector 场景支持三类 mask 语义：
     - `mask=None`
     - `mask="causal"`（`Q_len<=K_len`）
     - `mask_mode="array"`（additive mask；支持 broadcast 到 `[B,Hq,Q,K]`）
-  - bool mask 在当前 Vulkan 路径仍先转换为 additive mask，再进入 native
+  - bool mask 在 native 前重编码为 `uint32`（`mask_mode=2`），在 kernel 中按布尔语义直接屏蔽
   - `sinks` / training 仍走 fallback
-  - `q_len<=MLX_VK_SDPA_MAX_Q_LEN`（默认 `8`，可通过环境变量调节）
-  - `k_len<=MLX_VK_SDPA_MAX_K_LEN`（默认 `13`，可通过环境变量调节）
+  - `q_len<=MLX_VK_SDPA_MAX_Q_LEN`（默认 `16`，可通过环境变量调节）
+  - `k_len` 门禁支持分段：
+    - decode：`k_len<=MLX_VK_SDPA_MAX_K_LEN_DECODE`（默认 `16`）
+    - prefill：`k_len<=MLX_VK_SDPA_MAX_K_LEN_PREFILL`（默认继承全局）
+    - 兼容全局：`MLX_VK_SDPA_MAX_K_LEN`
   - `qk_dim<=256`，`v_dim<=256`
+  - 内核算法：
+    - `sdpa_bf16_decode_q1` 与 `split-k stage1` 已切换到单遍 online-softmax（不再双遍重复 QK）
 
 ### 10.3 仍走 fallback 的场景
 - `RoPE` 的非连续/非 1D `freqs` 布局

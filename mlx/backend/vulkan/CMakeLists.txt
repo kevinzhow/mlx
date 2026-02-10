@@ -101,6 +101,9 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_q1.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_splitk_stage1.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_splitk_reduce.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_prefill_q1.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_prefill_splitk_stage1.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_prefill_splitk_reduce.comp
 )
 
 # Compile shaders to SPIR-V

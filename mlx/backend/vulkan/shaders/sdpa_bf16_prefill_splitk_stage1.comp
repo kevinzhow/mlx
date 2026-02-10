@@ -1,10 +1,12 @@
 #version 450
 
-// Stage 1 for decode SDPA split-k:
+// Stage 1 for prefill SDPA split-k:
 // each workgroup computes one (row, split) partial tuple:
 // - partial row max (m)
 // - partial row exp sum (l)
 // - partial unnormalized weighted value sum (o)
+// Compared with decode stage1, this variant clips causal range once at chunk
+// setup, then runs branch-free inner t loop.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer QBuffer {
@@ -105,17 +107,9 @@ bool load_mask_bool(uint elem_idx) {
   return mask_buffer.words[elem_idx] != 0u;
 }
 
-float masked_logit(float dot, uint q_pos, uint k_pos, uint mask_base, out bool valid) {
+float masked_logit_prefill(float dot, uint k_pos, uint mask_base, out bool valid) {
   valid = true;
   float logit = dot * params.scale;
-
-  if (params.causal != 0u) {
-    int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
-    if (int(k_pos) > causal_limit) {
-      valid = false;
-      return 0.0;
-    }
-  }
 
   if (params.mask_mode == 1u) {
     logit += load_mask_add(mask_base + k_pos * params.mask_k_stride);
@@ -168,6 +162,22 @@ void main() {
   uint start_t = part * chunk;
   uint end_t = min(params.k_len, start_t + chunk);
 
+  if (params.causal != 0u) {
+    int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
+    if (causal_limit < 0) {
+      start_t = 1u;
+      end_t = 0u;
+    } else {
+      uint causal_end = min(params.k_len, uint(causal_limit + 1));
+      if (start_t < causal_end) {
+        end_t = min(end_t, causal_end);
+      } else {
+        start_t = 1u;
+        end_t = 0u;
+      }
+    }
+  }
+
   uint partial_idx = rowq * params.split_k + part;
   uint partial_o_base = partial_idx * params.v_dim;
 
@@ -196,14 +206,6 @@ void main() {
 
   // Single-pass online softmax in this split.
   for (uint t = start_t; t < end_t; ++t) {
-    // For causal attention, skip upper-triangular invalid positions early.
-    if (params.causal != 0u) {
-      int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
-      if (int(t) > causal_limit) {
-        continue;
-      }
-    }
-
     uint k_base = k_head_base + t * params.k_seq_stride;
     float partial = 0.0;
     // Process two bf16 elements when aligned to reduce packed-word loads.
@@ -234,7 +236,7 @@ void main() {
 
     if (lane == 0u) {
       bool valid = false;
-      float logit = masked_logit(dot_partial[0], q_pos, t, mask_base, valid);
+      float logit = masked_logit_prefill(dot_partial[0], t, mask_base, valid);
       if (!valid) {
         alpha_sh = 1.0;
         beta_sh = 0.0;

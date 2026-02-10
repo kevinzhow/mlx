@@ -2014,3 +2014,752 @@ python -m unittest discover -v
 1. 用统计门禁推进 `K cap` 分段扩展（先 `20/24`），以 `k_len_cap` 占比下降和 40/80-token 吞吐不回退为准入条件。
 2. 在 `MLX_VK_SDPA_STATS=1` 下补充中英文 `max_tokens=80` 基线，按 bucket 对比 `K cap` 策略收益。
 3. 当 `K cap` 收益稳定后，再推进 `Q_len>16` prefill/full native 门禁扩展，继续缩小 fallback 面。
+
+### 2026-02-10 主线推进（`K cap` 分段门禁落地 + 默认值审慎回收）✅
+
+#### 本轮目标
+- 实现 decode/prefill 分段 `K cap` 门禁能力，并基于 40/80-token 实测判定是否可直接提升默认 decode `K cap`。
+
+#### 本轮变更
+1. 分段 `K cap` 能力落地（保持全局兼容）：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - 新增：
+     - `MLX_VK_SDPA_MAX_K_LEN_DECODE`（`q_len==1`）
+     - `MLX_VK_SDPA_MAX_K_LEN_PREFILL`（`q_len>1`）
+   - 兼容策略：
+     - 若设置全局 `MLX_VK_SDPA_MAX_K_LEN`，分段门限默认继承全局值；
+     - 未设置全局时，decode/prefill 使用各自默认值。
+2. 门禁接线：
+   - `use_fallback` 与 native gate 均改为使用 `native_sdpa_max_k_len_for_q_len(q_len)`，保证前后判定一致。
+3. 默认策略最终收敛：
+   - 初始尝试将 decode 默认放到 `24` 做主线评估；
+   - 经过 80-token 重复对照后，默认值回收为 `16`（保守），仅保留分段 env 作为实验开关。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+   - `python -m unittest -v test_fast_sdpa` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. 40-token 对照（单次）：
+   - EN (`Hi`)
+     - old (`decode=16/prefill=16`): `2.389 tok/s`, `k_len_cap=924`
+     - new (`decode=24/prefill=16`): `2.406 tok/s`, `k_len_cap=700`
+   - ZH (`你好啊`)
+     - old: `2.377 tok/s`, `k_len_cap=952`
+     - new: `2.412 tok/s`, `k_len_cap=728`
+   - 结论：40-token 下 decode=24 有正向趋势，且显著降低 `k_len_cap` 回退。
+3. 80-token 对照（单次 + 重复）：
+   - 单次：
+     - EN old/new: `1.983 -> 1.985 tok/s`（近似持平）
+     - ZH old/new: `1.994 -> 1.965 tok/s`（新策略偏慢）
+   - 3 次重复均值：
+     - EN old/new: `1.993 -> 1.986 tok/s`
+     - ZH old/new: `1.991 -> 1.981 tok/s`
+   - 同时 `k_len_cap` 回退显著下降：
+     - EN: `2044 -> 1820`
+     - ZH: `2072 -> 1848`
+   - 结论：命中率提升明确，但 80-token 吞吐尚未稳定转正，不适合直接上默认。
+4. 正确性冒烟（默认收敛后）：
+   - ZH `prompt="你好啊"`：`Generation: 10 tokens, 3.130 tok/s`，输出前缀正常。
+   - EN `prompt="Hi what is your name"`：`Generation: 10 tokens, 3.245 tok/s`，输出前缀正常。
+
+#### 当前状态
+- ✅ 分段 `K cap` 能力已具备，可安全做 decode-only 放量实验。
+- ✅ 默认策略已保持保守（decode/prefill 默认仍为 `16`），避免在 80-token 场景引入回退风险。
+- ⚠️ 主要瓶颈仍是 `k_len_cap`；仅放宽门限不足以保证长序列吞吐提升，需先优化 decode `k=17~32` native 路径效率。
+
+#### 下一步（精确）
+1. 针对 decode `k=17~32` 做小步优化（优先 split-k 策略与调度开销），先让 `decode=24` 在 80-token 上转正后再考虑默认放量。
+2. 在 `MLX_VK_SDPA_STATS=1` 下固定 40/80-token 门禁（EN/ZH 各 3 次），以“吞吐不回退 + `k_len_cap` 占比下降”作为准入。
+3. 若 `decode=24` 稳定通过门禁，再推进 `20/24/32` 分段实验与 `Q_len>16` prefill 扩展。
+
+### 2026-02-10 主线推进（SDPA 单遍 online-softmax 内核落地）✅
+
+#### 本轮目标
+- 针对 decode `k=17~32` 路径，先优化 SDPA native kernel 本体，验证“命中率提升未转化为吞吐”的根因是否来自两遍 softmax 的计算/同步开销。
+
+#### 本轮变更
+1. SDPA shader 从“两遍 softmax”改为“单遍 online-softmax”：
+   - 文件：
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp`
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp`
+   - 改动要点：
+     - 删除先求 `row max` 再 second pass 的双循环；
+     - 使用 online 更新：`M/L` 与 `O` 在同一遍中迭代更新；
+     - 保持 mask/causal 语义不变（invalid 位置不参与更新）。
+2. 其余 gate 策略不变：
+   - 默认 `Q cap=16`、`K cap decode/prefill=16`；
+   - staged split-k / staged k-cap 逻辑保持不变。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+   - `python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 正确性冒烟（默认环境）：
+   - ZH `prompt="你好啊"`：`Generation: 10 tokens, 3.156 tok/s`，输出前缀正常（`<think> 好的，用户发来了一条消息`）。
+   - EN `prompt="Hi what is your name"`：`Generation: 10 tokens, 3.082 tok/s`，输出前缀正常（`<think> Okay, the user asked, "Hi`）。
+3. SDPA 微基准（`q_len=1, heads=16, dim=128`）：
+   - native on（`K cap decode=128`, `chunk_decode=32`）改动前后：
+     - `k=16`: `0.959 -> 0.899 ms`（约 `+6.3%`）
+     - `k=24`: `1.108 -> 0.842 ms`（约 `+24.0%`）
+     - `k=32`: `0.900 -> 0.831 ms`（约 `+7.8%`）
+     - `k=64`: `1.165 -> 1.169 ms`（基本持平）
+     - `k=128`: `1.368 -> 1.313 ms`（约 `+4.0%`）
+   - 但 native 仍明显慢于 fallback（同测约 `0.186~0.470 ms` 区间）。
+4. Qwen 端到端吞吐（默认 gate）：
+   - 40-token：
+     - EN：`2.369 -> 2.367 tok/s`（持平）
+     - ZH：`2.426 -> 2.391 tok/s`（轻微波动）
+   - 80-token：
+     - EN：`1.995 -> 1.986 tok/s`（持平）
+     - ZH：`1.977 -> 1.984 tok/s`（持平）
+5. `SDPA_STATS` 复核（`prompt=Hi`, 80-token）：
+   - 默认：`k_len_cap=2044`, `native_hits=251`, `Generation=1.988 tok/s`
+   - `decode K cap=24 + chunk=32`：`k_len_cap=1820`, `native_hits=475`, `Generation=1.983 tok/s`
+   - 结论：命中率可提升，但当前 native kernel 性能仍不足，吞吐未稳定转正。
+
+#### 当前状态
+- ✅ 单遍 online-softmax 已落地且无正确性/回归风险。
+- ✅ native kernel 局部时延改善（尤其 `k=24`）已确认。
+- ⚠️ 端到端吞吐仍基本不变；`decode k=17~32` 命中扩展未带来可复现收益，瓶颈仍在 native kernel 实际执行效率。
+
+#### 下一步（精确）
+1. 优先做 `decode` subgroup 版 dot-reduction（替换当前 barrier-heavy 规约），降低每步同步成本。
+2. 引入 `bf16x2/vec` 读写与更并行的 `V` 累加/写回路径，减少 lane0 串行段占比。
+3. 在上述 kernel 优化后，再重跑 `K cap=24` 门禁（40/80-token EN/ZH 各 3 次），以“吞吐稳定转正 + k_len_cap 占比下降”为准入条件。
+
+### 2026-02-10 主线研究（Metal vs Ollama Vulkan：SDPA 下一步方向）✅
+
+#### 本轮目标
+- 对比 Metal 后端与 Ollama/ggml Vulkan 的 attention 设计，确定 Vulkan SDPA 下一阶段应优先投入的方向。
+
+#### 研究结论（代码对照）
+1. Metal 关键机制（本仓）：
+   - `ScaledDotProductAttention::use_fallback` 只保留语义级 gate（training/logsumexp/cpu），并在 native 内部分流。  
+     参考：`mlx/backend/metal/scaled_dot_product_attention.cpp`
+   - 明确双路径：
+     - vector path：`q_len <= 8`（含 `sdpa_vector` 与按设备/序列长度选择的 `sdpa_vector_2pass`）
+     - full path：`q_len > 8`（`sdpa_full_self_attention_*`）
+   - 使用 function constants + kernel hash 做 pipeline 变体缓存（mask/casual/query_transposed/sinks）。
+   - vector kernel中已采用 subgroup reduction + online softmax，不是两遍全量重算。  
+     参考：`mlx/backend/metal/kernels/sdpa_vector.h`
+2. Ollama/ggml Vulkan 关键机制（上游实现）：
+   - flash-attn 路径按硬件能力选择 `FA_SCALAR / FA_COOPMAT1 / FA_COOPMAT2`，并在运行时可降级。  
+     参考：`/tmp/ollama/ml/backend/ggml/ggml/src/ggml-vulkan/ggml-vulkan.cpp`
+   - pipeline state key 维度完整（`HSK/HSV/small_rows/path/aligned/f32acc`），运行时按 key 取 pipeline。  
+     参考：`vk_fa_pipeline_state` 与 `pipeline_flash_attn_f32_f16`
+   - split-k 不是固定门限：依据 `shader_core_count` 与 workgroup 形状自动推导，再做对齐修正。  
+     参考：`ggml_vk_flash_attn(...)` 中 `split_k/split_kv` 选择逻辑
+   - shader 内有“mask 全 -inf block 直接跳过”的优化，减少无效计算。  
+     参考：`vulkan-shaders/flash_attn.comp`（`subgroupAll` + `continue`）
+3. 我们当前 Vulkan SDPA 的核心差距（本仓）：
+   - 仍是 decode-only 主体（`q_len`/`k_len` cap 门禁明显），缺少 Metal 对等的 full prefill native 主路径。  
+     参考：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - 虽已落地 online softmax，但 decode kernel 仍偏“barrier-heavy + 通用标量”实现，subgroup/向量化利用不足。
+   - split-k 临时缓冲在 dispatch 中动态创建（`manager->tensor(std::vector<float>...)`），调度/分配开销高。
+   - 路径选择主要基于固定 cap，缺少“能力 + 形状 + 负载”的多维策略（对照 Metal/Ollama）。
+
+#### 新方案（按优先级）
+1. P0 架构层：引入与 Metal 对齐的双路径
+   - `Path A` decode-vector（优先 `q_len <= 8`，兼容 `q_len == 1` 高优）
+   - `Path B` prefill/full（`q_len > 8`，tile 化 online softmax）
+   - 将现有 `Q/K cap` 从“全局硬门禁”改为“路径内安全阈值 + 实验开关”。
+2. P1 内核层：先做 decode kernel 真正提效
+   - subgroup shuffle 规约替换当前多 barrier 规约；
+   - `bf16x2/vec4` 读写 + 更并行的 `V` 聚合/写回；
+   - 保留已落地的 single-pass online softmax 数值框架。
+3. P1 运行时层：对齐 Ollama 的 split-k 与资源策略
+   - split-k 临时缓冲改为 stream/device 级复用池（避免每次 `manager->tensor(vector)` 分配）；
+   - split-k 选择引入“核心数/并行度”启发式，而非固定阈值。
+4. P2 覆盖层：prefill/full native 落地
+   - 先支持 `q_len > 8` 的 bfloat16 常见 head dim（64/80/128）；
+   - 补齐 cache-view（`data_size != size`）布局与 mask 广播语义。
+5. P3 扩展层（可选）
+   - coopmat/矩阵核路径做可探测加速（不替代标量兜底）；
+   - 量化 K/V 支持按“收益/复杂度”分阶段推进（避免 pipeline 组合爆炸）。
+
+#### 当前状态
+- ✅ 方向已明确：下一轮不再优先调 cap，改为“内核实效 + 运行时策略 + full path”三条主线并行推进。
+- ✅ 研究结论已与现有瓶颈（`k_len_cap` 降低但吞吐不转正）一致。
+
+#### 下一步（精确执行）
+1. 先落地 decode subgroup kernel（替换当前规约）并复测 micro + Qwen 40/80。
+2. 同步落地 split-k 临时缓冲复用池，消除每次 dispatch 动态分配。
+3. 启动 prefill/full tile kernel 最小可用版（`q_len>8`, head dim 64/80/128），形成 Metal 对齐主路径。
+
+### 2026-02-10 详细开发计划（Metal-first 架构 + Ollama 风格性能策略）🧭
+
+#### 计划总目标
+- 以 Metal 的 `vector/full` 双路径语义为主线，逐步把 Vulkan SDPA 从“decode-only + cap门禁”推进到“可持续扩展的主路径实现”，并引入 Ollama 风格的运行时策略（variant key、split-k 启发式、资源复用）提升吞吐。
+
+#### 全局门禁（每阶段都必须满足）
+1. 构建门禁：
+   - `cmake --build build_release_vulkan --target mlx -j`
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）
+2. 正确性门禁：
+   - `python/tests/test_fast_sdpa.py -v`（当前基线：20 pass / 1 skip）
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`（当前基线：223/223）
+   - Qwen 10-token 中英 prompt 正确性冒烟（无乱码、输出语义正常）
+3. 性能门禁（固定观测）：
+   - `MLX_VK_SDPA_STATS=1` 下记录 `use_fallback_rejects/native_hits/k_len_cap`
+   - Qwen `40/80` token 中英各 `3` 次，采用均值比较
+   - 准入条件：吞吐不回退，且 fallback 主因占比下降
+
+#### 阶段 A（P1 内核实效）: Decode kernel 规约与访存优化
+- 目标：
+  - 先把 decode `k=17~32` 的 kernel 单步时延压下去，让命中率提升能转化成吞吐收益。
+- 任务：
+  1. 在 `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp` / `sdpa_bf16_decode_splitk_stage1.comp`：
+     - 优化点 A1：规约路径（优先 subgroup-capable 方案，若受 SPIR-V 约束则采用低同步替代）。
+     - 优化点 A2：`bf16x2/vec4` 读取与 `V` 累加并行化，减少 lane0 串行段。
+     - 优化点 A3：减少循环内 barrier 次数与共享内存往返。
+  2. 补充 micro 基准脚本固化（`q_len=1`, `k={16,24,32,64,128}`）作为回归观测。
+- 交付物：
+  - decode kernel 优化提交 + micro 对照结果。
+- 验收：
+  - micro 至少在 `k=24/32` 稳定优于当前基线；
+  - Qwen 40/80 token 不劣化。
+
+#### 阶段 B（P1 运行时策略）: split-k 资源复用 + 启发式选择
+- 目标：
+  - 去掉 dispatch 内临时 buffer 动态分配，降低调度开销与抖动。
+- 任务：
+  1. 在 `mlx/backend/vulkan/primitives/fallback.cpp`：
+     - 把 `manager->tensor(std::vector<float>...)` 替换为 stream/device 级 split-k 缓冲复用（按最大需求扩容）。
+     - 保留线程安全与 stream 隔离，避免跨 stream 数据污染。
+  2. split-k 选择逻辑从“纯阈值”升级为“并行度启发式”：
+     - 引入 work item 数、heads、batch、k_len 的综合选择；
+     - 保留 env 覆盖（debug/强制 split_k）用于回归。
+- 交付物：
+  - split-k buffer pool + 选择策略提交；
+  - `MLX_VK_SDPA_STATS=1` 对照（fallback reason bucket 变化）。
+- 验收：
+  - `k_len_cap` 放宽后，吞吐相对阶段 A 有稳定正向或至少持平；
+  - 无新增 OOM/竞态/死锁。
+
+#### 阶段 C（P2 覆盖扩展）: Prefill/Full native MVP（Metal 对齐关键）
+- 目标：
+  - 建立 `q_len > 8` 的 native 主路径，不再长期依赖 fallback。
+- 任务：
+  1. 新增 prefill/full tile kernel（先支持 bf16 + head dim `64/80/128`）：
+     - 路径落点：`mlx/backend/vulkan/shaders/*` + `fallback.cpp` dispatch。
+  2. gate 策略改造：
+     - 从全局硬 cap 转为路径内安全门禁；
+     - decode/prefill 分别评估，不互相拖累。
+  3. 先实现 mask 子集：
+     - `mask=None`、`causal`、常见 array mask 广播布局。
+- 交付物：
+  - prefill/full MVP 路径可运行并命中；
+  - `ARCHITECTURE.md` 增补路径图与门禁规则。
+- 验收：
+  - `q_len>8` 负载下 native hit 显著提升；
+  - Qwen 真实负载下 prompt 阶段吞吐不劣化。
+
+#### 阶段 D（P2-P3 收敛）: 路径选择器与变体缓存完善
+- 目标：
+  - 形成可扩展的 `pipeline key` 与策略，减少手工 cap 调参依赖。
+- 任务：
+  1. 在 Vulkan 路径建立 `SDPA pipeline state key`（建议维度）：
+     - `path(decode/prefill)`, `head_dim`, `q_len bucket`, `k_len bucket`, `mask_mode`, `aligned/layout class`, `acc_mode`。
+  2. 增加运行时降级策略：
+     - 当某路径失败或超出能力时自动降级，不影响结果正确性。
+  3. 文档与调试开关完善：
+     - 将关键 env/gate 与默认值写入 `AGENTS.md`。
+- 交付物：
+  - 路径选择器 + 变体 key + debug 统计。
+- 验收：
+  - 新增场景不需要手工 hardcode cap 即可稳定运行；
+  - 回归与性能门禁持续通过。
+
+#### 阶段 E（可选强化）: coopmat 路径探索
+- 目标：
+  - 在不影响主路径稳定前提下，评估 coopmat 对特定设备的收益。
+- 原则：
+  - 仅作可探测加速路径，不替代 scalar/subgroup 兜底；
+  - 必须保持可关闭、可回退、可监控。
+
+#### 风险与回滚策略
+1. 风险：shader 优化导致数值不稳定/乱码
+   - 对策：每步改动后强制跑 Qwen 10-token 中英 + `test_fast_sdpa`
+   - 回滚：保留 env gate 快速禁用新路径
+2. 风险：split-k 复用引入并发问题
+   - 对策：按 stream 维度隔离复用，先单 stream 验证再放开
+3. 风险：prefill/full 路径引入大范围回归
+   - 对策：先 narrow head_dim + narrow mask 子集，逐步扩容
+
+#### 近期执行顺序（未来 3 个工作循环）
+1. Cycle-1：阶段 A 完成（decode kernel 实效优化 + micro/Qwen 对照）。
+2. Cycle-2：阶段 B 完成（split-k 复用池 + 启发式选择）。
+3. Cycle-3：阶段 C 启动并落地 prefill/full MVP（先 `q_len>8` 常见 head_dim）。
+
+### 2026-02-10 主线推进（阶段 B-1：SDPA split-k 临时 buffer 复用）✅
+
+#### 本轮目标
+- 消除 `fast::ScaledDotProductAttention` split-k 分支中每次 dispatch 的临时 `manager->tensor(std::vector<float>...)` 分配，改为按 stream 复用，降低调度开销和分配抖动。
+
+#### 本轮变更
+1. 在 `mlx/backend/vulkan/primitives/fallback.cpp` 新增 split-k 临时 tensor 缓存：
+   - 新增 `SdpaSplitKTempTensors` / `SdpaSplitKTempTensorRef`；
+   - 新增 `sdpa_splitk_temp_tensor_cache()`（`std::unordered_map<uint64_t, ...>`）与互斥保护；
+   - 缓存 key 使用 `device.type + device.index + stream.index` 组合；
+   - 容量策略为“只扩不缩”：`partial_o_capacity` / `partial_rows_capacity`。
+2. 将 split-k 路径分配点替换为缓存获取：
+   - 由每次新建 `partial_o/m/l` tensor，
+   - 改为 `get_sdpa_splitk_temp_tensors(device, stream, partial_rows, partial_o_elems)`。
+3. 行为保持：
+   - split-k shader 参数、调度顺序（stage1 -> reduce）与 fallback 语义不变。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+   - `python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 10-token 正确性/速度（实卡 Vulkan）：
+   - `prompt="Hi what is your name"`：`Generation: 10 tokens, 3.035 tok/s`，输出前缀正常（`<think> Okay, the user asked, "Hi`）。
+3. `MLX_VK_SDPA_STATS=1` 40-token 观测（`prompt="Hi"`）：
+   - `Generation: 40 tokens, 2.388 tok/s`
+   - `native_hits=251`, `k_len_cap=924`（bucket 仍集中在 decode `k=17~64`）。
+
+#### 当前状态
+- ✅ split-k 复用池已落地并稳定，无正确性回归。
+- ⚠️ 端到端吞吐仍与旧基线接近，当前瓶颈仍主要是 decode native kernel 执行效率，而非临时分配本身。
+
+#### 下一步（精确）
+1. 实施阶段 B-2：引入 split-k 启发式选择（结合 `n_rows=q*b*h` 与目标 workgroup 并行度），替换当前固定 `target_chunk` 主导逻辑。
+2. 同步实施阶段 A-2：继续优化 decode kernel（`k=17~32`）规约与访存，优先减少 barrier/共享内存开销。
+3. 用固定门禁复测（EN/ZH 40/80-token 各 3 次 + `MLX_VK_SDPA_STATS=1`）决定是否放宽 decode 默认 `K cap`。
+
+### 2026-02-10 主线推进（阶段 B-2：split-k 选择启发式）✅
+
+#### 本轮目标
+- 将 split-k 选择从“仅按 `k_len/target_chunk`”升级为“`target_chunk + 并行度(n_rows)`”联合启发式，贴近 Ollama 风格运行时策略。
+
+#### 本轮变更
+1. `mlx/backend/vulkan/primitives/fallback.cpp`
+   - `select_sdpa_split_k` 签名改为 `select_sdpa_split_k(k_len, q_len, n_rows)`；
+   - 新增按阶段的目标并行参数：
+     - `MLX_VK_SDPA_SPLITK_TARGET_WG_DECODE`（默认 `64`）
+     - `MLX_VK_SDPA_SPLITK_TARGET_WG_PREFILL`（默认 `128`）
+   - 新启发式：
+     - `requested_by_chunk = ceil(k_len / target_chunk)`
+     - `requested_by_parallel = ceil(target_workgroups / n_rows)`
+     - 最终 `requested = max(requested_by_chunk, min(requested_by_parallel, 2 * requested_by_chunk))`
+     - 之后继续受 `max_parts` / `k_len` 上限约束。
+2. 两处调用点同步传入 `n_rows = batch * heads * q_len`：
+   - 原生路径首次命中分支；
+   - repack 后重试分支。
+3. `MLX_VK_DEBUG_SDPA_SPLITK=1` 日志输出增强：
+   - 增加 `n_rows`、`target_workgroups`，便于后续调参。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+   - `python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 正确性冒烟：
+   - ZH `prompt="你好啊"`：`Generation: 10 tokens, 3.214 tok/s`，输出前缀正常（`<think> 好的，用户发来了一条消息`）。
+3. 启发式行为确认：
+   - 在 `MLX_VK_SDPA_MAX_K_LEN_DECODE=24`、`MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE=32`、`MLX_VK_DEBUG_SDPA_SPLITK=1` 下：
+   - decode 场景 `k_len=16~24, n_rows=16` 明确命中 `split_k=2`（此前固定 chunk 策略为 `split_k=1`）。
+4. 40-token 观测（`prompt="Hi"`，decode cap=24/chunk=32）：
+   - `Generation: 2.413 tok/s`
+   - `native_hits=475`, `k_len_cap=700`（`17-32` bucket native 命中提升）。
+
+#### 当前状态
+- ✅ split-k 选择策略已从静态阈值升级为轻量启发式，具备进一步调参基础。
+- ⚠️ 端到端收益目前仍然温和，主瓶颈依旧在 decode kernel 的算子执行效率（非选择策略本身）。
+
+#### 下一步（精确）
+1. 进入阶段 A-2：优先做 decode kernel 的 `qk` 规约与 `v` 累加访存优化（继续压 `k=17~32` 延迟）。
+2. 固定门禁跑 40/80-token EN/ZH 各 3 次，对比 `target_wg_decode=32/64/96`，找吞吐与命中率平衡点。
+3. 若 decode 子区间可稳定转正，再推进 prefill/full MVP（`q_len>8`）以对齐 Metal 主路径。
+
+### 2026-02-10 主线推进（阶段 A-2：QK bf16-pair 读路径优化）✅
+
+#### 本轮目标
+- 在不改变 SDPA 数值流程（single-pass online softmax）的前提下，减少 decode kernel QK dot-product 的 packed bf16 读开销。
+
+#### 本轮变更
+1. Shader 侧（仅 QK dot 路径）：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp`
+2. 核心策略：
+   - 将 `d += WG_SIZE` 的逐元素读改为 `d += WG_SIZE*2` 的 bf16-pair 处理；
+   - 对齐条件满足时（`(q_idx|k_idx)&1==0` 且存在 `d+1`）直接一次 packed 读解两元素；
+   - 非对齐/尾元素自动回退到原逐元素路径，保持语义正确。
+3. 不变项：
+   - mask/causal/online-softmax 更新公式不变；
+   - split-k stage1/reduce 流程与 push constants 不变。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+   - `python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 正确性与速度：
+   - EN `prompt="Hi what is your name"`：`Generation: 10 tokens, 3.085 tok/s`，输出前缀正常。
+   - ZH `prompt="你好啊"`：`Generation: 10 tokens, 3.214 tok/s`，输出前缀正常。
+3. 40-token 对照（`prompt="Hi"`，`decode cap=24/chunk=32`）：
+   - 本轮：`Generation: 2.419 tok/s`，`native_hits=475`，`k_len_cap=700`。
+   - 对比前轮（同门禁）：`2.413 tok/s` -> `2.419 tok/s`（小幅正向，单次结果仍需多次均值确认）。
+
+#### 当前状态
+- ✅ SDPA 主线改动（split-k 复用 + 启发式 + QK pair 读）均稳定通过回归。
+- ⚠️ 端到端收益仍是“渐进小步”，尚未形成 80-token 稳定转正证据。
+
+#### 下一步（精确）
+1. 补齐 A-2：继续做 `V` 累加/写回段的访存与并行度优化（减少 lane0 串行占比）。
+2. 按门禁执行 40/80-token EN/ZH 各 3 次（默认门禁与 decode=24 门禁各一组），只看均值做结论。
+3. 若均值确认 decode 子区间转正，再进入 prefill/full (`q_len>8`) MVP 设计与实现。
+
+### 2026-02-10 追踪修正（decode split-k 过早触发 + 测速规范）✅
+
+#### 本轮问题
+- 在继续 A/B 优化过程中，默认 Qwen 10-token 吞吐一度从 ~`3.1 tok/s` 掉到 ~`2.6 tok/s`，需要快速定位是否为新内核或新策略导致。
+
+#### 排查结论
+1. 根因定位：
+   - 非主因：`QK bf16-pair` 路径（保留后仍可恢复性能）。
+   - 主因：decode 路径 split-k 在较短 `k_len`（`>=16`）即触发，额外 stage1/reduce 开销超过收益。
+   - 证据：同一构建下强制 `MLX_VK_SDPA_SPLIT_K=1`，10-token 立即恢复到 ~`3.15 tok/s`。
+2. 测速方法纠偏：
+   - 并行发起两个生成任务会互相争抢 GPU，显著低估吞吐；
+   - 后续性能对照统一使用“串行单任务”。
+
+#### 本轮修复
+1. `mlx/backend/vulkan/primitives/fallback.cpp`
+   - 将 decode split-k 默认最小触发阈值调高：
+     - `native_sdpa_splitk_min_k_len_decode` 默认值从全局默认（16）抬到 `max(24, global_default)`。
+   - 保留 env 可覆盖：
+     - `MLX_VK_SDPA_SPLITK_MIN_K_LEN_DECODE`
+2. Shader 尝试：
+   - 试做 `V` 累加 bf16-pair 优化后未观察到稳定正收益，已回滚，保持保守路径。
+
+#### 验证结果
+1. 回归：
+   - `python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 10-token（串行）：
+   - EN `prompt="Hi what is your name"`：`Generation: 3.184 tok/s`
+   - ZH `prompt="你好啊"`：`Generation: 3.203 tok/s`
+3. decode cap=24 对照（`prompt="Hi"`, 40-token）：
+   - auto split-k：`2.420 tok/s`
+   - force `split_k=1`：`2.415 tok/s`
+   - 结论：在 cap=24 条件下当前启发式总体中性略正，无明显负收益。
+
+#### 当前状态
+- ✅ 默认短序列性能恢复，split-k 启发式不再干扰默认 decode 主路径。
+- ✅ `QK bf16-pair` + split-k 复用池 + 启发式框架均保持稳定回归。
+- ⚠️ 端到端收益仍主要受 decode kernel 实效与 prefill/full 覆盖限制。
+
+#### 下一步（精确）
+1. 进入主线阶段 C：启动 `q_len>8` prefill/full SDPA MVP（bf16，head dim 64/80/128）实现。
+2. 继续保持 decode 路径“默认保守 + 实验开关放量”策略，避免回归。
+3. 固化性能门禁脚本为串行执行，避免误判。
+
+### 2026-02-10 主线推进（prefill 实效：causal 上三角早跳过）✅
+
+#### 本轮目标
+- 在不改动数值语义的前提下，减少 prefill 场景（`q_len>1`、`causal=true`）的无效上三角计算，作为 full/prefill 主路径前的低风险提效。
+
+#### 本轮变更
+1. Shader 更新：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp`
+2. 改动点：
+   - 在每个 `t` 循环开始处增加 causal 无效区早跳过：
+     - `causal_limit = q_pos + k_len - q_len`
+     - 当 `t > causal_limit` 时直接 `continue`，避免后续 QK 计算与 V 累加。
+   - 该优化仅影响“本就应被 causal mask 屏蔽”的位置，输出语义保持一致。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+   - `python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 冒烟（串行）：
+   - EN `prompt="Hi what is your name"`：`Generation: 3.059 tok/s`，输出前缀正常。
+
+#### 当前状态
+- ✅ decode/prefill 共用 kernel 现在具备 causal 上三角早跳过，prefill 无效计算已减少。
+- ✅ 默认短序列吞吐保持在 ~`3.0+ tok/s` 区间，未引入可见回归。
+- ⚠️ 仍缺少真正 `q_len>8` 的独立 prefill/full tile kernel（主线阶段 C 目标未完成）。
+
+#### 下一步（精确）
+1. 在 `fallback.cpp` 中引入 prefill/full 专用 dispatch 框架（与 decode 分离的 path selector）。
+2. 新增 prefill MVP kernel（先 `bf16`, head dim `64/80/128`, `mask=None|causal`），并保持 fallback 兜底。
+3. 用 40/80-token EN/ZH 串行门禁 + `MLX_VK_SDPA_STATS=1` 验证命中率与吞吐是否同步提升。
+
+### 2026-02-10 主线推进（阶段 C-0：prefill/full dispatch 框架化）✅
+
+#### 本轮目标
+- 在不改变现有行为的前提下，把 SDPA native 调度从“decode 命名路径”重构为“decode/prefill path-aware”框架，为后续 `q_len>8` 独立 kernel 接入铺路。
+
+#### 本轮变更
+1. `mlx/backend/vulkan/primitives/fallback.cpp`
+   - 新增 path 抽象：
+     - `SdpaNativePathKind { Decode, Prefill }`
+     - `sdpa_native_path_kind(q_len)`
+     - `sdpa_native_path_name(path_kind)`
+   - 新增 kernel 选择 helper（当前 decode/prefill 先共用现有 decode kernel）：
+     - `sdpa_native_direct_kernel(path_kind)`
+     - `sdpa_native_splitk_stage1_kernel(path_kind)`
+     - `sdpa_native_splitk_reduce_kernel(path_kind)`
+     - 均带 TODO，后续直接替换为 prefill/full 专用 kernel。
+   - 调度 lambda 改名并升级：
+     - `dispatch_native_decode(...)` -> `dispatch_native_sdpa(path_kind, ...)`
+     - 错误日志新增 `path=decode|prefill` 字段。
+   - 主路径与 repack 重试路径均接入 `path_kind`。
+2. 安全修复：
+   - 修复 kernel helper 返回类型，避免返回临时 `std::string` 引用（改为 `const char*`）。
+
+#### 验证结果
+1. 构建：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+2. 回归：
+   - `python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+3. Qwen 冒烟（串行）：
+   - EN `prompt="Hi what is your name"`：`Generation: 3.044 tok/s`，输出前缀正常。
+
+#### 当前状态
+- ✅ SDPA native 已具备 path-aware dispatch 框架；后续可在不改调用拓扑下接入 prefill/full kernel。
+- ✅ 当前行为保持一致，无正确性/稳定性回归。
+
+#### 下一步（精确）
+1. 在 `KernelRegistry` 增加 prefill/full kernel 标识（先占位，再接入实现）。
+2. 落第一个 prefill MVP kernel（`q_len>8`，`bf16`，`mask=None|causal`，head dim 64/80/128）。
+3. 将 `sdpa_native_*_kernel(path_kind)` 的 prefill 分支切到新 kernel，并做 40/80-token 串行门禁验证。
+
+### 2026-02-10 主线推进（阶段 C-1：prefill kernel 键空间与门禁分离）✅
+
+#### 本轮目标
+- 将 prefill 路径从“仅逻辑分支”推进到“独立 kernel 名称/缓存键空间 + 独立 Q cap 配置”，为后续 prefill kernel 实现提供最小基础设施。
+
+#### 本轮变更
+1. `mlx/backend/vulkan/kernel_registry.h/.cpp`
+   - 新增 prefill kernel 常量：
+     - `SDPA_BF16_PREFILL_Q1`
+     - `SDPA_BF16_PREFILL_SPLITK_STAGE1`
+     - `SDPA_BF16_PREFILL_SPLITK_REDUCE`
+   - 在 `register_builtin_shaders()` 注册对应 shader 条目（当前先映射到与 decode 相同 SPIR-V，实现行为不变）。
+2. `mlx/backend/vulkan/primitives/fallback.cpp`
+   - `sdpa_native_*_kernel(path_kind)` 对 decode/prefill 分别返回不同 kernel 名称（算法缓存键从此分离）。
+   - 新增 Q cap 分离：
+     - `native_sdpa_max_q_len_decode()`（默认 `1`）
+     - `native_sdpa_max_q_len_prefill()`（默认继承 `MLX_VK_SDPA_MAX_Q_LEN`）
+     - `native_sdpa_max_q_len_for_q_len(q_len)`
+   - `can_use_native_sdpa_bf16_decode_q1` 的 `q_len_cap` 检查改为按阶段配置。
+3. 小修复：
+   - 修复 path kernel helper 返回类型，避免临时对象引用风险。
+
+#### 验证结果
+1. 构建：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+2. 回归：
+   - `python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+3. Qwen 冒烟（串行）：
+   - EN `prompt="Hi what is your name"`：`Generation: 2.985 tok/s`（输出前缀正常）。
+
+#### 当前状态
+- ✅ SDPA path 分离已进入“可独立演进”状态：prefill 具备独立 kernel 名称、独立 gate 参数、独立算法缓存键空间。
+- ✅ 现有行为保持稳定，无正确性回归。
+
+#### 下一步（精确）
+1. 新增真正的 prefill MVP shader（不再复用 decode SPIR-V），先覆盖 `q_len>8`、`mask=None|causal` 常见路径。
+2. 保持 decode 路径稳定，继续用串行 40/80-token 门禁验证 prefill 命中与吞吐变化。
+3. 逐步把 split-k prefill 分支迁移到 prefill 专用 stage1/reduce 内核实现。
+
+### 2026-02-10 主线推进（阶段 C-2：prefill 独立 SPIR-V 接入）✅
+
+#### 本轮目标
+- 让 prefill path 真正使用独立 shader/`spv.h`，不再复用 decode 二进制；同时在 prefill kernel 内部把 causal 可见 `k` 范围前置裁剪，降低 `q_len>1` 的循环分支与无效迭代开销。
+
+#### 本轮变更
+1. 新增 prefill 专用 shader 源码：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_prefill_q1.comp`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_prefill_splitk_stage1.comp`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_prefill_splitk_reduce.comp`
+2. 新增 prefill 专用 SPIR-V 头文件并接入运行时：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_prefill_q1_spv.h`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_prefill_splitk_stage1_spv.h`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_prefill_splitk_reduce_spv.h`
+3. `kernel_registry.cpp`：
+   - 增加 prefill `*_spv.h` include；
+   - `SDPA_BF16_PREFILL_*` 三个注册项改为读取 prefill 专用 SPIR-V（不再拷贝 decode SPIR-V）。
+4. `mlx/backend/vulkan/CMakeLists.txt`：
+   - 将 3 个 prefill `.comp` 加入 `SHADER_FILES`，纳入 `vulkan_shaders` 构建。
+5. prefill 内核优化点（语义不变）：
+   - direct/stage1 内核将 causal 上界裁剪提升到循环外，避免每个 `t` 的 causal 分支判断；
+   - split-k stage1 在 chunk 级别提前裁剪 `start_t/end_t`。
+
+#### 验证结果
+1. 构建：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+2. 回归：
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+3. Qwen 实卡冒烟（串行，实卡选择参数已开启）：
+   - EN `prompt="Hi what is your name"`：`Generation: 10 tokens, 3.135 tok/s` ✅
+   - ZH `prompt="你好啊"`：`Generation: 10 tokens, 3.122 tok/s` ✅
+   - 输出前缀正常（`<think> ...`），未见乱码/全符号异常。
+
+#### 当前状态
+- ✅ prefill path 已从“名字分离”升级为“独立 shader 二进制分离”，后续可单独迭代 prefill 算法而不影响 decode。
+- ✅ 当前正确性与稳定性保持，端到端短序列吞吐稳定在 ~`3.1 tok/s`。
+- ⚠️ prefill kernel 仍是 MVP 形态，尚未做 tile/subgroup 等高强度优化，40/80-token 长序列收益待量化。
+
+#### 下一步（精确）
+1. 在 prefill direct/stage1 中引入按 `qk_dim`/`v_dim` 的小型 tile（先 64/80/128 维）与共享内存复用，减少全局访存。
+2. 增加 `MLX_VK_SDPA_STATS=1` 的 40/80-token 串行门禁（EN/ZH 各 3 次），记录 prefill 命中率与 tok/s 均值。
+3. 基于结果决定是否推进 subgroup 版本 prefill kernel（保持 decode 路径默认保守不回归）。
+
+### 2026-02-10 主线推进（阶段 C-3：prefill Q 复用 + 并行写回 + 40/80 串行门禁）✅
+
+#### 本轮目标
+- 在 prefill SDPA 路径做一轮低风险实效优化（shared Q 复用 + 并行 bf16 写回），并用 `MLX_VK_SDPA_STATS=1` 跑完 40/80-token EN/ZH 串行门禁，明确命中与瓶颈位置。
+
+#### 本轮变更
+1. prefill direct kernel（`mlx/backend/vulkan/shaders/sdpa_bf16_prefill_q1.comp`）
+   - 新增 `shared float q_sh[256]`，每行预载 Q（`qk_dim<=256`），在 `t` 循环中复用，减少重复 Q 全局读。
+   - QK dot 路径改为优先使用 `q_sh` + K packed 读（仅要求 `k_idx` 对齐）。
+   - 输出写回新增偶数 `v_dim` 快路径：并行按 32-bit word 打包写回 bf16；奇数 `v_dim` 回退旧路径。
+   - `k_end==0` 分支也支持偶数 `v_dim` 并行清零写回。
+2. prefill split-k stage1（`mlx/backend/vulkan/shaders/sdpa_bf16_prefill_splitk_stage1.comp`）
+   - 同步引入 `q_sh[256]` 预载与复用，减少 split-k stage1 的 Q 重复访存。
+3. prefill split-k reduce（`mlx/backend/vulkan/shaders/sdpa_bf16_prefill_splitk_reduce.comp`）
+   - 输出阶段新增偶数 `v_dim` 的并行 word 写回路径，降低 lane0 串行写回占比。
+4. SPIR-V 同步
+   - 重新生成：
+     - `sdpa_bf16_prefill_q1.spv/.h`
+     - `sdpa_bf16_prefill_splitk_stage1.spv/.h`
+     - `sdpa_bf16_prefill_splitk_reduce.spv/.h`
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 10-token 冒烟（实卡）：
+   - EN `Hi what is your name`：`Generation: 3.139 tok/s` ✅
+   - ZH `你好啊`：`Generation: 3.187 tok/s` ✅
+   - 输出前缀正常，无乱码。
+
+#### 40/80-token 串行统计（`MLX_VK_SDPA_STATS=1`，EN/ZH 各 3 次）
+1. 平均吞吐：
+   - `en_40`: `2.401 tok/s`
+   - `zh_40`: `2.403 tok/s`
+   - `en_80`: `1.963 tok/s`
+   - `zh_80`: `1.986 tok/s`
+2. 命中统计（均值）：
+   - `en_*`: `native_hits=139`，其中 `prefill_hits=27`、`decode_hits=112`
+   - `zh_*`: `native_hits=223`，其中 `prefill_hits=27`、`decode_hits=196`
+3. 拒绝原因：
+   - `NativeRejectReason` 为 0（native gate 内无拒绝）；
+   - `UseFallbackReason` 仍由 `k_len_cap` 主导（40-token ~`952-1036`，80-token ~`2072-2156`）。
+
+#### 当前状态
+- ✅ prefill 路径已具备 shared-Q 复用与并行写回基础，正确性稳定。
+- ✅ 短序列（10-token）吞吐保持在 ~`3.1 tok/s`。
+- ⚠️ 40/80-token 主瓶颈仍是 decode 阶段 `k_len_cap` 导致的大量 fallback，prefill 优化对端到端长期吞吐影响受限。
+
+#### 下一步（精确）
+1. 进入 decode 主线：对 `k_len=17-64` 区间做受控放量（优先 `MLX_VK_SDPA_MAX_K_LEN_DECODE` + split-k decode 参数 A/B），目标是减少 `k_len_cap` fallback。
+2. 为 decode 路径补“同类低风险优化”（Q 复用/并行写回）并保持默认保守门禁，先在实验开关下验证。
+3. 继续 40/80-token 串行门禁，以 `k_len_cap` 计数下降和 `avg_gen_tps` 提升为准入标准，再决定是否推进 subgroup decode 内核。
+
+### 2026-02-10 主线推进（阶段 C-4：decode Q 复用 + 并行写回）✅
+
+#### 本轮目标
+- 将阶段 C-3 在 prefill 证明稳定的两类低风险优化（Q shared 复用、偶数 `v_dim` 并行 word 写回）扩展到 decode 主路径，优先改善 decode 侧执行效率。
+
+#### 本轮变更
+1. `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp`
+   - 新增 `shared float q_sh[256]`，每行预载 Q 并在 `k` 循环复用。
+   - QK dot 路径改为 `q_sh + k packed` 快路径（仅要求 `k_idx` 对齐）。
+   - 输出阶段新增偶数 `v_dim` 并行 bf16 word 写回；奇数维保持旧路径。
+   - 增加 `qk_dim > 256` 保护（与当前 native gate 上限一致）。
+2. `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp`
+   - 同步引入 `q_sh[256]` 预载复用与 `k_idx` 对齐快路径。
+   - 增加 `qk_dim > 256` 保护。
+3. `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_reduce.comp`
+   - 输出阶段新增偶数 `v_dim` 并行 word 写回，降低 lane0 串行写回占比。
+4. 同步 SPIR-V：
+   - `sdpa_bf16_decode_q1.spv/.h`
+   - `sdpa_bf16_decode_splitk_stage1.spv/.h`
+   - `sdpa_bf16_decode_splitk_reduce.spv/.h`
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 10-token（实卡）
+   - EN `Hi what is your name`：`Generation: 3.068 tok/s`
+   - ZH `你好啊`：`Generation: 3.168 tok/s`
+   - 输出前缀正常，无乱码。
+3. Qwen EN 长序列对照（`MLX_VK_SDPA_STATS=1`）
+   - 40-token：`Generation: 2.408 tok/s`，`native_hits=139`，`k_len_cap=1036`
+   - 80-token：`Generation: 1.992 tok/s`，`native_hits=139`，`k_len_cap=2156`
+
+#### 当前状态
+- ✅ decode/prefill 均已具备 shared-Q 复用与偶数维并行写回路径，正确性稳定。
+- ✅ 80-token EN 单次对照较 C-3 平均值（`1.963`）有小幅上行（到 `1.992`）。
+- ⚠️ 端到端主瓶颈不变：`k_len_cap` 导致 decode 在 `k>16` 区间大量 fallback，吞吐上限仍受限。
+
+#### 下一步（精确）
+1. 进入 D-1：做 decode `k_len` 放量 A/B（优先 `MLX_VK_SDPA_MAX_K_LEN_DECODE=24/32`，配套 split-k decode 参数）。
+2. 对每组参数跑 40/80-token EN/ZH 串行门禁（3 次均值），同时记录 `k_len_cap` 计数下降幅度。
+3. 选择“吞吐提升且正确性无回归”的 decode cap 作为新默认候选，再推进更深层 subgroup/tile 内核。
+
+### 2026-02-10 主线推进（阶段 D-1 预实验：decode cap 放量 A/B）✅
+
+#### 本轮目标
+- 快速验证 `MLX_VK_SDPA_MAX_K_LEN_DECODE` 放量（`16 -> 24 -> 32`）是否能在长序列直接带来吞吐提升，并确认 split-k 是否为主要副作用来源。
+
+#### 试验配置（80-token，串行，EN/ZH 各 1 次）
+1. `default`：不设 decode cap（等价 `cap=16`）
+2. `cap24`：`MLX_VK_SDPA_MAX_K_LEN_DECODE=24` + `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE=32`
+3. `cap32`：`MLX_VK_SDPA_MAX_K_LEN_DECODE=32` + `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE=32`
+4. `cap32_nosplit`：`MLX_VK_SDPA_MAX_K_LEN_DECODE=32` + `MLX_VK_SDPA_SPLIT_K=1`
+
+#### 结果摘要
+1. default (`cap=16`)
+   - EN: `1.996 tok/s`, `k_len_cap=2156`, `native_hits=139`
+   - ZH: `1.997 tok/s`, `k_len_cap=2072`, `native_hits=223`
+2. cap24
+   - EN: `1.981 tok/s`, `k_len_cap=1932`, `native_hits=363`
+   - ZH: `1.971 tok/s`, `k_len_cap=1848`, `native_hits=447`
+3. cap32
+   - EN: `1.983 tok/s`, `k_len_cap=1708`, `native_hits=587`
+   - ZH: `1.985 tok/s`, `k_len_cap=1624`, `native_hits=671`
+4. cap32_nosplit
+   - EN: `1.959 tok/s`, `k_len_cap=1708`, `native_hits=587`
+   - ZH: `1.975 tok/s`, `k_len_cap=1624`, `native_hits=671`
+
+#### 结论
+- ✅ 放量确实显著减少 `k_len_cap` fallback，并增加 native 命中。
+- ⚠️ 但在当前内核效率下，命中增加未转化为吞吐收益（单次对照反而略低于 default）。
+- ⚠️ `cap32_nosplit` 仍未改善，说明当前瓶颈不只 split-k 触发，而是 `k=17~32` 区间 native decode kernel 本身算效不足。
+
+#### 当前状态
+- decode 放量不应直接上默认；维持 `cap=16` 作为默认更稳妥。
+- 下一阶段应优先做 `k=17~32` native decode kernel 的算效优化，再二次评估 cap 放量。
+
+#### 下一步（精确）
+1. 针对 decode `k=17~32` 做内核级优化（优先减少每 token 的全局访存与指数/归约开销，评估 subgroup 规约版本）。
+2. 先在实验开关下验证该区间是否能跑赢 fallback，再考虑把 `cap=24/32` 纳入默认。
+3. 继续沿用 `MLX_VK_SDPA_STATS=1` + 40/80-token 串行门禁，确保“命中提升=吞吐提升”。

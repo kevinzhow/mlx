@@ -1,10 +1,9 @@
 #version 450
 
-// Stage 1 for decode SDPA split-k:
-// each workgroup computes one (row, split) partial tuple:
-// - partial row max (m)
-// - partial row exp sum (l)
-// - partial unnormalized weighted value sum (o)
+// Prefill-focused SDPA direct path:
+// one workgroup computes one (batch, query-head, query-pos) row.
+// Compared with decode shader, this variant pre-clips causal k-range once
+// before the loop to reduce branch overhead in q_len > 1 prefill.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer QBuffer {
@@ -19,19 +18,11 @@ layout(set = 0, binding = 2) readonly buffer VBuffer {
   uint words[];
 } v_buffer;
 
-layout(set = 0, binding = 3) buffer PartialOBuffer {
-  float values[];
-} partial_o_buffer;
+layout(set = 0, binding = 3) buffer OutBuffer {
+  uint words[];
+} out_buffer;
 
-layout(set = 0, binding = 4) buffer PartialMBuffer {
-  float values[];
-} partial_m_buffer;
-
-layout(set = 0, binding = 5) buffer PartialLBuffer {
-  float values[];
-} partial_l_buffer;
-
-layout(set = 0, binding = 6) readonly buffer MaskBuffer {
+layout(set = 0, binding = 4) readonly buffer MaskBuffer {
   uint words[];
 } mask_buffer;
 
@@ -53,7 +44,6 @@ layout(push_constant) uniform PushConstants {
   uint mask_q_stride;
   uint mask_k_stride;
   uint causal;
-  uint split_k;
   float scale;
 } params;
 
@@ -71,6 +61,13 @@ shared float accum_sh[256];
 
 float bf16_to_f32(uint bf16_bits) {
   return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
 }
 
 float load_q(uint elem_idx) {
@@ -105,17 +102,9 @@ bool load_mask_bool(uint elem_idx) {
   return mask_buffer.words[elem_idx] != 0u;
 }
 
-float masked_logit(float dot, uint q_pos, uint k_pos, uint mask_base, out bool valid) {
+float masked_logit_prefill(float dot, uint k_pos, uint mask_base, out bool valid) {
   valid = true;
   float logit = dot * params.scale;
-
-  if (params.causal != 0u) {
-    int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
-    if (int(k_pos) > causal_limit) {
-      valid = false;
-      return 0.0;
-    }
-  }
 
   if (params.mask_mode == 1u) {
     logit += load_mask_add(mask_base + k_pos * params.mask_k_stride);
@@ -133,27 +122,33 @@ float masked_logit(float dot, uint q_pos, uint k_pos, uint mask_base, out bool v
   return logit;
 }
 
-void main() {
-  uint gid = gl_WorkGroupID.x;
-  uint lane = gl_LocalInvocationID.x;
+void store_out(uint elem_idx, float value) {
+  uint word_idx = elem_idx >> 1u;
+  uint packed = out_buffer.words[word_idx];
+  uint bf16_val = f32_to_bf16(value) & 0xFFFFu;
+  if ((elem_idx & 1u) == 0u) {
+    packed = (packed & 0xFFFF0000u) | bf16_val;
+  } else {
+    packed = (packed & 0x0000FFFFu) | (bf16_val << 16u);
+  }
+  out_buffer.words[word_idx] = packed;
+}
 
-  uint n_rows = params.batch_size * params.n_q_heads * params.q_len;
-  uint total = n_rows * params.split_k;
-  if (gid >= total || params.split_k == 0u || params.q_len == 0u ||
-      params.v_dim == 0u ||
+void main() {
+  uint rowq = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+  uint total = params.batch_size * params.n_q_heads * params.q_len;
+  if (rowq >= total || params.q_len == 0u || params.v_dim == 0u ||
       params.v_dim > 256u || params.qk_dim == 0u || params.qk_dim > 256u ||
       params.k_len == 0u ||
       params.n_kv_heads == 0u) {
     return;
   }
 
-  uint rowq = gid / params.split_k;
-  uint part = gid % params.split_k;
-  uint row = rowq / params.q_len;
+  uint bh = rowq / params.q_len;
   uint q_pos = rowq % params.q_len;
-
-  uint b = row / params.n_q_heads;
-  uint hq = row % params.n_q_heads;
+  uint b = bh / params.n_q_heads;
+  uint hq = bh % params.n_q_heads;
   uint repeats = params.n_q_heads / params.n_kv_heads;
   uint hkv = hq / repeats;
 
@@ -164,12 +159,16 @@ void main() {
   uint mask_base = b * params.mask_batch_stride +
       hq * params.mask_head_stride + q_pos * params.mask_q_stride;
 
-  uint chunk = (params.k_len + params.split_k - 1u) / params.split_k;
-  uint start_t = part * chunk;
-  uint end_t = min(params.k_len, start_t + chunk);
-
-  uint partial_idx = rowq * params.split_k + part;
-  uint partial_o_base = partial_idx * params.v_dim;
+  uint k_end = params.k_len;
+  if (params.causal != 0u) {
+    int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
+    if (causal_limit < 0) {
+      k_end = 0u;
+    } else {
+      uint causal_end = uint(causal_limit + 1);
+      k_end = min(params.k_len, causal_end);
+    }
+  }
 
   if (lane == 0u) {
     max_logit_sh = NEG_LARGE;
@@ -183,27 +182,24 @@ void main() {
   }
   barrier();
 
-  if (start_t >= end_t) {
-    if (lane == 0u) {
-      partial_m_buffer.values[partial_idx] = NEG_LARGE;
-      partial_l_buffer.values[partial_idx] = 0.0;
-    }
-    for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
-      partial_o_buffer.values[partial_o_base + dv] = 0.0;
+  if (k_end == 0u) {
+    uint out_base = (((b * params.n_q_heads) + hq) * params.q_len + q_pos) * params.v_dim;
+    if ((params.v_dim & 1u) == 0u) {
+      uint out_word_base = out_base >> 1u;
+      uint out_word_count = params.v_dim >> 1u;
+      for (uint w = lane; w < out_word_count; w += WG_SIZE) {
+        out_buffer.words[out_word_base + w] = 0u;
+      }
+    } else if (lane == 0u) {
+      for (uint dv = 0u; dv < params.v_dim; ++dv) {
+        store_out(out_base + dv, 0.0);
+      }
     }
     return;
   }
 
-  // Single-pass online softmax in this split.
-  for (uint t = start_t; t < end_t; ++t) {
-    // For causal attention, skip upper-triangular invalid positions early.
-    if (params.causal != 0u) {
-      int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
-      if (int(t) > causal_limit) {
-        continue;
-      }
-    }
-
+  // Single-pass online softmax accumulation on V.
+  for (uint t = 0u; t < k_end; ++t) {
     uint k_base = k_head_base + t * params.k_seq_stride;
     float partial = 0.0;
     // Process two bf16 elements when aligned to reduce packed-word loads.
@@ -234,7 +230,7 @@ void main() {
 
     if (lane == 0u) {
       bool valid = false;
-      float logit = masked_logit(dot_partial[0], q_pos, t, mask_base, valid);
+      float logit = masked_logit_prefill(dot_partial[0], t, mask_base, valid);
       if (!valid) {
         alpha_sh = 1.0;
         beta_sh = 0.0;
@@ -264,11 +260,20 @@ void main() {
     barrier();
   }
 
-  if (lane == 0u) {
-    partial_m_buffer.values[partial_idx] = max_logit_sh;
-    partial_l_buffer.values[partial_idx] = denom_sh;
-  }
-  for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
-    partial_o_buffer.values[partial_o_base + dv] = accum_sh[dv];
+  float inv_denom = (denom_sh > 0.0) ? (1.0 / denom_sh) : 0.0;
+  uint out_base = (((b * params.n_q_heads) + hq) * params.q_len + q_pos) * params.v_dim;
+  if ((params.v_dim & 1u) == 0u) {
+    uint out_word_base = out_base >> 1u;
+    uint out_word_count = params.v_dim >> 1u;
+    for (uint w = lane; w < out_word_count; w += WG_SIZE) {
+      uint dv = w << 1u;
+      uint lo = f32_to_bf16(accum_sh[dv] * inv_denom) & 0xFFFFu;
+      uint hi = f32_to_bf16(accum_sh[dv + 1u] * inv_denom) & 0xFFFFu;
+      out_buffer.words[out_word_base + w] = lo | (hi << 16u);
+    }
+  } else if (lane == 0u) {
+    for (uint dv = 0u; dv < params.v_dim; ++dv) {
+      store_out(out_base + dv, accum_sh[dv] * inv_denom);
+    }
   }
 }

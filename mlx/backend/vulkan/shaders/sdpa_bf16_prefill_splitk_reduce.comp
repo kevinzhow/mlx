@@ -1,6 +1,6 @@
 #version 450
 
-// Stage 2 for decode SDPA split-k:
+// Stage 2 for prefill SDPA split-k:
 // reduce partial tuples (o_i, m_i, l_i) into final bf16 output.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
