@@ -671,6 +671,12 @@ inline bool native_qmm_enabled() {
   return enabled;
 }
 
+inline bool native_qmm_m1_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_QMM_NATIVE_M1");
+  return enabled;
+}
+
 inline bool native_rmsnorm_enabled() {
   static const bool enabled =
       env_flag_default_true("MLX_VK_ENABLE_RMSNORM_NATIVE");
@@ -2045,12 +2051,20 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       const uint32_t out_elems = static_cast<uint32_t>(out.size());
       const uint32_t n = static_cast<uint32_t>(out.shape(-1));
       const uint32_t k = static_cast<uint32_t>(inputs[0].shape(-1));
+      const uint32_t rows = static_cast<uint32_t>(
+          inputs[0].size() / static_cast<size_t>(k));
       const uint32_t groups_per_col =
           static_cast<uint32_t>(k / static_cast<uint32_t>(group_size_));
       const uint32_t w_words_per_col =
           static_cast<uint32_t>(inputs[1].shape(-1));
-      const uint32_t out_words = out_elems / 2u;
-      const uint32_t groups_x = std::max<uint32_t>(1, (out_words + 63u) / 64u);
+      const uint32_t out_words = (out_elems + 1u) / 2u;
+      const bool use_m1_kernel = native_qmm_m1_enabled() && (rows == 1u);
+      const uint32_t wg_size_x = use_m1_kernel ? 128u : 64u;
+      const uint32_t groups_x =
+          std::max<uint32_t>(1, (out_words + wg_size_x - 1u) / wg_size_x);
+      const char* qmm_kernel = use_m1_kernel
+          ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1
+          : vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128;
 
       const std::vector<uint32_t> push_consts{
           encode_push_constant_u32(out_elems),
@@ -2086,7 +2100,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         mark_qmm_const_tensor_uploaded(biases_cached.key);
       }
       encoder.record_algo_dispatch(
-          vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128,
+          qmm_kernel,
           {x_tensor,
            w_cached.tensor,
            scales_cached.tensor,

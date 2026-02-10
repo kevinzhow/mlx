@@ -88,6 +88,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `TARGET_DEVICE=gpu`
 - Default native gates expected on current mainline:
   - `MLX_VK_ENABLE_QMM_NATIVE=1` (default ON)
+  - `MLX_VK_ENABLE_QMM_NATIVE_M1=1` (default ON, decode `rows==1` 专核路径)
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_ROPE_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_SDPA_NATIVE=1` (default ON, still narrow gate in code)
@@ -125,6 +126,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - `MLX_VK_SDPA_STATS=1` (进程退出时打印 SDPA 命中/回退分布与 `k_len_cap` 占比)
 - Native gate toggles for isolation:
   - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
+  - `MLX_VK_ENABLE_QMM_NATIVE_M1=0|1`
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=0|1`
   - `MLX_VK_ENABLE_ROPE_NATIVE=0|1`
   - `MLX_VK_ENABLE_SDPA_NATIVE=0|1`

@@ -24,6 +24,7 @@
 #include "shaders/logsumexp_f32_spv.h"
 #include "shaders/logsumexp_bf16_row1_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_spv.h"
+#include "shaders/qmm_affine_bf16_t4_g128_m1_spv.h"
 #include "shaders/rmsnorm_bf16_spv.h"
 #include "shaders/rope_bf16_t1_spv.h"
 #include "shaders/rope_bf16_freqs_spv.h"
@@ -62,6 +63,8 @@ const char* KernelRegistry::LOGSUMEXP_F32 = "logsumexp_f32";
 const char* KernelRegistry::LOGSUMEXP_BF16_ROW1 = "logsumexp_bf16_row1";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128 =
     "qmm_affine_bf16_t4_g128";
+const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1 =
+    "qmm_affine_bf16_t4_g128_m1";
 const char* KernelRegistry::RMSNORM_BF16 = "rmsnorm_bf16";
 const char* KernelRegistry::ROPE_BF16_T1 = "rope_bf16_t1";
 const char* KernelRegistry::ROPE_BF16_FREQS = "rope_bf16_freqs";
@@ -194,6 +197,14 @@ void KernelRegistry::register_builtin_shaders() {
       qmm_affine_bf16_t4_g128_spv,
       qmm_affine_bf16_t4_g128_spv_len);
   shaders_[QMM_AFFINE_BF16_T4_G128] = std::move(qmm_spirv);
+
+  std::vector<uint32_t> qmm_m1_spirv(
+      (qmm_affine_bf16_t4_g128_m1_spv_len + 3) / 4);
+  std::memcpy(
+      qmm_m1_spirv.data(),
+      qmm_affine_bf16_t4_g128_m1_spv,
+      qmm_affine_bf16_t4_g128_m1_spv_len);
+  shaders_[QMM_AFFINE_BF16_T4_G128_M1] = std::move(qmm_m1_spirv);
 
   std::vector<uint32_t> rmsnorm_spirv((rmsnorm_bf16_spv_len + 3) / 4);
   std::memcpy(rmsnorm_spirv.data(), rmsnorm_bf16_spv, rmsnorm_bf16_spv_len);
