@@ -69,6 +69,7 @@ class KernelRegistry {
   static const char* QMM_AFFINE_BF16_T4_G128_M1;
   static const char* QMM_AFFINE_BF16_T4_G128_M2;
   static const char* QMM_AFFINE_BF16_T4_G128_M4;
+  static const char* QMM_AFFINE_BF16_T4_G128_M8;
   static const char* RMSNORM_BF16;
   static const char* ROPE_BF16_T1;
   static const char* ROPE_BF16_FREQS;

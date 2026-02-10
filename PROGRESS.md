@@ -12,7 +12,7 @@
 - 模型正确性：Qwen3-0.6B-MLX-4bit（EN/ZH，10 token）输出正常，无乱码/`!!!!!!!!!!` 回归。
 - 近期吞吐（实卡 Vulkan，串行口径）：
   - 10-token（EN）：约 `4.10 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1=1`）
-  - 40-token（EN）：约 `3.36 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1=1`）
+  - 40-token（EN）：约 `3.34 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1=1`，含 `M2/M4/M8` 分桶）
 - decode 主线 fallback 占比（同口径 profile）：
   - 由 `18.40%` 降到 `13.50%`
 
@@ -76,23 +76,26 @@
 - 实测：`M1=1` 时 40-token 吞吐约 `3.33 -> 2.86 tok/s`（显著回退）。
 - 结论：该实现引入了额外分支与寄存器压力，抵消了访存复用收益；已回退到 D-9.3 稳定版本。
 
-### D-9.4：QMM `M>1` 形状分桶（阶段1：`M=2/4` 已完成）
+### D-9.4：QMM `M>1` 形状分桶（阶段1：`M=2/4/8` 已完成）
 - 目标：延续 Metal/Ollama 的“高频形状专核”路线，把 QMM 从单点 `M=1` 扩展到小 batch 桶。
 - 本轮变更：
   - 新增 shader：`qmm_affine_bf16_t4_g128_m2.comp`（`rows==2` 专核）。
   - 新增 shader：`qmm_affine_bf16_t4_g128_m4.comp`（`rows==4` 专核）。
+  - 新增 shader：`qmm_affine_bf16_t4_g128_m8.comp`（`rows==8` 专核）。
   - 新增 kernel 注册：`QMM_AFFINE_BF16_T4_G128_M2`。
   - 新增 kernel 注册：`QMM_AFFINE_BF16_T4_G128_M4`。
-  - `QuantizedMatmul::eval_gpu` 增加 `rows==2/4` 动态派发与 gate：
+  - 新增 kernel 注册：`QMM_AFFINE_BF16_T4_G128_M8`。
+  - `QuantizedMatmul::eval_gpu` 增加 `rows==2/4/8` 动态派发与 gate：
     - `MLX_VK_ENABLE_QMM_NATIVE_M2=1`（默认 ON）
     - `MLX_VK_ENABLE_QMM_NATIVE_M4=1`（默认 ON）
+    - `MLX_VK_ENABLE_QMM_NATIVE_M8=1`（默认 ON）
   - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h` 同轮完成并构建。
 - 验证：
   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
   - `python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
-  - Qwen3（EN 40-token）保持当前高位：约 `3.36 tok/s`（无正确性回归）。
+  - Qwen3（EN 40-token）维持高位：约 `3.32~3.34 tok/s`（无正确性回归）。
 - 结论：
-  - `M=2/4` 路径已打通，形状分桶框架成立；下一步继续 `M=8` 与向量化分支。
+  - `M=2/4/8` 路径已打通，形状分桶框架成立；下一步进入向量化/子组化分支。
 
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
@@ -108,8 +111,8 @@
 - 当前 decode-unlimited + split-k 已稳定，但 `k=65+` 的 stage1/reduce 仍有进一步优化空间。
 
 ## 下一步（精确执行入口）
-1. 继续 D-9.4：补齐 `M=8` + 向量化路线  
-- 在已落地 `M=2/4` 的基础上，继续补 `rows==8` 专核，并评估 `uvec4`/子组归约收益。
+1. 继续 D-9.4：向量化/子组化路线  
+- 在已落地 `M=2/4/8` 的基础上，评估 `uvec4` 载入和子组归约，进一步降低 QMM 指令与访存开销。
 
 2. 拆解并减少 `RoPE` 剩余 fallback  
 - 用 `MLX_VK_DEBUG_ROPE_REJECT=1` 聚类 reject 原因，先补命中最高布局桶。
