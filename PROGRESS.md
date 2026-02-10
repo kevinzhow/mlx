@@ -3445,3 +3445,156 @@ python -m unittest discover -v
 1. 进入 D-9.1：实现 decode 高频 `ArgReduce`（至少 `argmax` / `axis=-1` / row-contiguous）native 路径，先消除当前主回退热点。
 2. 保持 Metal/Ollama 对齐策略：先做“高频形态专核 + 严格 gate”，再扩展到更广泛 layout。
 3. 完成 EN/ZH `10/40/80 token` 串行门禁与 `MLX_VK_PROFILE_PRINT_EACH=1` 对照，确认“命中提升=吞吐提升”后再推进下一个热点（`Compiled` fallback）。
+
+### 2026-02-11 主线推进（阶段 D-9.1：ArgReduce decode 热点 native 化）✅
+
+#### 本轮目标
+- 把 decode 主链路里新的热点 `ArgReduce`（`argmax`）从 CPU fallback 切到 Vulkan native。
+- 保持 gate 可控与回退正确，先覆盖高频形态再扩展。
+
+#### Metal / Ollama 对照分析（本轮）
+1. Metal（MLX）：
+   - `ArgReduce` 走单独 kernel，并按 axis/布局传入元信息进行规约。
+   - 启示：Vulkan 先做最后一维规约专核，避免用通用 fallback 吃掉逐 token 热路径。
+2. Ollama/ggml Vulkan：
+   - 对高频小算子采用“窄 gate + 专项 kernel + 运行时切换”。
+   - 启示：先落地 `argmax last-dim` 专核，后续再扩 dtype/layout/argmin。
+3. 迁移结论：
+   - 先实现 `ArgMax + axis=last + row-contiguous`（`f32/bf16`）路径，其他场景继续 fallback。
+
+#### 本轮代码变更
+1. 新增 `ArgMax` shader：
+   - `mlx/backend/vulkan/shaders/argmax_f32_lastdim.comp`
+   - `mlx/backend/vulkan/shaders/argmax_bf16_lastdim.comp`
+   - 并完成闭环：
+     - `argmax_f32_lastdim.spv` / `argmax_f32_lastdim_spv.h`
+     - `argmax_bf16_lastdim.spv` / `argmax_bf16_lastdim_spv.h`
+2. Vulkan 注册链路：
+   - `mlx/backend/vulkan/CMakeLists.txt` 增加上述 shader 编译条目。
+   - `mlx/backend/vulkan/kernel_registry.{h,cpp}` 新增 kernel 名：
+     - `ARGMAX_F32_LASTDIM`
+     - `ARGMAX_BF16_LASTDIM`
+3. 运行时调度（`mlx/backend/vulkan/primitives/fallback.cpp`）：
+   - 将 `ArgReduce` 从 `VULKAN_CPU_FALLBACK(ArgReduce)` 改为显式 `eval_gpu`。
+   - 新增 gate（默认 ON）：`MLX_VK_ENABLE_ARGREDUCE_ARGMAX_LASTDIM`。
+   - 新增 debug reject：`MLX_VK_DEBUG_ARGREDUCE_REJECT`。
+   - 当前 native 覆盖：
+     - `reduce_type=ArgMax`
+     - `axis == last dimension`
+     - `in` 行连续且 materialized（`data_size==size`）
+     - `out.dtype=uint32`、行连续
+     - `in.dtype in {float32, bfloat16}`
+   - 非命中条件保持 CPU fallback。
+
+#### 验证结果
+1. 回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan -R "arg reduce" --output-on-failure --timeout 120` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. 精确正确性抽检（GPU）：
+   - `f32 last-dim argmax` 与 NumPy 一致 ✅
+   - `bf16 last-dim argmax` 与 NumPy 一致 ✅
+   - `non-last axis`（fallback）与 NumPy 一致 ✅
+3. Qwen3 命中确认（`MLX_VK_PROFILE_PRINT_EACH=1`）：
+   - `ArgReduce` 样本显示 `fallback=0`，单次耗时约 `0.085~0.178 ms`。
+   - 对比上一轮 `ArgReduce` fallback 单样本 `~63 ms`，热点已被移除。
+   - 同轮样本聚合（10-token, prompt=`Hi`）：
+     - `ArgReduce`: `calls=11`, `fallback=0`, `total_ms=1.277`
+     - `Subtract`: `calls=66`, `fallback=0`, `total_ms=10.640`
+     - `LogSumExp`: `calls=11`, `fallback=0`, `total_ms=1.935`
+     - `Compiled`: `calls=335`, `fallback=335`, `total_ms=1811.032`（当前第一热点）
+4. Qwen3 吞吐 A/B（串行，避免并发 JIT cache 干扰）：
+   - 10-token（prompt=`Hi`，2 次均值）：
+     - `gate=1`: `(3.224 + 3.177)/2 = 3.201 tok/s`
+     - `gate=0`: `(3.160 + 3.169)/2 = 3.165 tok/s`
+     - 增益：约 `+1.1%`
+   - 40-token（prompt=`Hi`，2 次均值）：
+     - `gate=1`: `(2.485 + 2.478)/2 = 2.482 tok/s`
+     - `gate=0`: `(2.463 + 2.458)/2 = 2.461 tok/s`
+     - 增益：约 `+0.9%`
+
+#### 当前状态
+- `ArgReduce` 已从 decode 主瓶颈中移除（native 命中稳定，回归通过）。
+- 端到端吞吐有小幅稳定正收益（约 `~1%`），方向正确但尚非“性能蜕变”。
+- 下一热点集中在 `Compiled` fallback（profile 中仍显著）。
+
+#### 下一步（精确）
+1. 进入 D-9.2：定位并拆解 `Compiled` fallback 的高占比来源（先以 decode 主路径为目标，做子图内热点归因）。
+2. 对照 Metal/Ollama，把可拆出的高频小算子继续专项 native 化，优先“每 token 都会走”的 op。
+3. 固化串行门禁脚本（EN/ZH，10/40/80）避免并发 `mlx_lm` JIT cache 干扰，保证 A/B 数据可复现。
+
+### 2026-02-11 主线推进（阶段 D-9.2：`Compiled` 热点拆解 + `Sigmoid*Mul*Mul` native 化）✅
+
+#### 本轮目标
+- 按 D-9.2 计划拆解 `Compiled` 高占比来源，并对 decode 主路径中的单一大热点做专项 native 替换。
+
+#### Metal / Ollama 对照分析（本轮）
+1. Metal（MLX）：
+   - `Compiled` 在 GPU 侧是原生 kernel（不跨 CPU 边界），融合子图不会变成 CPU fallback 热点。
+   - 启示：Vulkan 在“通用 Compiled GPU kernel”未完成前，应优先把高频融合子图拆成专项 native kernel。
+2. Ollama/ggml Vulkan：
+   - 常见做法是“高频形态专核 + 运行时窄门禁”，先拿到确定性收益，再扩覆盖。
+   - 启示：对单一高命中融合形态（如 SwiGLU 片段）先做窄 gate，避免大而全重写。
+3. 迁移结论：
+   - 先在 Vulkan `Compiled` 路径支持 `CompiledSigmoidMultiplyMultiply`（bf16、同形状行连续）原生派发。
+
+#### 本轮代码变更
+1. `Compiled` 可观测性增强（`mlx/backend/vulkan/primitives/fallback.cpp`）：
+   - `Compiled::eval_gpu` 支持 profile 细分开关：`MLX_VK_PROFILE_COMPILED_DETAIL=1`（默认 OFF）。
+   - 新增一次性调试打印开关：`MLX_VK_DEBUG_COMPILED_DETAIL=1`（输出 name/lib/输入输出 dtype+shape+strides）。
+2. 新增 `CompiledSigmoidMultiplyMultiply` 原生路径（同文件）：
+   - 新 gate（默认 ON）：`MLX_VK_ENABLE_COMPILED_SIGMOID_MUL_MUL_BF16`。
+   - 仅命中窄覆盖：
+     - `name == "CompiledSigmoidMultiplyMultiply"`
+     - `inputs=2`, `outputs=1`
+     - `x/y/out` 均 `bfloat16`
+     - `x/y/out` 同形状，`x/y` 行连续 materialized，`out` 行连续
+   - 命中后直接走 Vulkan kernel；不命中保持原 CPU fallback。
+3. 新增 shader（闭环完成）：
+   - `mlx/backend/vulkan/shaders/silu_mul_bf16.comp`
+   - `mlx/backend/vulkan/shaders/silu_mul_bf16.spv`
+   - `mlx/backend/vulkan/shaders/silu_mul_bf16_spv.h`
+4. Vulkan 注册链路更新：
+   - `mlx/backend/vulkan/CMakeLists.txt` 增加 `silu_mul_bf16.comp`
+   - `mlx/backend/vulkan/kernel_registry.{h,cpp}` 新增 `SILU_MUL_BF16` 注册与加载
+
+#### 关键诊断与验证
+1. `Compiled` 归因确认（`MLX_VK_DEBUG_COMPILED_DETAIL=1`）：
+   - 唯一高频子图：`CompiledSigmoidMultiplyMultiply`
+   - 形态：`inputs=2`、`outputs=1`、`dtype=bfloat16`、`shape=[1,8,3072]`（行连续）
+2. 回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+3. Profile 同口径对照（`MLX_VK_PROFILE=1 MLX_VK_PROFILE_PRINT_EACH=1`, prompt=`Hi`, 10-token）：
+   - 改动前：
+     - `Compiled::CompiledSigmoidMultiplyMultiply calls=335, fallback=335, total_ms=660.321`
+     - 汇总：`calls=6844, fallback=1259, total_ms=2574.427, fallback_pct=18.40%`
+   - 改动后：
+     - `Compiled calls=335, fallback=0, total_ms=29.935`
+     - 汇总：`calls=6844, fallback=924, total_ms=1878.228, fallback_pct=13.50%`
+4. Qwen3 吞吐 A/B（串行，`MLX_VK_ENABLE_COMPILED_SIGMOID_MUL_MUL_BF16`）：
+   - 10-token（2 次均值）：
+     - gate=1: `(3.250 + 3.216)/2 = 3.233 tok/s`
+     - gate=0: `(3.218 + 3.165)/2 = 3.192 tok/s`
+     - 增益：约 `+1.3%`
+   - 40-token（2 次均值）：
+     - gate=1: `(2.698 + 2.704)/2 = 2.701 tok/s`
+     - gate=0: `(2.469 + 2.502)/2 = 2.486 tok/s`
+     - 增益：约 `+8.6%`
+5. Qwen3 正确性冒烟（默认 gate=1）：
+   - `prompt="你好啊", max_tokens=10`：输出正常中文前缀，`Generation: 2.713 tok/s`
+   - `prompt="Hi what is your name", max_tokens=10`：输出正常英文前缀，`Generation: 2.714 tok/s`
+
+#### 当前状态
+- ✅ `Compiled` 第一热点已从“CPU fallback 大头”转为“Vulkan native 小头”（`~660ms -> ~30ms`）。
+- ✅ decode 主线总 fallback 比显著下降（`18.40% -> 13.50%`）。
+- ⚠️ 新剩余热点/回退集中在：`Multiply` fallback、`BitwiseBinary` fallback、`fast::RoPE` 的少量 fallback（55 次）。
+
+#### 下一步（精确）
+1. 进入 D-9.3：继续对照 Metal/Ollama，优先清理 `Multiply` 高频 fallback（先做 decode 高频形态窄门禁 native）。
+2. 用 `MLX_VK_DEBUG_ROPE_REJECT=1` 拆解 `fast::RoPE fallback=55` 的具体形态，优先补 decode 高频桶。
+3. 保持 EN/ZH `10/40/80 token` 串行门禁 + `MLX_VK_PROFILE_PRINT_EACH=1` 同口径对照，确保“命中提升=吞吐提升”。

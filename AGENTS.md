@@ -91,6 +91,8 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_ROPE_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_SDPA_NATIVE=1` (default ON, still narrow gate in code)
+  - `MLX_VK_ENABLE_ARGREDUCE_ARGMAX_LASTDIM=1` (default ON, `ArgMax + axis=last + row-contiguous` 原生路径)
+  - `MLX_VK_ENABLE_COMPILED_SIGMOID_MUL_MUL_BF16=1` (default ON, `CompiledSigmoidMultiplyMultiply` bf16 专项原生路径)
   - `MLX_VK_ENABLE_SDPA_DECODE_D128=1` (default ON)
   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K32=1` (default ON, decode `k_len<=32` 特化路径)
   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K64=1` (default ON, decode `k_len<=64` 特化路径)
@@ -117,12 +119,17 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - `MLX_VK_DEBUG_ROPE_REJECT=1`
 - `MLX_VK_DEBUG_SDPA_REJECT=1`
 - `MLX_VK_DEBUG_SDPA_SPLITK=1`
+- `MLX_VK_DEBUG_ARGREDUCE_REJECT=1`
+- `MLX_VK_DEBUG_COMPILED_DETAIL=1`（打印 `Compiled` 子图 name/lib 与输入输出 layout，默认每种子图仅打印一次）
+- `MLX_VK_PROFILE_COMPILED_DETAIL=1`（将 profile 中 `Compiled` 拆分为 `Compiled::<subgraph>`，默认 OFF）
 - `MLX_VK_SDPA_STATS=1` (进程退出时打印 SDPA 命中/回退分布与 `k_len_cap` 占比)
 - Native gate toggles for isolation:
   - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=0|1`
   - `MLX_VK_ENABLE_ROPE_NATIVE=0|1`
   - `MLX_VK_ENABLE_SDPA_NATIVE=0|1`
+  - `MLX_VK_ENABLE_ARGREDUCE_ARGMAX_LASTDIM=0|1`
+  - `MLX_VK_ENABLE_COMPILED_SIGMOID_MUL_MUL_BF16=0|1`
   - `MLX_VK_ENABLE_SDPA_DECODE_D128=0|1`
   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K32=0|1`
   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K64=0|1`
@@ -139,6 +146,10 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - Global (backward-compatible): `MLX_VK_SDPA_MAX_K_LEN`
   - Decode override (`q_len==1`): `MLX_VK_SDPA_MAX_K_LEN_DECODE`
   - Prefill override (`q_len>1`): `MLX_VK_SDPA_MAX_K_LEN_PREFILL`
+
+### Benchmarking Notes
+
+- Run `mlx_lm generate` benchmarks serially (not in parallel shells/processes) to avoid transient JIT cache races under `/tmp/mlx/.../*.so` (e.g. `file too short`) that can skew results.
 
 ## Definition of Done
 

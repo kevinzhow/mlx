@@ -1,0 +1,64 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufferX {
+  uint words[];
+} buffer_x;
+
+layout(set = 0, binding = 1) readonly buffer BufferY {
+  uint words[];
+} buffer_y;
+
+layout(set = 0, binding = 2) writeonly buffer BufferOut {
+  uint words[];
+} buffer_out;
+
+layout(push_constant) uniform PushConstants {
+  uint size;
+} params;
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float load_bf16_from_word(uint packed, uint elem_idx) {
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float sigmoid(float x) {
+  return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+  uint word_idx = gl_GlobalInvocationID.x;
+  uint elem0 = word_idx * 2u;
+  if (elem0 >= params.size) {
+    return;
+  }
+
+  uint x_word = buffer_x.words[word_idx];
+  uint y_word = buffer_y.words[word_idx];
+
+  float x0 = load_bf16_from_word(x_word, elem0);
+  float y0 = load_bf16_from_word(y_word, elem0);
+  uint out_word = f32_to_bf16(x0 * sigmoid(x0) * y0) & 0xFFFFu;
+
+  uint elem1 = elem0 + 1u;
+  if (elem1 < params.size) {
+    float x1 = load_bf16_from_word(x_word, elem1);
+    float y1 = load_bf16_from_word(y_word, elem1);
+    out_word |= (f32_to_bf16(x1 * sigmoid(x1) * y1) & 0xFFFFu) << 16u;
+  }
+
+  buffer_out.words[word_idx] = out_word;
+}

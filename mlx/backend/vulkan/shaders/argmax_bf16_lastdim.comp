@@ -1,0 +1,80 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InBuffer {
+  uint words[];
+} in_buffer;
+
+layout(set = 0, binding = 1) writeonly buffer OutBuffer {
+  uint values[];
+} out_buffer;
+
+layout(push_constant) uniform PushConstants {
+  uint n_rows;
+  uint axis_size;
+} params;
+
+shared float s_best_val[256];
+shared uint s_best_idx[256];
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+float load_bf16_elem(uint elem_idx) {
+  uint packed = in_buffer.words[elem_idx >> 1u];
+  uint bf16_bits =
+      ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu) : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+bool better_choice(float cand_val, uint cand_idx, float best_val, uint best_idx) {
+  return (cand_val > best_val) ||
+      ((cand_val == best_val) && (cand_idx < best_idx));
+}
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+  if (row >= params.n_rows || params.axis_size == 0u) {
+    return;
+  }
+
+  uint row_offset = row * params.axis_size;
+
+  float best_val = -3.4028235e38;
+  uint best_idx = 0u;
+  if (lane < params.axis_size) {
+    best_val = load_bf16_elem(row_offset + lane);
+    best_idx = lane;
+  }
+
+  for (uint col = lane + 256u; col < params.axis_size; col += 256u) {
+    float v = load_bf16_elem(row_offset + col);
+    if (better_choice(v, col, best_val, best_idx)) {
+      best_val = v;
+      best_idx = col;
+    }
+  }
+
+  s_best_val[lane] = best_val;
+  s_best_idx[lane] = best_idx;
+  barrier();
+
+  for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    if (lane < stride) {
+      float cand_val = s_best_val[lane + stride];
+      uint cand_idx = s_best_idx[lane + stride];
+      if (better_choice(cand_val, cand_idx, s_best_val[lane], s_best_idx[lane])) {
+        s_best_val[lane] = cand_val;
+        s_best_idx[lane] = cand_idx;
+      }
+    }
+    barrier();
+  }
+
+  if (lane == 0u) {
+    out_buffer.values[row] = s_best_idx[0];
+  }
+}

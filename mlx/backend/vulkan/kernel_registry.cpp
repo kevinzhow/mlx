@@ -12,12 +12,15 @@
 #include "shaders/add_spv.h"
 #include "shaders/add_bf16_spv.h"
 #include "shaders/mul_bf16_spv.h"
+#include "shaders/silu_mul_bf16_spv.h"
 #include "shaders/sub_bf16_spv.h"
 #include "shaders/sub_bf16_scalar_spv.h"
 #include "shaders/sub_f32_spv.h"
 #include "shaders/sub_f32_scalar_spv.h"
 #include "shaders/sin_spv.h"
 #include "shaders/cos_spv.h"
+#include "shaders/argmax_f32_lastdim_spv.h"
+#include "shaders/argmax_bf16_lastdim_spv.h"
 #include "shaders/logsumexp_f32_spv.h"
 #include "shaders/logsumexp_bf16_row1_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_spv.h"
@@ -45,6 +48,7 @@ const char* KernelRegistry::ADD_F16 = "add_f16";
 const char* KernelRegistry::ADD_BF16 = "add_bf16";
 const char* KernelRegistry::MUL_F32 = "mul_f32";
 const char* KernelRegistry::MUL_BF16 = "mul_bf16";
+const char* KernelRegistry::SILU_MUL_BF16 = "silu_mul_bf16";
 const char* KernelRegistry::SUB_F32 = "sub_f32";
 const char* KernelRegistry::SUB_F32_SCALAR = "sub_f32_scalar";
 const char* KernelRegistry::SUB_BF16 = "sub_bf16";
@@ -52,6 +56,8 @@ const char* KernelRegistry::SUB_BF16_SCALAR = "sub_bf16_scalar";
 const char* KernelRegistry::DIV_F32 = "div_f32";
 const char* KernelRegistry::SIN_F32 = "sin_f32";
 const char* KernelRegistry::COS_F32 = "cos_f32";
+const char* KernelRegistry::ARGMAX_F32_LASTDIM = "argmax_f32_lastdim";
+const char* KernelRegistry::ARGMAX_BF16_LASTDIM = "argmax_bf16_lastdim";
 const char* KernelRegistry::LOGSUMEXP_F32 = "logsumexp_f32";
 const char* KernelRegistry::LOGSUMEXP_BF16_ROW1 = "logsumexp_bf16_row1";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128 =
@@ -112,6 +118,13 @@ void KernelRegistry::register_builtin_shaders() {
   std::memcpy(mul_bf16_spirv.data(), mul_bf16_spv, mul_bf16_spv_len);
   shaders_[MUL_BF16] = std::move(mul_bf16_spirv);
 
+  std::vector<uint32_t> silu_mul_bf16_spirv((silu_mul_bf16_spv_len + 3) / 4);
+  std::memcpy(
+      silu_mul_bf16_spirv.data(),
+      silu_mul_bf16_spv,
+      silu_mul_bf16_spv_len);
+  shaders_[SILU_MUL_BF16] = std::move(silu_mul_bf16_spirv);
+
   std::vector<uint32_t> sub_bf16_spirv((sub_bf16_spv_len + 3) / 4);
   std::memcpy(sub_bf16_spirv.data(), sub_bf16_spv, sub_bf16_spv_len);
   shaders_[SUB_BF16] = std::move(sub_bf16_spirv);
@@ -144,6 +157,21 @@ void KernelRegistry::register_builtin_shaders() {
   std::vector<uint32_t> cos_spirv((cos_spv_len + 3) / 4);
   std::memcpy(cos_spirv.data(), cos_spv, cos_spv_len);
   shaders_[COS_F32] = std::move(cos_spirv);
+
+  std::vector<uint32_t> argmax_f32_spirv((argmax_f32_lastdim_spv_len + 3) / 4);
+  std::memcpy(
+      argmax_f32_spirv.data(),
+      argmax_f32_lastdim_spv,
+      argmax_f32_lastdim_spv_len);
+  shaders_[ARGMAX_F32_LASTDIM] = std::move(argmax_f32_spirv);
+
+  std::vector<uint32_t> argmax_bf16_spirv(
+      (argmax_bf16_lastdim_spv_len + 3) / 4);
+  std::memcpy(
+      argmax_bf16_spirv.data(),
+      argmax_bf16_lastdim_spv,
+      argmax_bf16_lastdim_spv_len);
+  shaders_[ARGMAX_BF16_LASTDIM] = std::move(argmax_bf16_spirv);
 
   std::vector<uint32_t> logsumexp_spirv((logsumexp_f32_spv_len + 3) / 4);
   std::memcpy(

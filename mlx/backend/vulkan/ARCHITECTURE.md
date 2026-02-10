@@ -601,3 +601,37 @@ public:
 - 性能：
   - decode `20/40` token 吞吐相对当前基线提升且不出现 timeout
   - prefill（`Q_len>8`）相对 fallback 有稳定收益
+
+## 11. Compiled Hotspot Bridge（阶段 D-9.2）
+
+### 11.1 背景
+- Vulkan 目前没有 Metal 同级别的通用 `Compiled::eval_gpu` kernel 生成路径；
+- 在 Qwen decode 主路径中，`CompiledSigmoidMultiplyMultiply` 形成高频 CPU fallback 热点。
+
+### 11.2 当前策略（窄门禁专项 native）
+- 在 `Compiled::eval_gpu` 中识别融合子图名：`CompiledSigmoidMultiplyMultiply`；
+- 命中以下条件时走原生 Vulkan kernel `KernelRegistry::SILU_MUL_BF16`：
+  - `inputs=2`, `outputs=1`
+  - `x/y/out` 全部 `bfloat16`
+  - 同形状行连续（`x/y` materialized，`out` 行连续）
+- 其余 `Compiled` 形态保持显式 CPU fallback（语义优先）。
+
+### 11.3 Shader 与注册
+- Shader: `mlx/backend/vulkan/shaders/silu_mul_bf16.comp`
+- 闭环产物:
+  - `mlx/backend/vulkan/shaders/silu_mul_bf16.spv`
+  - `mlx/backend/vulkan/shaders/silu_mul_bf16_spv.h`
+- Registry: `KernelRegistry::SILU_MUL_BF16`
+
+### 11.4 运行时门禁与可观测性
+- Gate（默认 ON）:
+  - `MLX_VK_ENABLE_COMPILED_SIGMOID_MUL_MUL_BF16=1`
+- Debug:
+  - `MLX_VK_DEBUG_COMPILED_DETAIL=1`（打印子图 name/lib 与 I/O layout）
+- Profiling:
+  - `MLX_VK_PROFILE_COMPILED_DETAIL=1`（将 `Compiled` 拆分为 `Compiled::<subgraph>` 统计）
+
+### 11.5 与 Metal/Ollama 对齐说明
+- 该方案属于“过渡桥接”：
+  - 对齐 Metal/Ollama 的高频形态专项化思路（先把每 token 必经热点从 CPU 边界移走）；
+  - 后续仍应推进通用 `Compiled` GPU 化/更广泛融合，而非长期依赖字符串匹配门禁。

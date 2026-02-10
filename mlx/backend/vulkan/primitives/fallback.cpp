@@ -178,6 +178,38 @@ inline bool logsumexp_debug_reject_enabled() {
   return enabled;
 }
 
+inline bool compiled_profile_detail_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_PROFILE_COMPILED_DETAIL");
+    if (!v) {
+      return false;
+    }
+    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+        std::strcmp(v, "off") == 0) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
+inline bool compiled_debug_detail_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_DEBUG_COMPILED_DETAIL");
+    if (!v) {
+      return false;
+    }
+    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+        std::strcmp(v, "off") == 0) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
 inline bool env_flag_default_true(const char* name) {
   const char* v = std::getenv(name);
   if (!v) {
@@ -202,6 +234,12 @@ inline bool env_flag_default_false(const char* name) {
   }
   return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
       std::strcmp(v, "on") == 0;
+}
+
+inline bool native_compiled_sigmoid_mul_mul_bf16_enabled() {
+  static const bool enabled = env_flag_default_true(
+      "MLX_VK_ENABLE_COMPILED_SIGMOID_MUL_MUL_BF16");
+  return enabled;
 }
 
 inline bool sdpa_stats_enabled() {
@@ -658,6 +696,24 @@ inline bool native_logsumexp_f32_enabled() {
 inline bool native_logsumexp_bf16_row1_enabled() {
   static const bool enabled =
       env_flag_default_true("MLX_VK_ENABLE_LOGSUMEXP_BF16_ROW1");
+  return enabled;
+}
+
+inline bool native_argreduce_argmax_lastdim_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_ARGREDUCE_ARGMAX_LASTDIM");
+  return enabled;
+}
+
+inline bool argreduce_debug_reject_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_DEBUG_ARGREDUCE_REJECT");
+    if (!v) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
   return enabled;
 }
 
@@ -2060,7 +2116,6 @@ VULKAN_CPU_FALLBACK(ArcTan)
 VULKAN_CPU_FALLBACK(ArcTan2)
 VULKAN_CPU_FALLBACK(ArcTanh)
 VULKAN_CPU_FALLBACK(ArgPartition)
-VULKAN_CPU_FALLBACK(ArgReduce)
 VULKAN_CPU_FALLBACK(ArgSort)
 VULKAN_CPU_FALLBACK(BitwiseBinary)
 VULKAN_CPU_FALLBACK(BitwiseInvert)
@@ -2096,6 +2151,145 @@ VULKAN_CPU_FALLBACK(LogicalNot)
 VULKAN_CPU_FALLBACK(LogicalAnd)
 VULKAN_CPU_FALLBACK(LogicalOr)
 VULKAN_CPU_FALLBACK(LogAddExp)
+
+void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("ArgReduce");
+
+  if (!vulkan::is_available()) {
+    throw std::runtime_error("Vulkan not available");
+  }
+
+  auto stream = out.primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+
+  const char* reject_reason = nullptr;
+  auto reject = [&](const char* reason) {
+    reject_reason = reason;
+    return false;
+  };
+
+  uint32_t n_rows = 0u;
+  uint32_t axis_size = 0u;
+  bool native_success = false;
+
+  if (inputs.size() == 1) {
+    const auto& in = inputs[0];
+    bool common_ok = true;
+
+    if (!native_argreduce_argmax_lastdim_enabled()) {
+      common_ok = reject("gate_disabled");
+    } else if (reduce_type_ != ArgReduce::ArgMax) {
+      common_ok = reject("reduce_type");
+    } else if (in.ndim() < 1) {
+      common_ok = reject("ndim");
+    } else if (axis_ < 0 || axis_ != (in.ndim() - 1)) {
+      common_ok = reject("axis_lastdim");
+    } else if (!is_row_contiguous_materialized(in)) {
+      common_ok = reject("in_layout");
+    } else if (!out.flags().row_contiguous) {
+      common_ok = reject("out_layout");
+    } else if (out.dtype() != mlx::core::uint32) {
+      common_ok = reject("out_dtype");
+    } else if (in.strides()[in.ndim() - 1] != 1) {
+      common_ok = reject("last_stride");
+    }
+
+    if (common_ok) {
+      const int64_t axis_size_i64 = in.shape(in.ndim() - 1);
+      if (axis_size_i64 <= 0 ||
+          axis_size_i64 >
+              static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        common_ok = reject("axis_size");
+      } else {
+        axis_size = static_cast<uint32_t>(axis_size_i64);
+      }
+    }
+
+    if (common_ok) {
+      const size_t in_size = in.size();
+      if ((in_size % axis_size) != 0) {
+        common_ok = reject("size_mod_axis");
+      } else {
+        const size_t rows_size_t = in_size / axis_size;
+        if (rows_size_t == 0 || rows_size_t != out.size() ||
+            rows_size_t >
+                static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+          common_ok = reject("rows_shape");
+        } else {
+          n_rows = static_cast<uint32_t>(rows_size_t);
+        }
+      }
+    }
+
+    if (common_ok) {
+      const char* kernel_name = nullptr;
+      if (in.dtype() == mlx::core::float32) {
+        kernel_name = vulkan::KernelRegistry::ARGMAX_F32_LASTDIM;
+      } else if (in.dtype() == mlx::core::bfloat16) {
+        kernel_name = vulkan::KernelRegistry::ARGMAX_BF16_LASTDIM;
+      } else {
+        reject("in_dtype");
+      }
+
+      if (kernel_name) {
+        try {
+          if (!out.data_shared_ptr()) {
+            out.set_data(allocator::malloc(out.nbytes()));
+          }
+
+          auto& device = vulkan::device(stream.device);
+          auto& encoder = device.get_command_encoder(stream.index);
+          encoder.begin_encoding();
+
+          auto in_tensor = device.get_tensor(in);
+          auto out_tensor = device.get_tensor(out);
+          if (device.tensor_needs_sync_device(in)) {
+            encoder.record_tensor_sync_device({in_tensor});
+          }
+
+          const std::vector<uint32_t> push_consts{
+              encode_push_constant_u32(n_rows),
+              encode_push_constant_u32(axis_size)};
+          encoder.record_algo_dispatch(
+              kernel_name,
+              {in_tensor, out_tensor},
+              {n_rows, 1, 1},
+              push_consts);
+          device.mark_tensor_host_dirty(out, stream.index);
+          native_success = true;
+          return;
+        } catch (const std::exception&) {
+          reject("dispatch_error");
+        }
+      }
+    }
+  } else {
+    reject("arity");
+  }
+
+  if (!native_success && argreduce_debug_reject_enabled() && inputs.size() == 1) {
+    const auto& in = inputs[0];
+    std::cerr << "[VulkanArgReduceReject] reason="
+              << (reject_reason ? reject_reason : "unknown")
+              << " reduce_type=" << (reduce_type_ == ArgReduce::ArgMax ? "argmax" : "argmin")
+              << " axis=" << axis_
+              << " in_dtype=" << in.dtype()
+              << " out_dtype=" << out.dtype()
+              << " in_shape=" << shape_string(in)
+              << " in_strides=" << strides_string(in)
+              << " in_row=" << (in.flags().row_contiguous ? 1 : 0)
+              << " in_data_size=" << in.data_size()
+              << " in_size=" << in.size()
+              << " out_shape=" << shape_string(out)
+              << " out_strides=" << strides_string(out)
+              << " out_row=" << (out.flags().row_contiguous ? 1 : 0)
+              << " out_data_size=" << out.data_size()
+              << " out_size=" << out.size() << "\n";
+  }
+
+  profile.mark_fallback();
+  run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);
+}
 
 void LogSumExp::eval_gpu(const std::vector<array>& inputs, array& out) {
   vulkan::OpProfileScope profile("LogSumExp");
@@ -2272,7 +2466,143 @@ VULKAN_CPU_FALLBACK(Square)
 VULKAN_CPU_FALLBACK(Tan)
 VULKAN_CPU_FALLBACK(Tanh)
 
-VULKAN_CPU_FALLBACK_MULTI(Compiled)
+void Compiled::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto stream = outputs.empty() ? default_stream(default_device())
+                                : outputs.front().primitive().stream();
+  std::string detailed_name;
+  const char* profile_name = "Compiled";
+  if (compiled_profile_detail_enabled()) {
+    detailed_name = std::string("Compiled::") + name();
+    profile_name = detailed_name.c_str();
+  }
+
+  if (compiled_debug_detail_enabled()) {
+    static std::mutex debug_mtx;
+    static std::unordered_set<std::string> printed;
+    std::lock_guard<std::mutex> lock(debug_mtx);
+    const std::string debug_key = std::string(name()) + "|" + lib_name();
+    if (printed.insert(debug_key).second) {
+      std::cerr << "[VulkanCompiledDetail] name=" << name()
+                << " lib=" << lib_name()
+                << " inputs=" << inputs.size()
+                << " outputs=" << outputs.size() << "\n";
+      for (size_t i = 0; i < inputs.size(); ++i) {
+        const auto& in = inputs[i];
+        std::cerr << "  in[" << i << "] dtype=" << in.dtype()
+                  << " shape=" << shape_string(in)
+                  << " strides=" << strides_string(in)
+                  << " row=" << (in.flags().row_contiguous ? 1 : 0)
+                  << " size=" << in.size()
+                  << " data_size=" << in.data_size() << "\n";
+      }
+      for (size_t i = 0; i < outputs.size(); ++i) {
+        const auto& out = outputs[i];
+        std::cerr << "  out[" << i << "] dtype=" << out.dtype()
+                  << " shape=" << shape_string(out)
+                  << " strides=" << strides_string(out)
+                  << " row=" << (out.flags().row_contiguous ? 1 : 0)
+                  << " size=" << out.size()
+                  << " data_size=" << out.data_size() << "\n";
+      }
+    }
+  }
+
+  vulkan::OpProfileScope profile(profile_name);
+
+  bool native_success = false;
+  if (native_compiled_sigmoid_mul_mul_bf16_enabled() &&
+      std::strcmp(name(), "CompiledSigmoidMultiplyMultiply") == 0) {
+    const char* reject_reason = nullptr;
+    auto reject = [&](const char* reason) {
+      reject_reason = reason;
+      return false;
+    };
+
+    bool common_ok = true;
+    if (inputs.size() != 2 || outputs.size() != 1) {
+      common_ok = reject("arity");
+    } else if (
+        inputs[0].dtype() != bfloat16 || inputs[1].dtype() != bfloat16 ||
+        outputs[0].dtype() != bfloat16) {
+      common_ok = reject("dtype");
+    } else if (
+        inputs[0].shape() != inputs[1].shape() ||
+        inputs[0].shape() != outputs[0].shape()) {
+      common_ok = reject("shape");
+    } else if (
+        !is_row_contiguous_materialized(inputs[0]) ||
+        !is_row_contiguous_materialized(inputs[1]) ||
+        !outputs[0].flags().row_contiguous) {
+      common_ok = reject("layout");
+    } else if (
+        outputs[0].size() == 0 ||
+        outputs[0].size() >
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+      common_ok = reject("size");
+    }
+
+    if (common_ok) {
+      try {
+        auto& out = outputs[0];
+        if (!out.data_shared_ptr()) {
+          out.set_data(allocator::malloc(out.nbytes()));
+        }
+
+        prepare_inputs_for_cpu_fallback(inputs, stream);
+
+        auto& device = vulkan::device(stream.device);
+        auto& encoder = device.get_command_encoder(stream.index);
+        encoder.begin_encoding();
+
+        auto x_tensor = device.get_tensor(inputs[0]);
+        auto y_tensor = device.get_tensor(inputs[1]);
+        auto out_tensor = device.get_tensor(out);
+
+        std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+        if (device.tensor_needs_sync_device(inputs[0])) {
+          sync_tensors.push_back(x_tensor);
+        }
+        if (device.tensor_needs_sync_device(inputs[1])) {
+          sync_tensors.push_back(y_tensor);
+        }
+        if (!sync_tensors.empty()) {
+          encoder.record_tensor_sync_device(sync_tensors);
+        }
+
+        const uint32_t n = static_cast<uint32_t>(out.size());
+        const uint32_t n_words = (n + 1u) / 2u;
+        const uint32_t groups_x = std::max<uint32_t>(1, (n_words + 255u) / 256u);
+        encoder.record_algo_dispatch(
+            vulkan::KernelRegistry::SILU_MUL_BF16,
+            {x_tensor, y_tensor, out_tensor},
+            {groups_x, 1, 1},
+            {encode_push_constant_u32(n)});
+
+        device.mark_tensor_host_dirty(out, stream.index);
+        native_success = true;
+      } catch (const std::exception&) {
+        reject("dispatch_error");
+      }
+    }
+
+    if (!native_success && compiled_debug_detail_enabled()) {
+      std::cerr << "[VulkanCompiledReject] name=" << name()
+                << " reason=" << (reject_reason ? reject_reason : "unknown")
+                << "\n";
+    }
+  }
+
+  if (native_success) {
+    return;
+  }
+
+  profile.mark_fallback();
+  run_cpu_fallback_multi(
+      inputs, outputs, [&]() { eval_cpu(inputs, outputs); }, &profile);
+}
+
 VULKAN_CPU_FALLBACK_MULTI(DivMod)
 VULKAN_CPU_FALLBACK_MULTI(Eig)
 VULKAN_CPU_FALLBACK_MULTI(Eigh)

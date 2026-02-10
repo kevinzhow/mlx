@@ -92,12 +92,15 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/binary_add.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mul_bf16.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/silu_mul_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sub_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sub_bf16_scalar.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sub_f32.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sub_f32_scalar.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sin.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/cos.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/argmax_f32_lastdim.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/argmax_bf16_lastdim.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/logsumexp_f32.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/logsumexp_bf16_row1.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128.comp
