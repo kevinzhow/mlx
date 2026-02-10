@@ -1958,3 +1958,59 @@ python -m unittest discover -v
 1. 继续 `K cap` 小步扩展（`20/24`）并做 `max_tokens=80` 稳定性门禁，评估长上下文真实收益。
 2. 增加 SDPA 命中分布统计（按 `q_len/k_len` 分桶），量化 `k_len_cap` 回退占比。
 3. 设计 prefill/full 更大 `Q_len`（`>16`）native 路径门禁，逐步收敛至更接近 Metal 覆盖。
+
+### 2026-02-10 主线推进（SDPA 命中分布统计落地）✅
+
+#### 本轮目标
+- 落地可复用的 SDPA 命中/回退统计，量化 `k_len_cap` 真实占比，支撑后续 `K cap` 调参与门禁收敛。
+
+#### 本轮变更
+1. SDPA 统计器（env gate）：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - 新增 `MLX_VK_SDPA_STATS=1`（进程退出时打印统计）；
+   - 统计维度：
+     - `use_fallback` 调用与 reject 计数
+     - native gate 调用、reject、hit
+     - native dispatch 成功/失败
+     - 最终 fallback 次数
+     - `decode/prefill + q_len/k_len bucket` 分桶
+     - reject reason 与 reason+bucket 分布
+2. 统计钩子接入路径：
+   - `fast::ScaledDotProductAttention::use_fallback`
+   - `can_use_native_sdpa_bf16_decode_q1`
+   - `dispatch_native_decode`（success/fail）
+   - `eval_gpu` 最终 fallback 分支
+3. 生命周期修复：
+   - 调整 stats `state/reporter` 初始化顺序，避免退出期析构次序导致统计 map 丢失。
+4. 文档同步：
+   - 文件：`AGENTS.md`
+   - Optional debug env 新增：`MLX_VK_SDPA_STATS=1`。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+   - `python -m unittest -v test_fast_sdpa` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 40-token（默认 `K cap=16`，开启 stats）：
+   - EN `prompt="Hi"`：`Generation: 2.455 tok/s`
+     - `use_fallback_rejects=924/1176`（`78.6%`）
+     - `UseFallbackReason: k_len_cap=924`（唯一主因）
+     - bucket：`decode q=1, k=17-32 => 448`；`decode q=1, k=33-64 => 476`
+   - ZH `prompt="你好啊"`：`Generation: 2.401 tok/s`
+     - `use_fallback_rejects=952/1176`（`80.9%`）
+     - `UseFallbackReason: k_len_cap=952`（唯一主因）
+3. 快速 A/B（同负载，`K cap=16` vs `24`）：
+   - `K cap=16`：`Generation: 2.395 tok/s`, `k_len_cap rejects=924`, `native_hits=251`
+   - `K cap=24`：`Generation: 2.428 tok/s`, `k_len_cap rejects=700`, `native_hits=475`
+   - 结论：`K cap=24` 显著降低 `k_len_cap` 回退并带来小幅吞吐增益（该负载约 `+1.4%`）。
+
+#### 当前状态
+- ✅ 统计链路可直接回答“卡在哪里”：当前长序列 decode 的主瓶颈已明确为 `k_len_cap`。
+- ✅ 数据链路已可用于每轮门禁实验（无需再靠人工解析 reject 日志）。
+- ⚠️ 默认 `K cap=16` 下，40-token 负载仍有约 `79%~81%` 的 `use_fallback` 被 `k_len_cap` 挡回。
+
+#### 下一步（精确）
+1. 用统计门禁推进 `K cap` 分段扩展（先 `20/24`），以 `k_len_cap` 占比下降和 40/80-token 吞吐不回退为准入条件。
+2. 在 `MLX_VK_SDPA_STATS=1` 下补充中英文 `max_tokens=80` 基线，按 bucket 对比 `K cap` 策略收益。
+3. 当 `K cap` 收益稳定后，再推进 `Q_len>16` prefill/full native 门禁扩展，继续缩小 fallback 面。

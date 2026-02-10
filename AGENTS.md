@@ -96,6 +96,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - `MLX_VK_DEBUG_ROPE_REJECT=1`
 - `MLX_VK_DEBUG_SDPA_REJECT=1`
 - `MLX_VK_DEBUG_SDPA_SPLITK=1`
+- `MLX_VK_SDPA_STATS=1` (进程退出时打印 SDPA 命中/回退分布与 `k_len_cap` 占比)
 - Native gate toggles for isolation:
   - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=0|1`

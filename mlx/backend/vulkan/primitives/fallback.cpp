@@ -8,9 +8,11 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "mlx/allocator.h"
 #include "mlx/backend/cpu/encoder.h"
@@ -187,6 +189,262 @@ inline bool env_flag_default_false(const char* name) {
   }
   return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
       std::strcmp(v, "on") == 0;
+}
+
+inline bool sdpa_stats_enabled() {
+  static const bool enabled = env_flag_default_false("MLX_VK_SDPA_STATS");
+  return enabled;
+}
+
+inline uint32_t clamp_len_hint(int64_t len) {
+  if (len <= 0) {
+    return 0u;
+  }
+  if (len > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+    return std::numeric_limits<uint32_t>::max();
+  }
+  return static_cast<uint32_t>(len);
+}
+
+inline std::pair<uint32_t, uint32_t> sdpa_qk_len_hint(
+    const std::vector<mlx::core::array>& inputs) {
+  if (inputs.size() < 2) {
+    return {0u, 0u};
+  }
+  const auto& q = inputs[0];
+  const auto& k = inputs[1];
+  const uint32_t q_len = (q.ndim() >= 3) ? clamp_len_hint(q.shape(2)) : 0u;
+  const uint32_t k_len = (k.ndim() >= 3) ? clamp_len_hint(k.shape(2)) : 0u;
+  return {q_len, k_len};
+}
+
+inline uint32_t sdpa_qk_len_hint_from_array(const mlx::core::array& arr) {
+  return (arr.ndim() >= 3) ? clamp_len_hint(arr.shape(2)) : 0u;
+}
+
+inline const char* sdpa_len_bucket(uint32_t len) {
+  if (len <= 1u) {
+    return "1";
+  }
+  if (len <= 4u) {
+    return "2-4";
+  }
+  if (len <= 8u) {
+    return "5-8";
+  }
+  if (len <= 16u) {
+    return "9-16";
+  }
+  if (len <= 32u) {
+    return "17-32";
+  }
+  if (len <= 64u) {
+    return "33-64";
+  }
+  return "65+";
+}
+
+inline const char* sdpa_stage_name(uint32_t q_len) {
+  return q_len <= 1u ? "decode" : "prefill";
+}
+
+inline std::string sdpa_bucket_key(uint32_t q_len, uint32_t k_len) {
+  return std::string("stage=") + sdpa_stage_name(q_len) + " q=" +
+      sdpa_len_bucket(q_len) + " k=" + sdpa_len_bucket(k_len);
+}
+
+struct SdpaStatsState {
+  std::mutex mtx;
+  uint64_t use_fallback_calls{0};
+  uint64_t use_fallback_rejects{0};
+  uint64_t native_gate_calls{0};
+  uint64_t native_gate_rejects{0};
+  uint64_t native_hits{0};
+  uint64_t native_dispatch_success{0};
+  uint64_t native_dispatch_fail{0};
+  uint64_t final_fallbacks{0};
+  std::unordered_map<std::string, uint64_t> use_fallback_reason_counts;
+  std::unordered_map<std::string, uint64_t> use_fallback_reason_bucket_counts;
+  std::unordered_map<std::string, uint64_t> native_reject_reason_counts;
+  std::unordered_map<std::string, uint64_t> native_reject_reason_bucket_counts;
+  std::unordered_map<std::string, uint64_t> native_hit_bucket_counts;
+};
+
+inline SdpaStatsState& sdpa_stats_state() {
+  static SdpaStatsState state;
+  return state;
+}
+
+inline std::vector<std::pair<std::string, uint64_t>> sort_stats_counts(
+    const std::unordered_map<std::string, uint64_t>& counts) {
+  std::vector<std::pair<std::string, uint64_t>> out(counts.begin(), counts.end());
+  std::sort(
+      out.begin(),
+      out.end(),
+      [](const auto& a, const auto& b) {
+        if (a.second != b.second) {
+          return a.second > b.second;
+        }
+        return a.first < b.first;
+      });
+  return out;
+}
+
+struct SdpaStatsReporter;
+inline SdpaStatsReporter& sdpa_stats_reporter();
+
+inline void sdpa_stats_record_use_fallback_call() {
+  if (!sdpa_stats_enabled()) {
+    return;
+  }
+  auto& state = sdpa_stats_state();
+  (void)sdpa_stats_reporter();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.use_fallback_calls++;
+}
+
+inline void sdpa_stats_record_use_fallback_reject(
+    const char* reason,
+    uint32_t q_len,
+    uint32_t k_len) {
+  if (!sdpa_stats_enabled()) {
+    return;
+  }
+  auto& state = sdpa_stats_state();
+  (void)sdpa_stats_reporter();
+  const std::string reason_str = reason ? reason : "unknown";
+  const std::string bucket = sdpa_bucket_key(q_len, k_len);
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.use_fallback_rejects++;
+  state.use_fallback_reason_counts[reason_str]++;
+  state.use_fallback_reason_bucket_counts[reason_str + " | " + bucket]++;
+}
+
+inline void sdpa_stats_record_native_gate_call() {
+  if (!sdpa_stats_enabled()) {
+    return;
+  }
+  auto& state = sdpa_stats_state();
+  (void)sdpa_stats_reporter();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.native_gate_calls++;
+}
+
+inline void sdpa_stats_record_native_reject(
+    const char* reason,
+    uint32_t q_len,
+    uint32_t k_len) {
+  if (!sdpa_stats_enabled()) {
+    return;
+  }
+  auto& state = sdpa_stats_state();
+  (void)sdpa_stats_reporter();
+  const std::string reason_str = reason ? reason : "unknown";
+  const std::string bucket = sdpa_bucket_key(q_len, k_len);
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.native_gate_rejects++;
+  state.native_reject_reason_counts[reason_str]++;
+  state.native_reject_reason_bucket_counts[reason_str + " | " + bucket]++;
+}
+
+inline void sdpa_stats_record_native_hit(uint32_t q_len, uint32_t k_len) {
+  if (!sdpa_stats_enabled()) {
+    return;
+  }
+  auto& state = sdpa_stats_state();
+  (void)sdpa_stats_reporter();
+  const std::string bucket = sdpa_bucket_key(q_len, k_len);
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.native_hits++;
+  state.native_hit_bucket_counts[bucket]++;
+}
+
+inline void sdpa_stats_record_dispatch_result(bool success) {
+  if (!sdpa_stats_enabled()) {
+    return;
+  }
+  auto& state = sdpa_stats_state();
+  (void)sdpa_stats_reporter();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  if (success) {
+    state.native_dispatch_success++;
+  } else {
+    state.native_dispatch_fail++;
+  }
+}
+
+inline void sdpa_stats_record_final_fallback() {
+  if (!sdpa_stats_enabled()) {
+    return;
+  }
+  auto& state = sdpa_stats_state();
+  (void)sdpa_stats_reporter();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.final_fallbacks++;
+}
+
+inline void sdpa_stats_dump() {
+  if (!sdpa_stats_enabled()) {
+    return;
+  }
+  auto& state = sdpa_stats_state();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  if (state.use_fallback_calls == 0 && state.native_gate_calls == 0 &&
+      state.final_fallbacks == 0 && state.native_dispatch_success == 0 &&
+      state.native_dispatch_fail == 0) {
+    return;
+  }
+
+  std::cerr << "[VulkanSDPAStats] use_fallback_calls=" << state.use_fallback_calls
+            << " use_fallback_rejects=" << state.use_fallback_rejects
+            << " native_gate_calls=" << state.native_gate_calls
+            << " native_gate_rejects=" << state.native_gate_rejects
+            << " native_hits=" << state.native_hits
+            << " dispatch_success=" << state.native_dispatch_success
+            << " dispatch_fail=" << state.native_dispatch_fail
+            << " final_fallbacks=" << state.final_fallbacks
+            << " use_reason_keys=" << state.use_fallback_reason_counts.size()
+            << " native_reject_reason_keys="
+            << state.native_reject_reason_counts.size()
+            << " hit_bucket_keys=" << state.native_hit_bucket_counts.size()
+            << "\n";
+
+  for (const auto& [key, count] :
+       sort_stats_counts(state.use_fallback_reason_counts)) {
+    std::cerr << "[VulkanSDPAStats][UseFallbackReason] reason=" << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.native_reject_reason_counts)) {
+    std::cerr << "[VulkanSDPAStats][NativeRejectReason] reason=" << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.native_hit_bucket_counts)) {
+    std::cerr << "[VulkanSDPAStats][NativeHitBucket] " << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.use_fallback_reason_bucket_counts)) {
+    std::cerr << "[VulkanSDPAStats][UseFallbackReasonBucket] " << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.native_reject_reason_bucket_counts)) {
+    std::cerr << "[VulkanSDPAStats][NativeRejectReasonBucket] " << key
+              << " count=" << count << "\n";
+  }
+}
+
+struct SdpaStatsReporter {
+  ~SdpaStatsReporter() {
+    sdpa_stats_dump();
+  }
+};
+
+inline SdpaStatsReporter& sdpa_stats_reporter() {
+  static SdpaStatsReporter reporter;
+  return reporter;
 }
 
 inline bool native_qmm_enabled() {
@@ -980,7 +1238,11 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
     uint32_t& mask_q_stride,
     uint32_t& mask_k_stride,
     const char** reject_reason = nullptr) {
+  const auto [q_len_hint, k_len_hint] = sdpa_qk_len_hint(inputs);
+  sdpa_stats_record_native_gate_call();
+
   auto reject = [&](const char* reason) {
+    sdpa_stats_record_native_reject(reason, q_len_hint, k_len_hint);
     if (reject_reason) {
       *reject_reason = reason;
     }
@@ -1179,6 +1441,7 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
   k_len = static_cast<uint32_t>(lk);
   qk_dim = static_cast<uint32_t>(dq);
   v_dim = static_cast<uint32_t>(dv);
+  sdpa_stats_record_native_hit(q_len, k_len);
   if (sdpa_debug_hit_enabled()) {
     std::cerr << "[VulkanSDPAHit] "
               << "q_len=" << q_len << " k_len=" << k_len
@@ -1530,7 +1793,12 @@ bool fast::ScaledDotProductAttention::use_fallback(
     bool is_training,
     bool output_logsumexp,
     Stream stream) {
+  const uint32_t q_len_hint = sdpa_qk_len_hint_from_array(q);
+  const uint32_t k_len_hint = sdpa_qk_len_hint_from_array(k);
+  sdpa_stats_record_use_fallback_call();
+
   auto reject = [&](const char* reason) {
+    sdpa_stats_record_use_fallback_reject(reason, q_len_hint, k_len_hint);
     log_sdpa_reject(
         q, k, v, reason, has_mask, do_causal, is_training, output_logsumexp);
     return true;
@@ -2003,6 +2271,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
             reduce_push_consts);
       }
       device.mark_tensor_host_dirty(out, stream.index);
+      sdpa_stats_record_dispatch_result(true);
       return true;
     } catch (const std::exception& e) {
       if (sdpa_debug_reject_enabled() ||
@@ -2022,6 +2291,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
                   << " mask_k_stride=" << mask_k_stride_local
                   << "\n";
       }
+      sdpa_stats_record_dispatch_result(false);
       return false;
     }
   };
@@ -2216,6 +2486,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
               << "\n";
   }
 
+  sdpa_stats_record_final_fallback();
   profile.mark_fallback();
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }
