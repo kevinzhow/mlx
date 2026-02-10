@@ -79,7 +79,7 @@ inline kp::Tensor::TensorDataTypes to_kompute_dtype(Dtype dtype) {
 }
 
 inline size_t tensor_element_count(const array& arr) {
-  return std::max(arr.size(), arr.data_size());
+  return arr.data_size() > 0 ? arr.data_size() : arr.size();
 }
 
 } // namespace

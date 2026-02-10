@@ -54,9 +54,14 @@ class KernelRegistry {
   static const char* MUL_F32;
   static const char* MUL_BF16;
   static const char* SUB_F32;
+  static const char* SUB_F32_SCALAR;
+  static const char* SUB_BF16;
+  static const char* SUB_BF16_SCALAR;
   static const char* DIV_F32;
   static const char* SIN_F32;
   static const char* COS_F32;
+  static const char* LOGSUMEXP_F32;
+  static const char* LOGSUMEXP_BF16_ROW1;
   static const char* QMM_AFFINE_BF16_T4_G128;
   static const char* RMSNORM_BF16;
   static const char* ROPE_BF16_T1;

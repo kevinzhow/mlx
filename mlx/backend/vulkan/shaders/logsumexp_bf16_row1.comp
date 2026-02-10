@@ -1,0 +1,86 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InBuffer {
+  uint words[];
+} in_buffer;
+
+layout(set = 0, binding = 1) writeonly buffer OutBuffer {
+  uint words[];
+} out_buffer;
+
+layout(push_constant) uniform PushConstants {
+  uint axis_size;
+} params;
+
+shared float s_max[256];
+shared float s_sum[256];
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float load_bf16_elem(uint elem_idx) {
+  uint packed = in_buffer.words[elem_idx >> 1u];
+  uint bf16_bits =
+      ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu) : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+void main() {
+  uint lane = gl_LocalInvocationID.x;
+  if (params.axis_size == 0u) {
+    return;
+  }
+
+  float local_max = -3.4028235e38;
+  for (uint i = lane; i < params.axis_size; i += 256u) {
+    local_max = max(local_max, load_bf16_elem(i));
+  }
+
+  s_max[lane] = local_max;
+  barrier();
+
+  for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    if (lane < stride) {
+      s_max[lane] = max(s_max[lane], s_max[lane + stride]);
+    }
+    barrier();
+  }
+
+  float row_max = s_max[0];
+  if (isinf(row_max)) {
+    if (lane == 0u) {
+      out_buffer.words[0] = f32_to_bf16(row_max) & 0xFFFFu;
+    }
+    return;
+  }
+
+  float local_sum = 0.0;
+  for (uint i = lane; i < params.axis_size; i += 256u) {
+    local_sum += exp(load_bf16_elem(i) - row_max);
+  }
+
+  s_sum[lane] = local_sum;
+  barrier();
+
+  for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    if (lane < stride) {
+      s_sum[lane] += s_sum[lane + stride];
+    }
+    barrier();
+  }
+
+  if (lane == 0u) {
+    float result = log(s_sum[0]) + row_max;
+    out_buffer.words[0] = f32_to_bf16(result) & 0xFFFFu;
+  }
+}

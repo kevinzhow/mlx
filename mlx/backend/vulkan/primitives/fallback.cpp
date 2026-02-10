@@ -166,6 +166,18 @@ inline bool sdpa_debug_hit_enabled() {
   return enabled;
 }
 
+inline bool logsumexp_debug_reject_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_DEBUG_LOGSUMEXP_REJECT");
+    if (!v) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
 inline bool env_flag_default_true(const char* name) {
   const char* v = std::getenv(name);
   if (!v) {
@@ -634,6 +646,18 @@ inline bool native_rope_enabled() {
 
 inline bool native_sdpa_enabled() {
   static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_SDPA_NATIVE");
+  return enabled;
+}
+
+inline bool native_logsumexp_f32_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_LOGSUMEXP_F32");
+  return enabled;
+}
+
+inline bool native_logsumexp_bf16_row1_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_LOGSUMEXP_BF16_ROW1");
   return enabled;
 }
 
@@ -2072,7 +2096,152 @@ VULKAN_CPU_FALLBACK(LogicalNot)
 VULKAN_CPU_FALLBACK(LogicalAnd)
 VULKAN_CPU_FALLBACK(LogicalOr)
 VULKAN_CPU_FALLBACK(LogAddExp)
-VULKAN_CPU_FALLBACK(LogSumExp)
+
+void LogSumExp::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("LogSumExp");
+
+  if (!vulkan::is_available()) {
+    throw std::runtime_error("Vulkan not available");
+  }
+
+  auto stream = out.primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+
+  const char* reject_reason = nullptr;
+  auto reject = [&](const char* reason) {
+    reject_reason = reason;
+    return false;
+  };
+
+  uint32_t n_rows = 0u;
+  uint32_t axis_size = 0u;
+  bool native_success = false;
+  if (inputs.size() == 1) {
+    const auto& in = inputs[0];
+    bool common_ok = true;
+    if (in.ndim() < 1) {
+      common_ok = reject("ndim");
+    } else if (!in.flags().row_contiguous || in.data_size() != in.size()) {
+      common_ok = reject("in_layout");
+    } else if (!out.flags().row_contiguous) {
+      common_ok = reject("out_layout");
+    } else if (in.strides()[in.ndim() - 1] != 1) {
+      common_ok = reject("last_stride");
+    }
+
+    if (common_ok) {
+      const int64_t axis_size_i64 = in.shape(in.ndim() - 1);
+      if (axis_size_i64 <= 0 ||
+          axis_size_i64 >
+              static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        common_ok = reject("axis_size");
+      } else {
+        axis_size = static_cast<uint32_t>(axis_size_i64);
+      }
+    }
+
+    if (common_ok) {
+      const size_t in_size = in.size();
+      if ((in_size % axis_size) != 0) {
+        common_ok = reject("size_mod_axis");
+      } else {
+        const size_t rows_size_t = in_size / axis_size;
+        if (rows_size_t == 0 || rows_size_t != out.size() ||
+            rows_size_t >
+                static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+          common_ok = reject("rows_shape");
+        } else {
+          n_rows = static_cast<uint32_t>(rows_size_t);
+        }
+      }
+    }
+
+    if (common_ok) {
+      const char* kernel_name = nullptr;
+      uint32_t dispatch_x = 0u;
+      std::vector<uint32_t> push_consts;
+
+      if (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::float32) {
+        if (!native_logsumexp_f32_enabled()) {
+          reject("gate_f32_disabled");
+        } else {
+          kernel_name = vulkan::KernelRegistry::LOGSUMEXP_F32;
+          dispatch_x = n_rows;
+          push_consts = {
+              encode_push_constant_u32(n_rows),
+              encode_push_constant_u32(axis_size)};
+        }
+      } else if (
+          in.dtype() == mlx::core::bfloat16 &&
+          out.dtype() == mlx::core::bfloat16) {
+        if (!native_logsumexp_bf16_row1_enabled()) {
+          reject("gate_bf16_row1_disabled");
+        } else if (n_rows != 1u) {
+          reject("bf16_row1_nrows");
+        } else {
+          kernel_name = vulkan::KernelRegistry::LOGSUMEXP_BF16_ROW1;
+          dispatch_x = 1u;
+          push_consts = {encode_push_constant_u32(axis_size)};
+        }
+      } else {
+        reject("dtype");
+      }
+
+      if (kernel_name) {
+        try {
+          if (!out.data_shared_ptr()) {
+            out.set_data(allocator::malloc(out.nbytes()));
+          }
+
+          auto& device = vulkan::device(stream.device);
+          auto& encoder = device.get_command_encoder(stream.index);
+          encoder.begin_encoding();
+
+          auto in_tensor = device.get_tensor(in);
+          auto out_tensor = device.get_tensor(out);
+          if (device.tensor_needs_sync_device(in)) {
+            encoder.record_tensor_sync_device({in_tensor});
+          }
+
+          encoder.record_algo_dispatch(
+              kernel_name,
+              {in_tensor, out_tensor},
+              {dispatch_x, 1, 1},
+              push_consts);
+          device.mark_tensor_host_dirty(out, stream.index);
+          native_success = true;
+          return;
+        } catch (const std::exception&) {
+          reject("dispatch_error");
+        }
+      }
+    }
+  } else {
+    reject("arity");
+  }
+
+  if (!native_success && logsumexp_debug_reject_enabled() && inputs.size() == 1) {
+    const auto& in = inputs[0];
+    std::cerr << "[VulkanLogSumExpReject] reason="
+              << (reject_reason ? reject_reason : "unknown")
+              << " in_dtype=" << in.dtype()
+              << " out_dtype=" << out.dtype()
+              << " in_shape=" << shape_string(in)
+              << " in_strides=" << strides_string(in)
+              << " in_row=" << (in.flags().row_contiguous ? 1 : 0)
+              << " in_data_size=" << in.data_size()
+              << " in_size=" << in.size()
+              << " out_shape=" << shape_string(out)
+              << " out_strides=" << strides_string(out)
+              << " out_row=" << (out.flags().row_contiguous ? 1 : 0)
+              << " out_data_size=" << out.data_size()
+              << " out_size=" << out.size() << "\n";
+  }
+
+  profile.mark_fallback();
+  run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);
+}
+
 VULKAN_CPU_FALLBACK(MaskedScatter)
 VULKAN_CPU_FALLBACK(Matmul)
 VULKAN_CPU_FALLBACK(Maximum)

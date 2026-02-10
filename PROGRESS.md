@@ -3390,3 +3390,58 @@ python -m unittest discover -v
 1. 进入 D-8.4：优化 split-k stage1 中间张量（`partial_o/m/l`）写回成本，目标继续压低 `k=65+` decode 开销。
 2. 继续对照 Metal/Ollama，评估“stage1+reduce 融合”可行性（先 decode，再 prefill）。
 3. 启动 D-9：QMM decode `M=1` 专项核（预计是下一主要吞吐瓶颈）。
+
+### 2026-02-11 主线推进（阶段 D-9.0：Subtract 回退清理 + broadcast-scalar native）✅
+
+#### 本轮目标
+- 修复 `Subtract` 新增 native 路径引入的正确性回归（`test_fast_sdpa_decode_array_mask_q1`）。
+- 清理 decode 主链路中 `Subtract` 的大头 fallback（广播标量视图），减少生成阶段 CPU 回退时间。
+
+#### Metal / Ollama 对照分析（本轮）
+1. Metal（MLX）：
+   - 高频逐 token 路径会尽量避免把“标量广播”降级到通用慢路径。
+   - 启示：Vulkan 侧应显式识别 broadcast-scalar 形态，直接走轻量专核。
+2. Ollama/ggml Vulkan：
+   - 调度侧强调“形态识别 + 专用 variant”，尤其是标量广播/短向量这类高频小算子。
+   - 启示：不应仅依赖“shape 相等/size==1”判定，需要把 stride-0 broadcast 纳入 native gate。
+3. 迁移结论：
+   - `Subtract` 需要补齐 broadcast-scalar gate，并确保 tensor 元素计数与 `data_size` 一致，避免 broadcast 视图被按逻辑 size 同步。
+
+#### 本轮代码变更
+1. `Subtract` 原生 gate 扩展（`mlx/backend/vulkan/primitives/binary.cpp`）：
+   - `can_use_native_binary_{f32,bf16}_scalar_rhs(...)` 新增 broadcast-scalar 识别：
+     - `b.data_size()==1` 且 `strides` 全 0（stride-0 broadcast view）。
+   - 使 `bfloat16` 的 broadcast 标量减法直接命中 `SUB_BF16_SCALAR`。
+2. 正确性回归修复（同文件）：
+   - `f32` 原生路径限定 `out.size()>1`，避免 0D 标量路径触发此前不稳定行为；
+   - `test_fast_sdpa_decode_array_mask_q1` 回归恢复通过。
+3. Tensor 元素计数修复（`mlx/backend/vulkan/device.cpp`）：
+   - `tensor_element_count(arr)` 从 `max(size,data_size)` 改为：
+     - `arr.data_size()>0 ? arr.data_size() : arr.size()`
+   - 目的：broadcast 视图按真实存储元素计数同步，避免把 `data_size=1` 的视图按逻辑 `size` 处理。
+4. 调试可观测性（`binary.cpp`）：
+   - 新增 `MLX_VK_DEBUG_SUBTRACT_FALLBACK=1` 路径日志，输出 `Subtract` 命中/回退形态（shape/strides/data_size）。
+
+#### 验证结果
+1. 正确性回归：
+   - `pytest -q python/tests/test_fast_sdpa.py::TestFastSDPA::test_fast_sdpa_decode_array_mask_q1` ✅
+   - `python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+2. C++ 全量：
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+3. Subtract 命中变化（Qwen3，`MLX_VK_PROFILE_PRINT_EACH=1` + `MLX_VK_DEBUG_SUBTRACT_FALLBACK=1`）：
+   - 变更前：存在 `Subtract fallback`（`b.shape=[1,151936], strides=[0,0], data_size=1`）。
+   - 变更后：该形态命中 `native_sub_bf16_scalar_rhs`，`Subtract fallback` 归零。
+4. 10-token 生成（实卡 Vulkan，EN）：
+   - `Prompt: 13 tokens, 8.186 / 8.949 tok/s`
+   - `Generation: 10 tokens, 3.177 / 3.176 tok/s`
+   - 峰值显存：`0.347 GB`
+
+#### 当前状态
+- `Subtract` 在 decode 主链路的主要 fallback 已清理，broadcast-scalar 形态可稳定 native 命中。
+- `test_fast_sdpa` 回归问题已修复，C++ 全量保持通过。
+- 新热点已转移到 `ArgReduce` fallback（profile 可见单次大耗时样本）。
+
+#### 下一步（精确）
+1. 进入 D-9.1：实现 decode 高频 `ArgReduce`（至少 `argmax` / `axis=-1` / row-contiguous）native 路径，先消除当前主回退热点。
+2. 保持 Metal/Ollama 对齐策略：先做“高频形态专核 + 严格 gate”，再扩展到更广泛 layout。
+3. 完成 EN/ZH `10/40/80 token` 串行门禁与 `MLX_VK_PROFILE_PRINT_EACH=1` 对照，确认“命中提升=吞吐提升”后再推进下一个热点（`Compiled` fallback）。

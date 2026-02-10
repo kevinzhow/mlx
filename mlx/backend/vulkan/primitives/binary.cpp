@@ -8,12 +8,15 @@
 #include "mlx/backend/vulkan/op_profiler.h"
 #include "mlx/primitives.h"
 #include "mlx/backend/cpu/eval.h"
+#include "mlx/dtype_utils.h"
 #include "mlx/stream.h"
 
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <iostream>
 #include <limits>
+#include <sstream>
 
 namespace mlx::core {
 
@@ -56,12 +59,29 @@ inline bool can_use_native_binary_f32(
     const array& a,
     const array& b,
     const array& out) {
-  return out.size() > 0 &&
+  return out.size() > 1 &&
       a.dtype() == float32 && b.dtype() == float32 && out.dtype() == float32 &&
       a.size() == b.size() && a.size() == out.size() &&
       a.shape() == b.shape() && a.shape() == out.shape() &&
       is_row_contiguous_materialized(a) &&
       is_row_contiguous_materialized(b) && out.flags().row_contiguous;
+}
+
+inline bool can_use_native_binary_f32_scalar_rhs(
+    const array& a,
+    const array& b,
+    const array& out) {
+  const bool rhs_is_scalar =
+      (b.size() == 1 && is_row_contiguous_materialized(b)) ||
+      (b.size() > 1 && b.data_size() == 1 && !b.strides().empty() &&
+       std::all_of(
+           b.strides().begin(),
+           b.strides().end(),
+           [](int64_t stride) { return stride == 0; }));
+  return out.size() > 1 &&
+      a.dtype() == float32 && b.dtype() == float32 && out.dtype() == float32 &&
+      rhs_is_scalar && a.size() == out.size() && a.shape() == out.shape() &&
+      is_row_contiguous_materialized(a) && out.flags().row_contiguous;
 }
 
 inline bool can_use_native_binary_bf16(
@@ -74,6 +94,24 @@ inline bool can_use_native_binary_bf16(
       a.size() == out.size() && a.shape() == b.shape() &&
       a.shape() == out.shape() && is_row_contiguous_materialized(a) &&
       is_row_contiguous_materialized(b) && out.flags().row_contiguous;
+}
+
+inline bool can_use_native_binary_bf16_scalar_rhs(
+    const array& a,
+    const array& b,
+    const array& out) {
+  const bool rhs_is_scalar =
+      (b.size() == 1 && is_row_contiguous_materialized(b)) ||
+      (b.size() > 1 && b.data_size() == 1 && !b.strides().empty() &&
+       std::all_of(
+           b.strides().begin(),
+           b.strides().end(),
+           [](int64_t stride) { return stride == 0; }));
+  return out.size() > 0 &&
+      a.dtype() == bfloat16 && b.dtype() == bfloat16 &&
+      out.dtype() == bfloat16 && rhs_is_scalar &&
+      a.size() == out.size() && a.shape() == out.shape() &&
+      is_row_contiguous_materialized(a) && out.flags().row_contiguous;
 }
 
 inline uint32_t encode_push_constant_u32(uint32_t value) {
@@ -110,6 +148,79 @@ inline bool native_add_bf16_enabled() {
 inline bool native_mul_bf16_enabled() {
   static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_MUL_BF16");
   return enabled;
+}
+
+inline bool native_sub_bf16_enabled() {
+  static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_SUB_BF16");
+  return enabled;
+}
+
+inline bool native_sub_f32_enabled() {
+  static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_SUB_F32");
+  return enabled;
+}
+
+inline bool debug_subtract_fallback_enabled() {
+  const char* env = std::getenv("MLX_VK_DEBUG_SUBTRACT_FALLBACK");
+  if (!env) {
+    return false;
+  }
+  return std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
+      std::strcmp(env, "on") == 0;
+}
+
+inline std::string shape_string(const array& arr) {
+  std::ostringstream os;
+  os << "[";
+  for (size_t i = 0; i < arr.shape().size(); ++i) {
+    if (i > 0) {
+      os << ",";
+    }
+    os << arr.shape()[i];
+  }
+  os << "]";
+  return os.str();
+}
+
+inline std::string strides_string(const array& arr) {
+  std::ostringstream os;
+  os << "[";
+  for (size_t i = 0; i < arr.strides().size(); ++i) {
+    if (i > 0) {
+      os << ",";
+    }
+    os << arr.strides()[i];
+  }
+  os << "]";
+  return os.str();
+}
+
+inline void log_subtract_path(
+    const char* path,
+    const std::vector<array>& inputs,
+    const array& out) {
+  if (!debug_subtract_fallback_enabled() || inputs.size() < 2) {
+    return;
+  }
+  std::cerr << "[VulkanSubtractPath] path=" << path
+            << " a.dtype=" << dtype_to_string(inputs[0].dtype())
+            << " a.shape=" << shape_string(inputs[0])
+            << " a.strides=" << strides_string(inputs[0])
+            << " a.size=" << inputs[0].size()
+            << " a.data_size=" << inputs[0].data_size()
+            << " a.row=" << (inputs[0].flags().row_contiguous ? 1 : 0)
+            << " b.dtype=" << dtype_to_string(inputs[1].dtype())
+            << " b.shape=" << shape_string(inputs[1])
+            << " b.strides=" << strides_string(inputs[1])
+            << " b.size=" << inputs[1].size()
+            << " b.data_size=" << inputs[1].data_size()
+            << " b.row=" << (inputs[1].flags().row_contiguous ? 1 : 0)
+            << " out.dtype=" << dtype_to_string(out.dtype())
+            << " out.shape=" << shape_string(out)
+            << " out.strides=" << strides_string(out)
+            << " out.size=" << out.size()
+            << " out.data_size=" << out.data_size()
+            << " out.row=" << (out.flags().row_contiguous ? 1 : 0) << "\n";
 }
 
 inline bool dispatch_native_binary(
@@ -264,8 +375,80 @@ void Subtract::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   auto s = out.primitive().stream();
-  profile.mark_fallback();
   prepare_inputs_for_cpu_fallback(inputs, s);
+
+  if (native_sub_f32_enabled() &&
+      can_use_native_binary_f32(inputs[0], inputs[1], out) &&
+      out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    const uint32_t n = static_cast<uint32_t>(out.size());
+    if (dispatch_native_binary(
+            s,
+            inputs[0],
+            inputs[1],
+            out,
+            vulkan::KernelRegistry::SUB_F32,
+            n,
+            &profile)) {
+      log_subtract_path("native_sub_f32", inputs, out);
+      return;
+    }
+  }
+
+  if (native_sub_f32_enabled() &&
+      can_use_native_binary_f32_scalar_rhs(inputs[0], inputs[1], out) &&
+      out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    const uint32_t n = static_cast<uint32_t>(out.size());
+    if (dispatch_native_binary(
+            s,
+            inputs[0],
+            inputs[1],
+            out,
+            vulkan::KernelRegistry::SUB_F32_SCALAR,
+            n,
+            &profile)) {
+      log_subtract_path("native_sub_f32_scalar_rhs", inputs, out);
+      return;
+    }
+  }
+
+  if (native_sub_bf16_enabled() &&
+      can_use_native_binary_bf16(inputs[0], inputs[1], out) &&
+      out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    const uint32_t n = static_cast<uint32_t>(out.size());
+    const uint32_t n_words = (n + 1u) / 2u;
+    if (dispatch_native_binary(
+            s,
+            inputs[0],
+            inputs[1],
+            out,
+            vulkan::KernelRegistry::SUB_BF16,
+            n_words,
+            &profile)) {
+      log_subtract_path("native_sub_bf16", inputs, out);
+      return;
+    }
+  }
+
+  if (native_sub_bf16_enabled() &&
+      can_use_native_binary_bf16_scalar_rhs(inputs[0], inputs[1], out) &&
+      out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    const uint32_t n = static_cast<uint32_t>(out.size());
+    const uint32_t n_words = (n + 1u) / 2u;
+    if (dispatch_native_binary(
+            s,
+            inputs[0],
+            inputs[1],
+            out,
+            vulkan::KernelRegistry::SUB_BF16_SCALAR,
+            n_words,
+            &profile)) {
+      log_subtract_path("native_sub_bf16_scalar_rhs", inputs, out);
+      return;
+    }
+  }
+
+  log_subtract_path("fallback", inputs, out);
+  profile.mark_fallback();
   sync_inputs_to_host_if_needed(inputs);
   eval_cpu(inputs, out);
   vulkan::device(Device::gpu).invalidate_tensor(out);
