@@ -247,6 +247,11 @@ inline bool sdpa_stats_enabled() {
   return enabled;
 }
 
+inline bool qmm_stats_enabled() {
+  static const bool enabled = env_flag_default_false("MLX_VK_QMM_STATS");
+  return enabled;
+}
+
 inline uint32_t clamp_len_hint(int64_t len) {
   if (len <= 0) {
     return 0u;
@@ -663,6 +668,142 @@ struct SdpaStatsReporter {
 
 inline SdpaStatsReporter& sdpa_stats_reporter() {
   static SdpaStatsReporter reporter;
+  return reporter;
+}
+
+inline const char* qmm_rows_bucket(uint32_t rows) {
+  if (rows <= 1u) {
+    return "1";
+  }
+  if (rows <= 2u) {
+    return "2";
+  }
+  if (rows <= 4u) {
+    return "3-4";
+  }
+  if (rows <= 8u) {
+    return "5-8";
+  }
+  if (rows <= 16u) {
+    return "9-16";
+  }
+  return "17+";
+}
+
+struct QmmStatsState {
+  std::mutex mtx;
+  uint64_t native_dispatch_success{0};
+  uint64_t native_dispatch_fail{0};
+  uint64_t final_fallbacks{0};
+  std::unordered_map<std::string, uint64_t> native_kernel_counts;
+  std::unordered_map<std::string, uint64_t> native_rows_bucket_counts;
+  std::unordered_map<std::string, uint64_t> fallback_rows_bucket_counts;
+};
+
+inline QmmStatsState& qmm_stats_state() {
+  static QmmStatsState state;
+  return state;
+}
+
+struct QmmStatsReporter;
+inline QmmStatsReporter& qmm_stats_reporter();
+
+inline void qmm_stats_record_native_dispatch_success(
+    uint32_t rows,
+    const char* kernel) {
+  if (!qmm_stats_enabled()) {
+    return;
+  }
+  auto& state = qmm_stats_state();
+  (void)qmm_stats_reporter();
+  const std::string kernel_name =
+      (kernel && kernel[0] != '\0') ? kernel : "unknown";
+  const std::string rows_key =
+      std::string("rows=") + qmm_rows_bucket(rows);
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.native_dispatch_success++;
+  state.native_kernel_counts[kernel_name]++;
+  state.native_rows_bucket_counts[rows_key]++;
+}
+
+inline void qmm_stats_record_native_dispatch_fail(
+    uint32_t rows,
+    const char* kernel) {
+  if (!qmm_stats_enabled()) {
+    return;
+  }
+  auto& state = qmm_stats_state();
+  (void)qmm_stats_reporter();
+  const std::string kernel_name =
+      (kernel && kernel[0] != '\0') ? kernel : "unknown";
+  const std::string rows_key =
+      std::string("rows=") + qmm_rows_bucket(rows);
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.native_dispatch_fail++;
+  state.native_kernel_counts[std::string("fail:") + kernel_name]++;
+  state.fallback_rows_bucket_counts[rows_key]++;
+}
+
+inline void qmm_stats_record_final_fallback(uint32_t rows) {
+  if (!qmm_stats_enabled()) {
+    return;
+  }
+  auto& state = qmm_stats_state();
+  (void)qmm_stats_reporter();
+  const std::string rows_key =
+      std::string("rows=") + qmm_rows_bucket(rows);
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.final_fallbacks++;
+  state.fallback_rows_bucket_counts[rows_key]++;
+}
+
+inline void qmm_stats_dump() {
+  if (!qmm_stats_enabled()) {
+    return;
+  }
+  auto& state = qmm_stats_state();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  if (state.native_dispatch_success == 0 && state.native_dispatch_fail == 0 &&
+      state.final_fallbacks == 0) {
+    return;
+  }
+
+  std::cerr << "[VulkanQMMStats] native_dispatch_success="
+            << state.native_dispatch_success
+            << " native_dispatch_fail=" << state.native_dispatch_fail
+            << " final_fallbacks=" << state.final_fallbacks
+            << " native_kernel_keys=" << state.native_kernel_counts.size()
+            << " native_rows_bucket_keys="
+            << state.native_rows_bucket_counts.size()
+            << " fallback_rows_bucket_keys="
+            << state.fallback_rows_bucket_counts.size()
+            << "\n";
+
+  for (const auto& [key, count] :
+       sort_stats_counts(state.native_kernel_counts)) {
+    std::cerr << "[VulkanQMMStats][NativeKernel] kernel=" << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.native_rows_bucket_counts)) {
+    std::cerr << "[VulkanQMMStats][NativeRowsBucket] " << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.fallback_rows_bucket_counts)) {
+    std::cerr << "[VulkanQMMStats][FallbackRowsBucket] " << key
+              << " count=" << count << "\n";
+  }
+}
+
+struct QmmStatsReporter {
+  ~QmmStatsReporter() {
+    qmm_stats_dump();
+  }
+};
+
+inline QmmStatsReporter& qmm_stats_reporter() {
+  static QmmStatsReporter reporter;
   return reporter;
 }
 
@@ -2049,6 +2190,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto stream = out.primitive().stream();
   prepare_inputs_for_cpu_fallback(inputs, stream);
 
+  uint32_t rows_hint = 0u;
+  if (out.ndim() > 0) {
+    const int64_t n_hint = out.shape(-1);
+    if (n_hint > 0) {
+      rows_hint = static_cast<uint32_t>(
+          out.size() / static_cast<size_t>(n_hint));
+    }
+  }
+  const char* qmm_kernel_for_stats = "none";
+
   if (native_qmm_enabled() && can_use_native_affine_bf16_quantized_matmul(
           inputs, out, group_size_, bits_, transpose_, mode_)) {
     try {
@@ -2093,6 +2244,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                         : (use_m8_kernel
                                ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M8
                                : vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128)));
+      qmm_kernel_for_stats = qmm_kernel;
 
       const std::vector<uint32_t> push_consts{
           encode_push_constant_u32(out_elems),
@@ -2137,13 +2289,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           {groups_x, 1, 1},
           push_consts);
       device.mark_tensor_host_dirty(out, stream.index);
+      qmm_stats_record_native_dispatch_success(rows, qmm_kernel);
       return;
     } catch (const std::exception&) {
+      qmm_stats_record_native_dispatch_fail(rows_hint, qmm_kernel_for_stats);
       // Fall through to CPU fallback.
     }
   }
 
   profile.mark_fallback();
+  qmm_stats_record_final_fallback(rows_hint);
   run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);
 }
 

@@ -127,6 +127,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - `MLX_VK_DEBUG_COMPILED_DETAIL=1`（打印 `Compiled` 子图 name/lib 与输入输出 layout，默认每种子图仅打印一次）
 - `MLX_VK_PROFILE_COMPILED_DETAIL=1`（将 profile 中 `Compiled` 拆分为 `Compiled::<subgraph>`，默认 OFF）
 - `MLX_VK_SDPA_STATS=1` (进程退出时打印 SDPA 命中/回退分布与 `k_len_cap` 占比)
+- `MLX_VK_QMM_STATS=1` (进程退出时打印 QMM native kernel 命中与 rows 桶分布，用于 shape 分桶优化)
 - Native gate toggles for isolation:
   - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1=0|1`

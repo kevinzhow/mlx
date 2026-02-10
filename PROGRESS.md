@@ -89,6 +89,8 @@
     - `MLX_VK_ENABLE_QMM_NATIVE_M2=1`（默认 ON）
     - `MLX_VK_ENABLE_QMM_NATIVE_M4=1`（默认 ON）
     - `MLX_VK_ENABLE_QMM_NATIVE_M8=1`（默认 ON）
+  - 新增 QMM 运行统计：`MLX_VK_QMM_STATS=1`
+    - 进程退出时打印 native kernel 命中计数（`m1/m2/m4/m8/generic`）与 `rows` 桶分布、fallback 桶分布。
   - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h` 同轮完成并构建。
 - 验证：
   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
@@ -96,6 +98,25 @@
   - Qwen3（EN 40-token）维持高位：约 `3.32~3.34 tok/s`（无正确性回归）。
 - 结论：
   - `M=2/4/8` 路径已打通，形状分桶框架成立；下一步进入向量化/子组化分支。
+
+### D-9.5：QMM 命中分布可观测性（已完成）
+- 目标：在继续做 QMM 架构优化前，先拿到真实命中桶，避免“优化了未命中路径”。
+- 变更：
+  - `QuantizedMatmul::eval_gpu` 增加 QMM 统计埋点与退出打印。
+  - 新增环境变量：`MLX_VK_QMM_STATS=1`。
+  - 指标包含：native success/fail、kernel 命中计数、native/fallback 的 rows 桶分布。
+- 观测（Qwen3 EN 40-token，实卡 Vulkan）：
+  - `qmm_affine_bf16_t4_g128_m1`: `8077`
+  - `qmm_affine_bf16_t4_g128`(generic): `191`
+  - rows 桶：`rows=1` 主导，另有 `rows=9-16` 命中 generic。
+- 结论：
+  - 当前工作负载几乎不命中 `M=2/4/8` 桶。
+  - 下一阶段优先级应从 `M=2/4/8` 继续扩展，调整为“`rows=9-16` prefill 热桶专项 + `M=1` 主核进一步向量化”。
+
+### E-9.5a：QMM `M=1` 多累加器展开实验（已回退）
+- 假设：通过多累加器 + 最内层显式展开降低依赖链，提升 decode 吞吐。
+- 实测：Qwen3 EN 40-token 吞吐无稳定正收益（约 `3.32~3.33 tok/s`，未优于基线）。
+- 结论：已回退该实现，保持当前稳定核。
 
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
@@ -112,7 +133,7 @@
 
 ## 下一步（精确执行入口）
 1. 继续 D-9.4：向量化/子组化路线  
-- 在已落地 `M=2/4/8` 的基础上，评估 `uvec4` 载入和子组归约，进一步降低 QMM 指令与访存开销。
+- 基于 `MLX_VK_QMM_STATS=1` 结果，优先做 `rows=9-16` prefill 热桶专核（如 `M=16`），避免继续优化低命中桶。
 
 2. 拆解并减少 `RoPE` 剩余 fallback  
 - 用 `MLX_VK_DEBUG_ROPE_REJECT=1` 聚类 reject 原因，先补命中最高布局桶。
@@ -120,10 +141,13 @@
 3. 清理 `Multiply` 高频 fallback  
 - 继续沿 Metal/Ollama 的“高频小算子专核”路线，先做 decode 高频形态桶。
 
-4. 门禁与评估口径保持一致  
+4. `M=1` 主核向量化第二轮  
+- 在命中主桶明确后，再评估 `uvec4` 载入/子组归约，确保每次优化都作用于主耗时路径。
+
+5. 门禁与评估口径保持一致  
 - 继续用 EN/ZH `10/40/80` 串行压测 + profile 对照，确保“命中提升 = 吞吐提升”。
 
-5. 研究流程约束  
+6. 研究流程约束  
 - 每轮方案分析必须对照 Metal 与 Ollama 技术路径，并将结论与目标回写本文件。
 
 ## 标准验证命令（保留）
