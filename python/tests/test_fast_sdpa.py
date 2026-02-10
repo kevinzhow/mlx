@@ -339,6 +339,38 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 )
                 self.assertTrue(mx.allclose(ref, out, atol=1e-4, rtol=1e-4))
 
+    def test_fast_sdpa_vector_cache_view_strides(self):
+        mx.random.seed(0)
+        B = 1
+        Hq = 16
+        Hkv = 8
+        D = 128
+        V = 128
+        max_kv_len = 256
+        scale = 1.0 / math.sqrt(D)
+
+        q = mx.random.normal(shape=(B, Hq, 1, D)).astype(mx.bfloat16)
+        k_base = mx.random.normal(shape=(B, Hkv, max_kv_len, D)).astype(mx.bfloat16)
+        v_base = mx.random.normal(shape=(B, Hkv, max_kv_len, V)).astype(mx.bfloat16)
+        # Keep k_len within default Vulkan native gate (<= 8) so this test
+        # exercises the decode path without extra env toggles.
+        for k_len in [7, 8]:
+            # Slice from a larger KV cache to preserve cache-view layout
+            # (data_size > size) with non-compact head stride.
+            k = k_base[:, :, :k_len, :]
+            v = v_base[:, :, :k_len, :]
+
+            native_out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+
+            # In current Vulkan path, providing any explicit mask routes SDPA
+            # through fallback, which is a useful correctness baseline.
+            zero_mask = mx.zeros((B, 1, 1, k_len), dtype=mx.bfloat16)
+            fallback_out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask=zero_mask
+            )
+
+            self.assertTrue(mx.allclose(native_out, fallback_out, atol=1e-2, rtol=1e-2))
+
     def test_fast_sdpa_vector(self):
         D = 64
         L = 43

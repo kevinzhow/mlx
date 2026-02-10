@@ -1249,3 +1249,150 @@ python -m unittest discover -v
 1. 在 `k_len_cap=13/16` 下追加更长序列门禁（`Hi`, `max_tokens=20/40`）并统计超时率与输出质量（含 token-level 对比）。
 2. 若稳定，再讨论上调默认 `MLX_VK_SDPA_MAX_K_LEN`；若仍有波动，继续限定默认并优化 split-k 路径。
 3. 继续推进 SDPA v3：`mask/causal` native 覆盖（对齐 Metal vector/full 语义）。
+
+### 2026-02-10 深夜增量（SDPA cache-view 正确性门禁补齐）✅
+
+#### 本轮目标
+- 把 `cache-view (data_size != size)` 的 SDPA decode 正确性固化为回归测试，避免后续改动把该路径悄悄回退。
+
+#### 本轮变更
+1. 新增 Python 回归用例：
+   - 文件：`python/tests/test_fast_sdpa.py`
+   - 新增：`test_fast_sdpa_vector_cache_view_strides`
+   - 用例构造：
+     - `q` 形状 `(1,16,1,128)`（bf16）
+     - `k/v` 先分配 `(1,8,256,128)`，再通过 `mx.as_strided` 构造 cache-view（大 stride）
+     - 覆盖 `k_len in [9, 13]`
+   - 校验方式：
+     - `mask=None` 路径输出 vs `zero mask`（强制 fallback）路径输出
+     - 断言 `allclose(atol=1e-3, rtol=1e-3)`
+
+#### 验证结果
+- 新增单测：
+  - `python -m unittest -v test_fast_sdpa.TestFastSDPA.test_fast_sdpa_vector_cache_view_strides` ✅
+- SDPA 整体回归：
+  - `python -m unittest -v test_fast_sdpa` => `17 passed, 1 skipped` ✅（新增用例已纳入）
+- Qwen3 冒烟（实卡 Vulkan，默认门限）：
+  - `prompt="Hi what is your name", max_tokens=10` ✅（`Generation: 1.612 tok/s`；本次与另一任务并行运行，吞吐偏低）
+  - `prompt="你好啊", max_tokens=10` ✅（`Generation: 1.574 tok/s`；同上并行干扰）
+
+#### 当前状态
+- ✅ `cache-view stride` 路径已有专门回归门禁，后续重构可直接检测 native/fallback 一致性。
+- ✅ SDPA 相关 Python 门禁更新为 `17` 项通过（`1` 项 skip）。
+- ⚠️ 本轮 Qwen 吞吐数值受并行运行影响，仅用于正确性确认，不作为性能基线。
+
+#### 下一步（精确）
+1. 做 token-level 对照：同一 prompt 下比较 `k_len_cap=8` 与 `13/16` 的逐步 logits/argmax 漂移位置。
+2. 若漂移集中在某一阶段（如 split-k 边界），优先在对应 kernel 路径补数值稳定性修复与专项测试。
+3. 完成后再做串行性能复测（40 token），更新新的稳定吞吐基线。
+
+### 2026-02-10 深夜增量（SDPA 真实根因修复：同步最新 SPIR-V 头文件）✅
+
+#### 本轮目标
+- 解决 `k_len_cap=13` 下 token 漂移的真实根因，确认是否来自 shader 实现本身还是构建产物偏差。
+
+#### 本轮结论（根因）
+1. SDPA shader 源码与运行时实际加载的 `spv.h` 不一致：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp` 与 `sdpa_bf16_decode_q1_spv.h` 不一致；
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp` 与 `sdpa_bf16_decode_splitk_stage1_spv.h` 不一致。
+2. 旧 `spv.h` 导致运行时行为异常：
+   - native 输出对 `scale` 变化不敏感（`scale=1.0/0.1/0.01` 输出相同）；
+   - 输出近似退化为 `mean(V)`（Q/K 信息几乎未生效）。
+3. 这解释了此前 `k_len>8` 的质量漂移：并非仅门限策略问题，主要是执行了过期的 SDPA kernel 二进制。
+
+#### 本轮变更
+1. 重新生成并同步 SDPA 相关 SPIR-V 与头文件：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.spv`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_spv.h`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.spv`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1_spv.h`
+2. 重建链路：
+   - `cmake --build build_release_vulkan --target mlx -j`
+   - `CMAKE_ARGS='-DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF -DMLX_BUILD_PYTHON_BINDINGS=ON -DCMAKE_BUILD_TYPE=Release' python3 setup.py build_ext --inplace`
+3. 回归测试补强：
+   - `python/tests/test_fast_sdpa.py::test_fast_sdpa_vector_cache_view_strides` 改为真实 KV cache slice 视图（`k_base[:, :, :k_len, :]`），并把 `k_len` 调整为默认 cap 可命中的 `[7, 8]`；
+   - 数值阈值更新为 `allclose(atol=1e-2, rtol=1e-2)`（该路径当前误差上界稳定在 bf16 量级 `0.0078125`）。
+
+#### 验证结果
+1. native vs fallback（synthetic, `k_len=9`）：
+   - 修复前：`max_abs ~ 1.38`，且 scale 不生效；
+   - 修复后：`max_abs = 0.0078125`，`mean_abs ~ 8.2e-4`，scale 生效。
+2. Qwen token-level 对照（同 prompt）：
+   - `prompt="Hi what is your name", max_tokens=10`：`cap=8` 与 `cap=13` 的 `out_ids` 完全一致；
+   - `prompt="Hi", max_tokens=20`：`cap=8` 与 `cap=13` 的 `out_ids` 完全一致。
+3. 运行时探针（首次 `k_len>=9` 命中）：
+   - `max_abs=0.005615`，`mean_abs=0.000343`，`argmax_out == argmax_ref`。
+4. Python SDPA 回归：
+   - `python -m unittest -v test_fast_sdpa` => `17 passed, 1 skipped`。
+
+#### 当前状态
+- ✅ `k_len>8` 的主要错误来源（过期 SPIR-V 头文件）已修复。
+- ✅ `cap=8` 与 `cap=13` 在当前 Qwen 冒烟与 token-level 对照中已无早期漂移。
+- ⚠️ 当前环境下吞吐较低（约 `0.20 tok/s`），本轮重点是正确性修复，性能结论需在稳定实卡环境下复测。
+
+#### 下一步（精确）
+1. 在实卡权限环境下做串行 `40` token 吞吐基线（默认 cap 与 `cap=13/16`）。
+2. 在确认长序列稳定后，评估上调默认 `MLX_VK_SDPA_MAX_K_LEN`（先 `8 -> 13`，再看 `16`）。
+3. 继续 SDPA v3 主线：`mask/causal` native 覆盖与 Metal 机制对齐。
+
+### 2026-02-10 运行参数复核（不显式设置 VK_ICD/MESA 也可走实卡）✅
+
+#### 本轮目标
+- 验证当前权限状态下，去掉 `VK_ICD_FILENAMES` 和 `MESA_VK_DEVICE_SELECT` 后是否仍能走真实 Radeon Vulkan 设备。
+
+#### 验证结果
+1. 设备检查（仅 `PYTHONPATH=python TARGET_DEVICE=gpu`）：
+   - `default_device = Device(gpu, 0)`
+   - `device_info = {'architecture': 'vulkan', 'device_name': 'Vulkan GPU (Kompute)'}`
+2. `strace` 运行时证据（同样不设置 `VK_ICD_FILENAMES/MESA_VK_DEVICE_SELECT`）：
+   - 命中 `openat(..., "/lib/x86_64-linux-gnu/libvulkan_radeon.so", ...)`
+   - 命中 `openat(..., "/dev/dri/renderD128", O_RDWR|O_CLOEXEC) = 4`
+   - 结论：进程已访问真实 GPU render node，并加载 Radeon Vulkan 驱动。
+3. Qwen 冒烟（无 `VK_ICD_FILENAMES/MESA_VK_DEVICE_SELECT`）：
+   - `prompt="Hi", max_tokens=1` 成功，`exit_code=0`。
+
+#### 当前状态
+- ✅ 当前环境下，**不强制设置** `VK_ICD_FILENAMES` / `MESA_VK_DEVICE_SELECT` 也能走 Vulkan 实卡。
+- ⚠️ 继续显式设置这两个变量时，可能受系统 device-select 层影响导致落到 CPU（需谨慎使用）。
+
+#### 下一步（精确）
+1. 后续性能基线优先使用：`PYTHONPATH=python TARGET_DEVICE=gpu`（不额外强制 `VK_ICD_FILENAMES/MESA_VK_DEVICE_SELECT`）。
+2. 若需要固定某张卡，再做最小化约束并先做一次 `default_device + strace` 快速确认。
+
+### 2026-02-10 实卡速度复测（Qwen3 10-token）✅
+
+#### 本轮目标
+- 在已确认实卡可用的默认路径下，复测 Qwen3 的 10-token 生成速度。
+
+#### 验证命令
+- `timeout 240s env PYTHONPATH=python TARGET_DEVICE=gpu python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi what is your name" --max-tokens 10 --temp 0`
+
+#### 验证结果
+- `Prompt: 13 tokens, 8.181 tokens-per-sec`
+- `Generation: 10 tokens, 3.088 tokens-per-sec`
+- `Peak memory: 0.347 GB`
+
+#### 当前状态
+- ✅ 默认实卡路径下 10-token 速度基线已记录，可作为后续优化对比参考。
+
+### 2026-02-10 实卡 A/B（`cap=8` vs `cap=13`）✅
+
+#### 本轮目标
+- 在同一运行条件下对比 `MLX_VK_SDPA_MAX_K_LEN=8` 与 `13` 的 Qwen3 10-token 速度与输出一致性。
+
+#### 验证命令（串行，避免并行互扰）
+- `timeout 240s env PYTHONPATH=python TARGET_DEVICE=gpu MLX_VK_SDPA_MAX_K_LEN=8 python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi what is your name" --max-tokens 10 --temp 0`
+- `timeout 240s env PYTHONPATH=python TARGET_DEVICE=gpu MLX_VK_SDPA_MAX_K_LEN=13 python3 -m mlx_lm generate --model Qwen/Qwen3-0.6B-MLX-4bit --prompt "Hi what is your name" --max-tokens 10 --temp 0`
+
+#### 验证结果
+- `cap=8`：
+  - `Prompt: 13 tokens, 8.201 tokens-per-sec`
+  - `Generation: 10 tokens, 3.049 tokens-per-sec`
+- `cap=13`：
+  - `Prompt: 13 tokens, 8.436 tokens-per-sec`
+  - `Generation: 10 tokens, 3.154 tokens-per-sec`
+- 文本输出前缀一致：`<think> Okay, the user asked, "Hi ...`
+
+#### 当前状态
+- ✅ `cap=13` 相比 `cap=8` 在本次 10-token 案例中生成速度小幅提升（约 +3.4%）。
+- ✅ 本次 A/B 未观察到输出质量回归（同 prompt 前缀一致）。
