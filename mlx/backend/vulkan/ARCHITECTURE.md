@@ -502,19 +502,20 @@ public:
   - `k/v` 支持两类布局：
     - 4D 密集行主序
     - KV cache-view（`stride[-1]==1`，`batch/head` 维紧邻，`seq` 维可跨大步长，允许 `data_size != size`）
-  - `Q_len=1`
-  - decode 场景支持三类 mask 语义（均限 `Q_len=1`）：
+  - `Q_len` 支持范围：`1..MLX_VK_SDPA_MAX_Q_LEN`（默认 `8`）
+  - decode/vector 场景支持三类 mask 语义：
     - `mask=None`
-    - `mask="causal"`（`Q_len=1` 时与 no-mask 等价并走 native）
-    - `mask_mode="array"`（additive mask；支持 broadcast 到 `[B,Hq,1,K]`）
-  - bool mask 在当前 Vulkan 路径会先转换为 additive mask，再进入 native
+    - `mask="causal"`（`Q_len<=K_len`）
+    - `mask_mode="array"`（additive mask；支持 broadcast 到 `[B,Hq,Q,K]`）
+  - bool mask 在当前 Vulkan 路径仍先转换为 additive mask，再进入 native
   - `sinks` / training 仍走 fallback
+  - `q_len<=MLX_VK_SDPA_MAX_Q_LEN`（默认 `8`，可通过环境变量调节）
   - `k_len<=MLX_VK_SDPA_MAX_K_LEN`（默认 `13`，可通过环境变量调节）
   - `qk_dim<=256`，`v_dim<=256`
 
 ### 10.3 仍走 fallback 的场景
 - `RoPE` 的非连续/非 1D `freqs` 布局
-- `ScaledDotProductAttention` 的未覆盖场景（training、sinks、`Q_len>1`，或 `k_len>MLX_VK_SDPA_MAX_K_LEN`）
+- `ScaledDotProductAttention` 的未覆盖场景（training、sinks、`Q_len>MLX_VK_SDPA_MAX_Q_LEN`，或 `k_len>MLX_VK_SDPA_MAX_K_LEN`）
 
 ### 10.4 SDPA v3 方案（Metal 对齐 + Ollama/ggml Vulkan 参考）
 

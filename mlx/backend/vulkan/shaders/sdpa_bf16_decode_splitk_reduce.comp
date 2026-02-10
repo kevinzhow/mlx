@@ -23,6 +23,7 @@ layout(set = 0, binding = 3) buffer OutBuffer {
 layout(push_constant) uniform PushConstants {
   uint batch_size;
   uint n_q_heads;
+  uint q_len;
   uint v_dim;
   uint split_k;
 } params;
@@ -57,7 +58,7 @@ void main() {
   uint row = gl_WorkGroupID.x;
   uint lane = gl_LocalInvocationID.x;
 
-  uint n_rows = params.batch_size * params.n_q_heads;
+  uint n_rows = params.batch_size * params.n_q_heads * params.q_len;
   if (row >= n_rows || params.v_dim == 0u || params.v_dim > 256u ||
       params.split_k == 0u) {
     return;

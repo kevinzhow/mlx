@@ -440,6 +440,61 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             self.assertTrue(mx.allclose(out_bool, out_add, atol=1e-2, rtol=1e-2))
             self.assertTrue(mx.allclose(out_bool, out_ref, atol=2e-2, rtol=2e-2))
 
+    def test_fast_sdpa_decode_q4_native(self):
+        mx.random.seed(0)
+        B = 1
+        Hq = 16
+        Hkv = 8
+        D = 128
+        Q = 4
+        scale = 1.0 / math.sqrt(D)
+
+        for k_len in [9, 13]:
+            q = mx.random.normal(shape=(B, Hq, Q, D)).astype(mx.bfloat16)
+            k = mx.random.normal(shape=(B, Hkv, k_len, D)).astype(mx.bfloat16)
+            v = mx.random.normal(shape=(B, Hkv, k_len, D)).astype(mx.bfloat16)
+
+            out_causal = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask="causal"
+            )
+            ref_causal = mlx_primitives_sdpa_with_gqa(
+                q.astype(mx.float32),
+                k.astype(mx.float32),
+                v.astype(mx.float32),
+                scale,
+                mask="causal",
+            ).astype(mx.bfloat16)
+            self.assertTrue(
+                mx.allclose(out_causal, ref_causal, atol=2e-2, rtol=2e-2)
+            )
+
+            bool_mask = (
+                mx.random.uniform(shape=(B, 1, Q, k_len), dtype=mx.float32) > 0.25
+            )
+            add_mask = mx.where(
+                bool_mask,
+                mx.zeros(bool_mask.shape, dtype=mx.bfloat16),
+                mx.full(bool_mask.shape, -float("inf"), dtype=mx.bfloat16),
+            )
+            bool_mask_full = mx.broadcast_to(bool_mask, (B, Hq, Q, k_len))
+
+            out_bool = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask=bool_mask
+            )
+            out_add = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask=add_mask
+            )
+            ref_mask = mlx_primitives_sdpa_with_gqa(
+                q.astype(mx.float32),
+                k.astype(mx.float32),
+                v.astype(mx.float32),
+                scale,
+                mask=bool_mask_full,
+            ).astype(mx.bfloat16)
+
+            self.assertTrue(mx.allclose(out_bool, out_add, atol=2e-2, rtol=2e-2))
+            self.assertTrue(mx.allclose(out_bool, ref_mask, atol=2e-2, rtol=2e-2))
+
     def test_fast_sdpa_vector(self):
         D = 64
         L = 43

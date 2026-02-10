@@ -232,6 +232,26 @@ inline uint32_t native_sdpa_max_k_len() {
   return max_k_len;
 }
 
+inline uint32_t native_sdpa_max_q_len() {
+  static const uint32_t max_q_len = []() -> uint32_t {
+    constexpr uint32_t kDefault = 8u;
+    const char* v = std::getenv("MLX_VK_SDPA_MAX_Q_LEN");
+    if (!v || v[0] == '\0') {
+      return kDefault;
+    }
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(v, &end, 10);
+    if (end == v || *end != '\0' || parsed == 0ul) {
+      return kDefault;
+    }
+    if (parsed > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+      return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(parsed);
+  }();
+  return max_q_len;
+}
+
 inline uint32_t parse_env_u32(const char* name, uint32_t default_value) {
   const char* v = std::getenv(name);
   if (!v || v[0] == '\0') {
@@ -833,6 +853,7 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
     uint32_t& batch_size,
     uint32_t& n_q_heads,
     uint32_t& n_kv_heads,
+    uint32_t& q_len,
     uint32_t& k_len,
     uint32_t& qk_dim,
     uint32_t& v_dim,
@@ -843,7 +864,8 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
     uint32_t& mask_mode,
     uint32_t& mask_batch_stride,
     uint32_t& mask_head_stride,
-    uint32_t& mask_seq_stride,
+    uint32_t& mask_q_stride,
+    uint32_t& mask_k_stride,
     const char** reject_reason = nullptr) {
   auto reject = [&](const char* reason) {
     if (reject_reason) {
@@ -891,25 +913,30 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
 
   if (q.shape(0) != k.shape(0) || k.shape(0) != v.shape(0) ||
       q.shape(3) != k.shape(3) || k.shape(1) != v.shape(1) ||
-      k.shape(2) != v.shape(2) || q.shape(2) != 1) {
+      k.shape(2) != v.shape(2)) {
     return reject("shape_contract");
-  }
-  if (do_causal && q.shape(2) != 1) {
-    return reject("causal_q_len");
   }
 
   const int64_t b = q.shape(0);
   const int64_t hq = q.shape(1);
   const int64_t hkv = k.shape(1);
+  const int64_t lq = q.shape(2);
   const int64_t lk = k.shape(2);
   const int64_t dq = q.shape(3);
   const int64_t dv = v.shape(3);
-  if (b <= 0 || hq <= 0 || hkv <= 0 || lk <= 0 || dq <= 0 || dv <= 0 ||
+  if (b <= 0 || hq <= 0 || hkv <= 0 || lq <= 0 || lk <= 0 || dq <= 0 ||
+      dv <= 0 ||
       (hq % hkv) != 0) {
     return reject("dim_nonpositive_or_head_repeat");
   }
+  if (lq > static_cast<int64_t>(native_sdpa_max_q_len())) {
+    return reject("q_len_cap");
+  }
   if (lk > static_cast<int64_t>(native_sdpa_max_k_len())) {
     return reject("k_len_cap");
+  }
+  if (do_causal && lq > lk) {
+    return reject("causal_qk_len");
   }
   if (dq > 256 || dv > 256) {
     return reject("dim_bounds");
@@ -921,6 +948,7 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
   if (b > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
       hq > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
       hkv > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+      lq > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
       lk > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
       dq > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
       dv > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
@@ -928,7 +956,7 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
   }
 
   if (out.ndim() != 4 || out.shape(0) != b || out.shape(1) != hq ||
-      out.shape(2) != 1 || out.shape(3) != dv) {
+      out.shape(2) != lq || out.shape(3) != dv) {
     return reject("output_shape");
   }
 
@@ -995,7 +1023,7 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
       return reject("mask_dtype");
     }
     if (mask->ndim() != 4 || mask->shape(0) != b || mask->shape(1) != hq ||
-        mask->shape(2) != 1 || mask->shape(3) != lk) {
+        mask->shape(2) != lq || mask->shape(3) != lk) {
       return reject("mask_shape");
     }
     const auto& st = mask->strides();
@@ -1004,12 +1032,14 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
     }
     if (st[0] > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         st[1] > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+        st[2] > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         st[3] > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
       return reject_layout("mask_layout", *mask);
     }
     const uint64_t max_elem_u64 =
         (static_cast<uint64_t>(b) - 1u) * static_cast<uint64_t>(st[0]) +
         (static_cast<uint64_t>(hq) - 1u) * static_cast<uint64_t>(st[1]) +
+        (static_cast<uint64_t>(lq) - 1u) * static_cast<uint64_t>(st[2]) +
         (static_cast<uint64_t>(lk) - 1u) * static_cast<uint64_t>(st[3]);
     if (mask->data_size() == 0 ||
         max_elem_u64 >= static_cast<uint64_t>(mask->data_size())) {
@@ -1018,23 +1048,27 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
     mask_mode = 1u;
     mask_batch_stride = static_cast<uint32_t>(st[0]);
     mask_head_stride = static_cast<uint32_t>(st[1]);
-    mask_seq_stride = static_cast<uint32_t>(st[3]);
+    mask_q_stride = static_cast<uint32_t>(st[2]);
+    mask_k_stride = static_cast<uint32_t>(st[3]);
   } else {
     mask_mode = 0u;
     mask_batch_stride = 0u;
     mask_head_stride = 0u;
-    mask_seq_stride = 0u;
+    mask_q_stride = 0u;
+    mask_k_stride = 0u;
   }
 
   batch_size = static_cast<uint32_t>(b);
   n_q_heads = static_cast<uint32_t>(hq);
   n_kv_heads = static_cast<uint32_t>(hkv);
+  q_len = static_cast<uint32_t>(lq);
   k_len = static_cast<uint32_t>(lk);
   qk_dim = static_cast<uint32_t>(dq);
   v_dim = static_cast<uint32_t>(dv);
   if (sdpa_debug_hit_enabled()) {
     std::cerr << "[VulkanSDPAHit] "
-              << "k_len=" << k_len << " qk_dim=" << qk_dim
+              << "q_len=" << q_len << " k_len=" << k_len
+              << " qk_dim=" << qk_dim
               << " v_dim=" << v_dim
               << " q.shape=" << shape_string(q)
               << " q.strides=" << strides_string(q)
@@ -1420,17 +1454,20 @@ bool fast::ScaledDotProductAttention::use_fallback(
 
   if (q.shape(0) != k.shape(0) || k.shape(0) != v.shape(0) ||
       q.shape(3) != k.shape(3) || k.shape(1) != v.shape(1) ||
-      k.shape(2) != v.shape(2) || q.shape(2) != 1) {
+      k.shape(2) != v.shape(2)) {
     return reject("shape_contract");
   }
-  if (do_causal && q.shape(2) != 1) {
-    return reject("causal_q_len");
+  if (q.shape(2) <= 0 || q.shape(2) > static_cast<int64_t>(native_sdpa_max_q_len())) {
+    return reject("q_len_cap");
   }
   if (k.shape(1) <= 0 || (q.shape(1) % k.shape(1)) != 0) {
     return reject("head_repeat");
   }
   if (k.shape(2) <= 0) {
     return reject("k_len_nonpositive");
+  }
+  if (do_causal && q.shape(2) > k.shape(2)) {
+    return reject("causal_qk_len");
   }
   if (k.shape(2) > static_cast<int64_t>(native_sdpa_max_k_len())) {
     return reject("k_len_cap");
@@ -1677,6 +1714,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
   uint32_t batch_size = 0;
   uint32_t n_q_heads = 0;
   uint32_t n_kv_heads = 0;
+  uint32_t q_len = 0;
   uint32_t k_len = 0;
   uint32_t qk_dim = 0;
   uint32_t v_dim = 0;
@@ -1687,13 +1725,15 @@ void fast::ScaledDotProductAttention::eval_gpu(
   uint32_t mask_mode = 0;
   uint32_t mask_batch_stride = 0;
   uint32_t mask_head_stride = 0;
-  uint32_t mask_seq_stride = 0;
+  uint32_t mask_q_stride = 0;
+  uint32_t mask_k_stride = 0;
   const char* native_reject_reason = nullptr;
   auto dispatch_native_decode = [&](
                                     const std::vector<array>& native_inputs,
                                     uint32_t batch_size_local,
                                     uint32_t n_q_heads_local,
                                     uint32_t n_kv_heads_local,
+                                    uint32_t q_len_local,
                                     uint32_t k_len_local,
                                     uint32_t qk_dim_local,
                                     uint32_t v_dim_local,
@@ -1704,7 +1744,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
                                     uint32_t mask_mode_local,
                                     uint32_t mask_batch_stride_local,
                                     uint32_t mask_head_stride_local,
-                                    uint32_t mask_seq_stride_local,
+                                    uint32_t mask_q_stride_local,
+                                    uint32_t mask_k_stride_local,
                                     uint32_t split_k_local) -> bool {
     try {
       auto& out = outputs[0];
@@ -1746,7 +1787,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
 
       const uint64_t n_rows_u64 =
           static_cast<uint64_t>(batch_size_local) *
-          static_cast<uint64_t>(n_q_heads_local);
+          static_cast<uint64_t>(n_q_heads_local) *
+          static_cast<uint64_t>(q_len_local);
       if (n_rows_u64 == 0u ||
           n_rows_u64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
         throw std::runtime_error("[Vulkan SDPA] row shape overflow.");
@@ -1757,6 +1799,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
             encode_push_constant_u32(batch_size_local),
             encode_push_constant_u32(n_q_heads_local),
             encode_push_constant_u32(n_kv_heads_local),
+            encode_push_constant_u32(q_len_local),
             encode_push_constant_u32(k_len_local),
             encode_push_constant_u32(qk_dim_local),
             encode_push_constant_u32(v_dim_local),
@@ -1767,7 +1810,9 @@ void fast::ScaledDotProductAttention::eval_gpu(
             encode_push_constant_u32(mask_mode_local),
             encode_push_constant_u32(mask_batch_stride_local),
             encode_push_constant_u32(mask_head_stride_local),
-            encode_push_constant_u32(mask_seq_stride_local),
+            encode_push_constant_u32(mask_q_stride_local),
+            encode_push_constant_u32(mask_k_stride_local),
+            encode_push_constant_u32(do_causal_ ? 1u : 0u),
             encode_push_constant_f32(scale_)};
 
         encoder.record_algo_dispatch(
@@ -1803,6 +1848,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
             encode_push_constant_u32(batch_size_local),
             encode_push_constant_u32(n_q_heads_local),
             encode_push_constant_u32(n_kv_heads_local),
+            encode_push_constant_u32(q_len_local),
             encode_push_constant_u32(k_len_local),
             encode_push_constant_u32(qk_dim_local),
             encode_push_constant_u32(v_dim_local),
@@ -1813,7 +1859,9 @@ void fast::ScaledDotProductAttention::eval_gpu(
             encode_push_constant_u32(mask_mode_local),
             encode_push_constant_u32(mask_batch_stride_local),
             encode_push_constant_u32(mask_head_stride_local),
-            encode_push_constant_u32(mask_seq_stride_local),
+            encode_push_constant_u32(mask_q_stride_local),
+            encode_push_constant_u32(mask_k_stride_local),
+            encode_push_constant_u32(do_causal_ ? 1u : 0u),
             encode_push_constant_u32(split_k_local),
             encode_push_constant_f32(scale_)};
 
@@ -1832,6 +1880,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
         const std::vector<uint32_t> reduce_push_consts{
             encode_push_constant_u32(batch_size_local),
             encode_push_constant_u32(n_q_heads_local),
+            encode_push_constant_u32(q_len_local),
             encode_push_constant_u32(v_dim_local),
             encode_push_constant_u32(split_k_local)};
 
@@ -1847,6 +1896,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
       if (sdpa_debug_reject_enabled() ||
           env_flag_default_false("MLX_VK_DEBUG_SDPA_ERROR")) {
         std::cerr << "[VulkanSDPAError] native path failed: " << e.what()
+                  << " q_len=" << q_len_local
                   << " split_k=" << split_k_local << " k_len=" << k_len_local
                   << " qk_dim=" << qk_dim_local << " v_dim=" << v_dim_local
                   << " k_head_stride=" << k_head_stride_local
@@ -1856,7 +1906,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
                   << " mask_mode=" << mask_mode_local
                   << " mask_batch_stride=" << mask_batch_stride_local
                   << " mask_head_stride=" << mask_head_stride_local
-                  << " mask_seq_stride=" << mask_seq_stride_local
+                  << " mask_q_stride=" << mask_q_stride_local
+                  << " mask_k_stride=" << mask_k_stride_local
                   << "\n";
       }
       return false;
@@ -1872,6 +1923,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
           batch_size,
           n_q_heads,
           n_kv_heads,
+          q_len,
           k_len,
           qk_dim,
           v_dim,
@@ -1882,7 +1934,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
           mask_mode,
           mask_batch_stride,
           mask_head_stride,
-          mask_seq_stride,
+          mask_q_stride,
+          mask_k_stride,
           &native_reject_reason)) {
     const uint32_t split_k = select_sdpa_split_k(k_len);
     if (dispatch_native_decode(
@@ -1890,6 +1943,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
             batch_size,
             n_q_heads,
             n_kv_heads,
+            q_len,
             k_len,
             qk_dim,
             v_dim,
@@ -1900,7 +1954,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
             mask_mode,
             mask_batch_stride,
             mask_head_stride,
-            mask_seq_stride,
+            mask_q_stride,
+            mask_k_stride,
             split_k)) {
       return;
     }
@@ -1946,6 +2001,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
       uint32_t packed_batch = 0;
       uint32_t packed_q_heads = 0;
       uint32_t packed_kv_heads = 0;
+      uint32_t packed_q_len = 0;
       uint32_t packed_k_len = 0;
       uint32_t packed_qk_dim = 0;
       uint32_t packed_v_dim = 0;
@@ -1956,7 +2012,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
       uint32_t packed_mask_mode = 0;
       uint32_t packed_mask_batch_stride = 0;
       uint32_t packed_mask_head_stride = 0;
-      uint32_t packed_mask_seq_stride = 0;
+      uint32_t packed_mask_q_stride = 0;
+      uint32_t packed_mask_k_stride = 0;
       const char* packed_reject_reason = nullptr;
       if (can_use_native_sdpa_bf16_decode_q1(
               packed_inputs,
@@ -1967,6 +2024,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
               packed_batch,
               packed_q_heads,
               packed_kv_heads,
+              packed_q_len,
               packed_k_len,
               packed_qk_dim,
               packed_v_dim,
@@ -1977,7 +2035,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
               packed_mask_mode,
               packed_mask_batch_stride,
               packed_mask_head_stride,
-              packed_mask_seq_stride,
+              packed_mask_q_stride,
+              packed_mask_k_stride,
               &packed_reject_reason)) {
         const uint32_t packed_split_k = select_sdpa_split_k(packed_k_len);
         if (dispatch_native_decode(
@@ -1985,6 +2044,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
                 packed_batch,
                 packed_q_heads,
                 packed_kv_heads,
+                packed_q_len,
                 packed_k_len,
                 packed_qk_dim,
                 packed_v_dim,
@@ -1995,7 +2055,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
                 packed_mask_mode,
                 packed_mask_batch_stride,
                 packed_mask_head_stride,
-                packed_mask_seq_stride,
+                packed_mask_q_stride,
+                packed_mask_k_stride,
                 packed_split_k)) {
           return;
         }

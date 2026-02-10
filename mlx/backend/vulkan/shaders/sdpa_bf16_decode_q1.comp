@@ -1,6 +1,6 @@
 #version 450
 
-// One workgroup computes one (batch, query-head) decode row.
+// One workgroup computes one (batch, query-head, query-pos) row.
 // Threads cooperate on QK dot-products and V accumulation.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -28,6 +28,7 @@ layout(push_constant) uniform PushConstants {
   uint batch_size;
   uint n_q_heads;
   uint n_kv_heads;
+  uint q_len;
   uint k_len;
   uint qk_dim;
   uint v_dim;
@@ -38,11 +39,14 @@ layout(push_constant) uniform PushConstants {
   uint mask_mode;
   uint mask_batch_stride;
   uint mask_head_stride;
-  uint mask_seq_stride;
+  uint mask_q_stride;
+  uint mask_k_stride;
+  uint causal;
   float scale;
 } params;
 
 const uint WG_SIZE = 64u;
+const float NEG_LARGE = -3.4028235e38;
 
 shared float dot_partial[WG_SIZE];
 shared float max_logit_sh;
@@ -82,11 +86,34 @@ float load_v(uint elem_idx) {
   return bf16_to_f32(bf16_bits);
 }
 
-float load_mask(uint elem_idx) {
+float load_mask_add(uint elem_idx) {
   uint packed = mask_buffer.words[elem_idx >> 1u];
   uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
                                            : (packed >> 16u);
   return bf16_to_f32(bf16_bits);
+}
+
+float masked_logit(float dot, uint q_pos, uint k_pos, uint mask_base, out bool valid) {
+  valid = true;
+  float logit = dot * params.scale;
+
+  if (params.causal != 0u) {
+    int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
+    if (int(k_pos) > causal_limit) {
+      valid = false;
+      return 0.0;
+    }
+  }
+
+  if (params.mask_mode == 1u) {
+    logit += load_mask_add(mask_base + k_pos * params.mask_k_stride);
+    if (isinf(logit) && logit < 0.0) {
+      valid = false;
+      return 0.0;
+    }
+  }
+
+  return logit;
 }
 
 void store_out(uint elem_idx, float value) {
@@ -102,27 +129,31 @@ void store_out(uint elem_idx, float value) {
 }
 
 void main() {
-  uint bh = gl_WorkGroupID.x;
+  uint rowq = gl_WorkGroupID.x;
   uint lane = gl_LocalInvocationID.x;
-  uint total = params.batch_size * params.n_q_heads;
-  if (bh >= total || params.v_dim == 0u || params.v_dim > 256u ||
-      params.qk_dim == 0u || params.k_len == 0u || params.n_kv_heads == 0u) {
+  uint total = params.batch_size * params.n_q_heads * params.q_len;
+  if (rowq >= total || params.q_len == 0u || params.v_dim == 0u ||
+      params.v_dim > 256u || params.qk_dim == 0u || params.k_len == 0u ||
+      params.n_kv_heads == 0u) {
     return;
   }
 
+  uint bh = rowq / params.q_len;
+  uint q_pos = rowq % params.q_len;
   uint b = bh / params.n_q_heads;
   uint hq = bh % params.n_q_heads;
   uint repeats = params.n_q_heads / params.n_kv_heads;
   uint hkv = hq / repeats;
 
-  uint q_base = ((b * params.n_q_heads) + hq) * params.qk_dim;
+  uint q_base = (((b * params.n_q_heads) + hq) * params.q_len + q_pos) * params.qk_dim;
   uint kvh = (b * params.n_kv_heads) + hkv;
   uint k_head_base = kvh * params.k_head_stride;
   uint v_head_base = kvh * params.v_head_stride;
-  uint mask_base = b * params.mask_batch_stride + hq * params.mask_head_stride;
+  uint mask_base = b * params.mask_batch_stride +
+      hq * params.mask_head_stride + q_pos * params.mask_q_stride;
 
   if (lane == 0u) {
-    max_logit_sh = -3.4028235e38;
+    max_logit_sh = NEG_LARGE;
     denom_sh = 0.0;
   }
   for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
@@ -148,11 +179,11 @@ void main() {
     }
 
     if (lane == 0u) {
-      float dot = dot_partial[0] * params.scale;
-      if (params.mask_mode != 0u) {
-        dot += load_mask(mask_base + t * params.mask_seq_stride);
+      bool valid = false;
+      float logit = masked_logit(dot_partial[0], q_pos, t, mask_base, valid);
+      if (valid) {
+        max_logit_sh = max(max_logit_sh, logit);
       }
-      max_logit_sh = max(max_logit_sh, dot);
     }
     barrier();
   }
@@ -175,12 +206,14 @@ void main() {
     }
 
     if (lane == 0u) {
-      float dot = dot_partial[0] * params.scale;
-      if (params.mask_mode != 0u) {
-        dot += load_mask(mask_base + t * params.mask_seq_stride);
+      bool valid = false;
+      float logit = masked_logit(dot_partial[0], q_pos, t, mask_base, valid);
+      if (!valid || max_logit_sh <= -3.0e38) {
+        weight_sh = 0.0;
+      } else {
+        weight_sh = exp(logit - max_logit_sh);
+        denom_sh += weight_sh;
       }
-      weight_sh = exp(dot - max_logit_sh);
-      denom_sh += weight_sh;
     }
     barrier();
 
@@ -194,7 +227,7 @@ void main() {
 
   if (lane == 0u) {
     float inv_denom = (denom_sh > 0.0) ? (1.0 / denom_sh) : 0.0;
-    uint out_base = ((b * params.n_q_heads) + hq) * params.v_dim;
+    uint out_base = (((b * params.n_q_heads) + hq) * params.q_len + q_pos) * params.v_dim;
     for (uint dv = 0u; dv < params.v_dim; ++dv) {
       store_out(out_base + dv, accum_sh[dv] * inv_denom);
     }

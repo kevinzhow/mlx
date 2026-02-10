@@ -1589,3 +1589,61 @@ python -m unittest discover -v
 1. 继续 SDPA v3：补 `Q_len>1`（小 `Q_len` 向量路径）native，实现与 Metal vector 路径更一致的命中覆盖。
 2. 评估 bool mask kernel 原生支持（移除 `supports_bool_mask=false` 过渡层），减少额外前处理。
 3. 在 `max_tokens=40` 与更长上下文上复测吞吐，确认 array-mask 接入后无长序列回退。
+
+### 2026-02-10 主线推进（SDPA `Q_len<=8` native 覆盖）✅
+
+#### 本轮目标
+- 将 SDPA native 覆盖从 `Q_len=1` 扩展到小 `Q_len` 向量场景（默认 `<=8`），对齐 Metal vector 路径方向并提升真实命中率。
+
+#### 本轮变更
+1. 扩展 SDPA gate（Vulkan）到 `Q_len<=8`：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - 新增 `MLX_VK_SDPA_MAX_Q_LEN`（默认 `8`）；
+   - `use_fallback` / `can_use_native_sdpa_bf16_decode_q1` 从仅 `Q_len=1` 改为 `Q_len<=cap`；
+   - `causal` 增加 `Q_len<=K_len` 约束（超界继续 fallback）。
+2. SDPA push constants 与 dispatch 扩展：
+   - `eval_gpu` 原生 dispatch 增加 `q_len`、`causal`、`mask_q_stride`、`mask_k_stride`；
+   - split-k reduce push constants 增加 `q_len`，行数改为 `B * Hq * Q_len`。
+3. SDPA shader 升级为小 `Q_len` 向量路径：
+   - 文件：
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp`
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp`
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_reduce.comp`
+   - 由 `(B,Hq)` 行升级为 `(B,Hq,Q)` 行；
+   - 增加 causal 判定与 `mask_q_stride/mask_k_stride` 读取；
+   - 全屏蔽场景保持 `denom=0 -> 输出0` 的稳定处理。
+4. 回归增强：
+   - 文件：`python/tests/test_fast_sdpa.py`
+   - 新增 `test_fast_sdpa_decode_q4_native`，覆盖：
+     - `Q_len=4` + causal
+     - `Q_len=4` + bool/additive array mask（与 reference 对照）。
+5. 同步 SPIR-V 头文件：
+   - `sdpa_bf16_decode_q1_spv.h`
+   - `sdpa_bf16_decode_splitk_stage1_spv.h`
+   - `sdpa_bf16_decode_splitk_reduce_spv.h`
+
+#### 验证结果
+1. 构建：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+2. Python SDPA 回归：
+   - 新增用例通过：`test_fast_sdpa_decode_q4_native` ✅
+   - 子集：`test_fast_sdpa_decode_q4_native / test_fast_sdpa_decode_array_mask_q1 / test_fast_sdpa_decode_causal_q1` ✅
+   - 全量：`python -m unittest -v test_fast_sdpa` => `20 passed, 1 skipped` ✅
+3. native 命中确认：
+   - `MLX_VK_DEBUG_SDPA_HIT=1` 下，`q_len=4, k_len=13` 的 `causal` 与 `array-mask` 均出现命中日志 ✅
+4. C++ 回归：
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+5. Qwen 冒烟（默认实卡路径）：
+   - 串行 EN 10-token：`Generation: 3.107 tok/s`（输出正常）✅
+   - 并行 EN+ZH 双进程会降到 `~2.61 tok/s`（已标记为并行干扰，不作基线）。
+
+#### 当前状态
+- ✅ SDPA native 覆盖已从 `Q_len=1` 扩到 `Q_len<=8`（默认），并支持 `causal` 与 additive array mask。
+- ✅ `Q=4` 场景已具备单测门禁与实测命中证据。
+- ⚠️ bool mask 仍通过 fast 层前置转换为 additive 后进入 native（`supports_bool_mask=false`）。
+
+#### 下一步（精确）
+1. 继续 SDPA v3：评估 `MLX_VK_SDPA_MAX_Q_LEN` 从 `8` 上调到 `16` 的正确性与吞吐收益（先 `Q=8/16` 合成与 Qwen prefill A/B）。
+2. 推进 bool mask kernel 原生支持，去掉前置转换开销。
+3. 结合 split-k 参数再做长上下文（`max_tokens=40` 及以上）串行吞吐复测，更新稳定基线。
