@@ -1,6 +1,6 @@
 # PROGRESS
 
-更新日期: 2026-02-09
+更新日期: 2026-02-10
 
 ## 目标
 
@@ -1802,3 +1802,159 @@ python -m unittest discover -v
 1. 继续 `K cap` 分段扩展实验（`20/24`），并与 split-k 参数联动，寻找长上下文收益拐点。
 2. 在 `max_tokens=40/80` 与更长 prompt 下建立固定门禁，持续跟踪 `k_len_cap` 回退比例。
 3. 启动 prefill/full（`Q_len>13`）native 路径设计，优先补齐与 Metal 对齐的高收益覆盖空洞。
+
+### 2026-02-10 主线推进（`K cap` 分段 + split-k 联动评估）✅
+
+#### 本轮目标
+- 在不破坏稳定基线的前提下，评估 `K cap=20/24` 与 `split-k` 参数联动是否带来可落地收益。
+
+#### 验证方法
+1. 网格扫描（EN, `prompt="Hi"`, `max_tokens=40`）：
+   - `K cap`: `16 / 20 / 24`
+   - `MLX_VK_SDPA_SPLITK_MIN_K_LEN`: `16 / 24 / 32`
+2. 候选复测（中英文长序列 + 英文短序列）：
+   - 基线：`k16s16`
+   - 候选：`k20s32`
+   - 长序列：`max_tokens=40`
+   - 短序列：`max_tokens=3`（EN 多次）
+
+#### 验证结果
+1. 网格扫描（EN 40-token）：
+   - `k16s16`: `2.392 tok/s`
+   - `k16s24`: `2.400 tok/s`
+   - `k16s32`: `2.404 tok/s`
+   - `k20s16`: `2.391 tok/s`
+   - `k20s24`: `2.403 tok/s`
+   - `k20s32`: `2.419 tok/s`
+   - `k24s16`: `2.399 tok/s`
+   - `k24s24`: `2.395 tok/s`
+   - `k24s32`: `2.415 tok/s`
+2. 候选复测（`k16s16` vs `k20s32`）：
+   - EN 40-token：
+     - `k16s16`: `2.397 tok/s`
+     - `k20s32`: `2.395 tok/s`
+   - ZH 40-token：
+     - `k16s16`: `2.405 tok/s`
+     - `k20s32`: `2.385 tok/s`
+   - EN 3-token（3 runs）：
+     - `k16s16`: `4.188 / 4.455 / 4.301 tok/s`
+     - `k20s32`: `4.700 / 4.683 / 4.281 tok/s`
+
+#### 结论
+- ✅ `k20s32` 在短输出场景（3-token）有可见收益。
+- ⚠️ 在长序列（40-token）中英场景下未形成稳定正收益，ZH 略有回退风险。
+- ✅ 当前保持默认 `k16s16` 更稳妥；`k20s32` 适合作为可选调参而非立即默认。
+
+#### 当前状态
+- 默认仍为：
+  - `MLX_VK_SDPA_MAX_K_LEN=16`
+  - `MLX_VK_SDPA_SPLITK_MIN_K_LEN=16`
+- 已建立 `K cap` 与 split-k 的首轮联动数据，可用于下一轮自动策略设计。
+
+#### 下一步（精确）
+1. 引入按阶段/长度分段的 split-k 策略（prefill/decode 区分），避免“一刀切”默认。
+2. 增加 `max_tokens=80` 长序列基线，对 `k16s16` 与候选策略做稳定性复测。
+3. 启动 prefill/full（`Q_len > 13`）native 路径设计，减少当前主要回退来源。
+
+### 2026-02-10 主线推进（staged split-k 落地 + 长序列复测）✅
+
+#### 本轮目标
+- 落地按阶段 split-k 策略（decode/prefill 区分），并完成回归与 `max_tokens=80` 长序列对照。
+
+#### 本轮变更
+1. staged split-k 策略落地：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - 新增按阶段参数组：
+     - decode（`q_len==1`）：`MLX_VK_SDPA_SPLITK_*_DECODE`
+     - prefill（`q_len>1`）：`MLX_VK_SDPA_SPLITK_*_PREFILL`
+   - 保持全局兼容：
+     - `MLX_VK_SDPA_SPLITK_MIN_K_LEN`
+     - `MLX_VK_SDPA_SPLITK_TARGET_CHUNK`
+     - `MLX_VK_SDPA_SPLITK_MAX_PARTS`
+     - `MLX_VK_SDPA_SPLIT_K`
+2. split-k 选择器扩展：
+   - `select_sdpa_split_k(k_len, q_len)` 根据阶段选择配置；
+   - packed SDPA 路径同步使用 `packed_q_len` 做阶段判定。
+3. 可观测性增强：
+   - 新增 `MLX_VK_DEBUG_SDPA_SPLITK=1` 日志；
+   - 文档同步：`AGENTS.md` 增加 staged split-k 参数与 debug 开关说明。
+
+#### 验证结果
+1. 构建：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `CMAKE_ARGS='-DMLX_BUILD_VULKAN=ON -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF -DCMAKE_BUILD_TYPE=Release' python3 setup.py build_ext --inplace` ✅
+2. 回归：
+   - `python/tests`: `python3 -m unittest -v test_fast_sdpa` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+3. staged 生效证据（Qwen debug）：
+   - prefill：`stage=prefill q_len=12 k_len=12 min_k_len=32 split_k=1`
+   - decode：`stage=decode q_len=1 k_len=16 min_k_len=16 split_k=2`
+   - 说明 decode/prefill 已走不同 split-k 策略。
+4. `max_tokens=80` 对照（Qwen，实卡 Vulkan）：
+   - staged 默认：
+     - EN：`Generation: 80 tokens, 2.018 tok/s`
+     - ZH：`Generation: 80 tokens, 1.991 tok/s`
+   - one-size（prefill 覆盖为 `16/16/8`）：
+     - EN：`Generation: 80 tokens, 1.976 tok/s`
+     - ZH：`Generation: 80 tokens, 1.995 tok/s`
+   - 结论：staged 与 one-size 总体同量级；EN 有小幅正向，ZH 基本持平，无明显回退。
+5. Qwen 10-token 正确性冒烟（默认 staged）：
+   - ZH（`prompt="你好啊"`）：`Generation: 10 tokens, 3.178 tok/s`，输出前缀：`<think> 好的，用户发来了一条消息`
+   - EN（`prompt="Hi what is your name"`）：`Generation: 10 tokens, 3.115 tok/s`，输出前缀：`<think> Okay, the user asked, "Hi`
+   - 未见乱码回归。✅
+
+#### 当前状态
+- ✅ staged split-k 已落地并通过 C++/Python 全量相关回归。
+- ✅ 长序列吞吐在当前负载下稳定，无新增负回归。
+- ⚠️ 主要覆盖瓶颈仍在 `Q_len > 13` / 更长 prefill 的 native 覆盖不足。
+
+#### 下一步（精确）
+1. 设计并验证 prefill native 扩展（优先 `Q_len 14~16` 的安全放量门禁）。
+2. 在 `max_tokens=80` 基线上加入 `K cap` 与 split-k 联动门禁，持续追踪 `k_len_cap` 回退比。
+3. 补充 SDPA 命中分布统计（decode/prefill、q_len/k_len 桶）用于下一轮参数自动化收敛。
+
+### 2026-02-10 主线推进（`Q cap` 默认上调到 `16`）✅
+
+#### 本轮目标
+- 将 prefill native 覆盖从 `Q_len<=13` 安全扩到 `<=16`，与当前默认 `K cap=16` 对齐。
+
+#### 本轮变更
+1. 默认 `Q cap` 上调：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `native_sdpa_max_q_len()` 默认值：`13 -> 16`（仍可用 `MLX_VK_SDPA_MAX_Q_LEN` 覆盖）。
+2. 其余 gate/回退行为不变：
+   - `K cap` 仍为 `16`；
+   - `k_len > 16` 继续回退（`k_len_cap`）。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+   - `python -m unittest -v test_fast_sdpa` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. 命中率证据（`prompt="Hi what is your name and role"`，Prompt=15 tokens）：
+   - 变更前（`Q cap=13`）：
+     - `q_len_cap_rejects=28`
+     - `prefill_hits_q14=0`
+     - `Generation (3 tokens)=4.285 tok/s`
+   - 变更后（默认 `Q cap=16`）：
+     - `q_len_cap_rejects=0`
+     - `prefill_hits_q14=27`
+     - `Generation (3 tokens)=4.377 tok/s`
+3. A/B（同一 prompt，10-token）：
+   - `MLX_VK_SDPA_MAX_Q_LEN=13`：`Generation: 3.049 tok/s`
+   - `MLX_VK_SDPA_MAX_Q_LEN=16`：`Generation: 3.060 tok/s`
+   - 结论：在该 `q_len=14` prefill 负载下，命中率显著提升，吞吐小幅正向，无回退迹象。
+4. Qwen 标准正确性复测（默认 `Q cap=16`）：
+   - ZH `prompt="你好啊"`：`Generation: 10 tokens, 3.105 tok/s`，输出前缀正常。
+   - EN `prompt="Hi what is your name"`：`Generation: 10 tokens, 3.060 tok/s`，输出前缀正常。
+
+#### 当前状态
+- ✅ `Q cap=16` + `K cap=16` 已对齐，`q_len=14~16` prefill 不再被默认门禁挡回 CPU。
+- ✅ staged split-k + qcap 扩展在当前回归集与 Qwen 冒烟下稳定。
+- ⚠️ 长上下文 decode 的主要回退来源已更集中于 `k_len > 16`（`k_len_cap`）。
+
+#### 下一步（精确）
+1. 继续 `K cap` 小步扩展（`20/24`）并做 `max_tokens=80` 稳定性门禁，评估长上下文真实收益。
+2. 增加 SDPA 命中分布统计（按 `q_len/k_len` 分桶），量化 `k_len_cap` 回退占比。
+3. 设计 prefill/full 更大 `Q_len`（`>16`）native 路径门禁，逐步收敛至更接近 Metal 覆盖。

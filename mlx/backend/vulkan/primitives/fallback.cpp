@@ -236,7 +236,7 @@ inline uint32_t native_sdpa_max_q_len() {
   static const uint32_t max_q_len = []() -> uint32_t {
     // Keep Q cap aligned with current default K cap so causal prefill up to
     // the native K window can hit Vulkan SDPA without extra env toggles.
-    constexpr uint32_t kDefault = 13u;
+    constexpr uint32_t kDefault = 16u;
     const char* v = std::getenv("MLX_VK_SDPA_MAX_Q_LEN");
     if (!v || v[0] == '\0') {
       return kDefault;
@@ -293,20 +293,131 @@ inline uint32_t native_sdpa_splitk_forced_parts() {
   return value;
 }
 
-inline uint32_t select_sdpa_split_k(uint32_t k_len) {
-  const uint32_t forced = native_sdpa_splitk_forced_parts();
-  if (forced > 0u) {
-    return std::min<uint32_t>(k_len, std::max<uint32_t>(1u, forced));
+inline bool sdpa_splitk_debug_enabled() {
+  static const bool enabled = env_flag_default_false("MLX_VK_DEBUG_SDPA_SPLITK");
+  return enabled;
+}
+
+inline uint32_t native_sdpa_splitk_min_k_len_decode() {
+  static const uint32_t value = std::max<uint32_t>(
+      2u,
+      parse_env_u32(
+          "MLX_VK_SDPA_SPLITK_MIN_K_LEN_DECODE", native_sdpa_splitk_min_k_len()));
+  return value;
+}
+
+inline uint32_t native_sdpa_splitk_target_chunk_decode() {
+  static const uint32_t value = std::max<uint32_t>(
+      1u,
+      parse_env_u32(
+          "MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE",
+          native_sdpa_splitk_target_chunk()));
+  return value;
+}
+
+inline uint32_t native_sdpa_splitk_max_parts_decode() {
+  static const uint32_t value = std::max<uint32_t>(
+      1u,
+      parse_env_u32(
+          "MLX_VK_SDPA_SPLITK_MAX_PARTS_DECODE", native_sdpa_splitk_max_parts()));
+  return value;
+}
+
+inline uint32_t native_sdpa_splitk_min_k_len_prefill() {
+  static const uint32_t value = std::max<uint32_t>(
+      2u,
+      parse_env_u32(
+          "MLX_VK_SDPA_SPLITK_MIN_K_LEN_PREFILL",
+          std::max<uint32_t>(32u, native_sdpa_splitk_min_k_len())));
+  return value;
+}
+
+inline uint32_t native_sdpa_splitk_target_chunk_prefill() {
+  static const uint32_t value = std::max<uint32_t>(
+      1u,
+      parse_env_u32(
+          "MLX_VK_SDPA_SPLITK_TARGET_CHUNK_PREFILL",
+          std::max<uint32_t>(32u, native_sdpa_splitk_target_chunk())));
+  return value;
+}
+
+inline uint32_t native_sdpa_splitk_max_parts_prefill() {
+  static const uint32_t value = std::max<uint32_t>(
+      1u,
+      parse_env_u32(
+          "MLX_VK_SDPA_SPLITK_MAX_PARTS_PREFILL",
+          std::min<uint32_t>(4u, native_sdpa_splitk_max_parts())));
+  return value;
+}
+
+struct SdpaSplitKConfig {
+  uint32_t min_k_len;
+  uint32_t target_chunk;
+  uint32_t max_parts;
+  const char* stage;
+};
+
+inline SdpaSplitKConfig select_sdpa_splitk_config(uint32_t q_len) {
+  if (q_len <= 1u) {
+    return {
+        native_sdpa_splitk_min_k_len_decode(),
+        native_sdpa_splitk_target_chunk_decode(),
+        native_sdpa_splitk_max_parts_decode(),
+        "decode"};
   }
-  if (k_len < native_sdpa_splitk_min_k_len()) {
+  return {
+      native_sdpa_splitk_min_k_len_prefill(),
+      native_sdpa_splitk_target_chunk_prefill(),
+      native_sdpa_splitk_max_parts_prefill(),
+      "prefill"};
+}
+
+inline uint32_t select_sdpa_split_k(uint32_t k_len, uint32_t q_len) {
+  const uint32_t forced = native_sdpa_splitk_forced_parts();
+  const auto cfg = select_sdpa_splitk_config(q_len);
+  uint32_t split_k = 1u;
+  if (forced > 0u) {
+    split_k = std::min<uint32_t>(k_len, std::max<uint32_t>(1u, forced));
+    if (sdpa_splitk_debug_enabled()) {
+      std::cerr << "[VulkanSDPASplitK] "
+                << "stage=" << cfg.stage
+                << " q_len=" << q_len
+                << " k_len=" << k_len
+                << " forced=" << forced
+                << " split_k=" << split_k
+                << "\n";
+    }
+    return split_k;
+  }
+  if (k_len < cfg.min_k_len) {
+    if (sdpa_splitk_debug_enabled()) {
+      std::cerr << "[VulkanSDPASplitK] "
+                << "stage=" << cfg.stage
+                << " q_len=" << q_len
+                << " k_len=" << k_len
+                << " min_k_len=" << cfg.min_k_len
+                << " split_k=1"
+                << "\n";
+    }
     return 1u;
   }
-  const uint32_t target_chunk = native_sdpa_splitk_target_chunk();
-  uint32_t split_k = (k_len + target_chunk - 1u) / target_chunk;
+  split_k = (k_len + cfg.target_chunk - 1u) / cfg.target_chunk;
   split_k = std::max<uint32_t>(2u, split_k);
-  split_k = std::min<uint32_t>(split_k, native_sdpa_splitk_max_parts());
+  split_k = std::min<uint32_t>(split_k, cfg.max_parts);
   split_k = std::min<uint32_t>(split_k, k_len);
-  return std::max<uint32_t>(1u, split_k);
+  split_k = std::max<uint32_t>(1u, split_k);
+  if (sdpa_splitk_debug_enabled()) {
+    std::cerr << "[VulkanSDPASplitK] "
+              << "stage=" << cfg.stage
+              << " q_len=" << q_len
+              << " k_len=" << k_len
+              << " min_k_len=" << cfg.min_k_len
+              << " target_chunk=" << cfg.target_chunk
+              << " max_parts=" << cfg.max_parts
+              << " split_k=" << split_k
+              << "\n";
+  }
+  return split_k;
 }
 
 inline bool native_rope_hs_transposed_enabled() {
@@ -1964,7 +2075,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
           mask_q_stride,
           mask_k_stride,
           &native_reject_reason)) {
-    const uint32_t split_k = select_sdpa_split_k(k_len);
+    const uint32_t split_k = select_sdpa_split_k(k_len, q_len);
     if (dispatch_native_decode(
             native_inputs,
             batch_size,
@@ -2066,7 +2177,8 @@ void fast::ScaledDotProductAttention::eval_gpu(
               packed_mask_q_stride,
               packed_mask_k_stride,
               &packed_reject_reason)) {
-        const uint32_t packed_split_k = select_sdpa_split_k(packed_k_len);
+        const uint32_t packed_split_k =
+            select_sdpa_split_k(packed_k_len, packed_q_len);
         if (dispatch_native_decode(
                 packed_native_inputs,
                 packed_batch,

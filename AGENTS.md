@@ -95,6 +95,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 
 - `MLX_VK_DEBUG_ROPE_REJECT=1`
 - `MLX_VK_DEBUG_SDPA_REJECT=1`
+- `MLX_VK_DEBUG_SDPA_SPLITK=1`
 - Native gate toggles for isolation:
   - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=0|1`
@@ -102,6 +103,10 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_SDPA_NATIVE=0|1`
   - `MLX_VK_ENABLE_ADD_BF16=0|1`
   - `MLX_VK_ENABLE_MUL_BF16=0|1`
+- Split-k tuning knobs:
+  - Global (existing): `MLX_VK_SDPA_SPLITK_MIN_K_LEN`, `MLX_VK_SDPA_SPLITK_TARGET_CHUNK`, `MLX_VK_SDPA_SPLITK_MAX_PARTS`, `MLX_VK_SDPA_SPLIT_K`
+  - Decode overrides (`q_len==1`): `MLX_VK_SDPA_SPLITK_MIN_K_LEN_DECODE`, `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE`, `MLX_VK_SDPA_SPLITK_MAX_PARTS_DECODE`
+  - Prefill overrides (`q_len>1`): `MLX_VK_SDPA_SPLITK_MIN_K_LEN_PREFILL`, `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_PREFILL`, `MLX_VK_SDPA_SPLITK_MAX_PARTS_PREFILL`
 
 ## Definition of Done
 
