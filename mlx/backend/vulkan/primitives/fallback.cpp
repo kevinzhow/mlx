@@ -272,6 +272,12 @@ inline bool native_sdpa_decode_d128_k32_kernel_enabled() {
   return enabled;
 }
 
+inline bool native_sdpa_decode_d128_k64_kernel_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_SDPA_DECODE_D128_K64");
+  return enabled;
+}
+
 inline std::string sdpa_bucket_key(uint32_t q_len, uint32_t k_len) {
   return std::string("stage=") + sdpa_stage_name(q_len) + " q=" +
       sdpa_len_bucket(q_len) + " k=" + sdpa_len_bucket(k_len);
@@ -290,6 +296,10 @@ inline const char* sdpa_native_direct_kernel(
     if (k_len <= 32u && mask_mode == 0u &&
         native_sdpa_decode_d128_k32_kernel_enabled()) {
       return mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1_D128_K32;
+    }
+    if (k_len <= 64u && mask_mode == 0u &&
+        native_sdpa_decode_d128_k64_kernel_enabled()) {
+      return mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1_D128_K64;
     }
     return mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1_D128;
   }
@@ -610,11 +620,16 @@ inline uint32_t parse_env_u32(const char* name, uint32_t default_value) {
   return static_cast<uint32_t>(parsed);
 }
 
+inline bool sdpa_len_within_cap_or_unlimited(uint32_t len, uint32_t cap) {
+  // cap==0 is treated as unlimited for staged rollouts.
+  return cap == 0u || len <= cap;
+}
+
 inline uint32_t native_sdpa_max_k_len_decode() {
   static const uint32_t value = []() -> uint32_t {
-    // Keep conservative default until staged K-cap A/B is stable across
-    // both 40/80-token workloads; use *_DECODE env for controlled rollouts.
-    constexpr uint32_t kDecodeDefault = 16u;
+    // Decode path uses split-k and specialized kernels; keep default unbounded
+    // and let dispatch heuristics decide partitioning. Use *_DECODE env to cap.
+    constexpr uint32_t kDecodeDefault = 0u; // 0 => unlimited
     if (env_has_nonempty_value("MLX_VK_SDPA_MAX_K_LEN")) {
       return parse_env_u32(
           "MLX_VK_SDPA_MAX_K_LEN_DECODE", native_sdpa_max_k_len_global());
@@ -677,7 +692,7 @@ inline uint32_t native_sdpa_splitk_target_chunk_decode() {
       1u,
       parse_env_u32(
           "MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE",
-          native_sdpa_splitk_target_chunk()));
+          std::max<uint32_t>(32u, native_sdpa_splitk_target_chunk())));
   return value;
 }
 
@@ -1529,8 +1544,9 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
                    static_cast<uint32_t>(lq)))) {
     return reject("q_len_cap");
   }
-  if (lk > static_cast<int64_t>(native_sdpa_max_k_len_for_q_len(
-                   static_cast<uint32_t>(lq)))) {
+  if (!sdpa_len_within_cap_or_unlimited(
+          static_cast<uint32_t>(lk),
+          native_sdpa_max_k_len_for_q_len(static_cast<uint32_t>(lq)))) {
     return reject("k_len_cap");
   }
   if (do_causal && lq > lk) {
@@ -2074,9 +2090,9 @@ bool fast::ScaledDotProductAttention::use_fallback(
   if (do_causal && q.shape(2) > k.shape(2)) {
     return reject("causal_qk_len");
   }
-  if (k.shape(2) >
-      static_cast<int64_t>(native_sdpa_max_k_len_for_q_len(
-          static_cast<uint32_t>(q.shape(2))))) {
+  if (!sdpa_len_within_cap_or_unlimited(
+          static_cast<uint32_t>(k.shape(2)),
+          native_sdpa_max_k_len_for_q_len(static_cast<uint32_t>(q.shape(2))))) {
     return reject("k_len_cap");
   }
   if (q.shape(3) <= 0 || q.shape(3) > 256 ||

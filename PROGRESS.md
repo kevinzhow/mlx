@@ -2888,3 +2888,149 @@ python -m unittest discover -v
 1. 用同样方法补齐 EN/ZH + 40/80-token 的多次均值（至少 3 次）评估 `cap24` 是否可作为默认候选。
 2. 若 `cap24` 在多样本下稳定胜出，再推进 `cap32`（优先 split-k/规约效率）。
 3. 并行准备 subgroup 规约原型，目标覆盖 `k=33~64`，继续压缩 `k_len_cap` 回退占比。
+
+### 2026-02-10 主线推进（阶段 D-4：cap24 多样本门禁 + 默认值提升）✅
+
+#### 本轮目标
+- 按计划完成 EN/ZH + 40/80-token 的 3 次均值门禁，判断 `cap24` 是否可升为默认 decode cap。
+
+#### 多样本门禁结果（3 次均值，实卡，`MLX_VK_SDPA_STATS=1`）
+- 原始 CSV：`/tmp/sdpa_cap_bench_20260210_212709.csv`
+
+1. `cap16`（对照）
+   - `en|40`: `avg_tps=2.380`, `avg_k_len_cap=1036`, `avg_native_hits=139`
+   - `en|80`: `avg_tps=1.971`, `avg_k_len_cap=2156`, `avg_native_hits=139`
+   - `zh|40`: `avg_tps=2.396`, `avg_k_len_cap=952`, `avg_native_hits=223`
+   - `zh|80`: `avg_tps=1.965`, `avg_k_len_cap=2072`, `avg_native_hits=223`
+2. `cap24`（候选）
+   - `en|40`: `avg_tps=2.404`, `avg_k_len_cap=812`, `avg_native_hits=363`
+   - `en|80`: `avg_tps=1.990`, `avg_k_len_cap=1932`, `avg_native_hits=363`
+   - `zh|40`: `avg_tps=2.409`, `avg_k_len_cap=728`, `avg_native_hits=447`
+   - `zh|80`: `avg_tps=1.981`, `avg_k_len_cap=1848`, `avg_native_hits=447`
+
+#### 结论
+- ✅ `cap24` 在四个维度（EN/ZH × 40/80）均值都优于 `cap16`。
+- ✅ `k_len_cap` 回退显著下降，native 命中显著上升，且收益不再是单点噪声。
+
+#### 本轮代码变更（默认策略升级）
+1. `mlx/backend/vulkan/primitives/fallback.cpp`
+   - `native_sdpa_max_k_len_decode()` 默认值：`16 -> 24`
+   - `native_sdpa_splitk_target_chunk_decode()` 默认值提升到至少 `32`（与 `cap24` 路径实测匹配）
+2. 兼容性
+   - 仍可通过环境变量覆盖：
+     - `MLX_VK_SDPA_MAX_K_LEN_DECODE`
+     - `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE`
+
+#### 验证结果（默认值升级后）
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 80-token 默认参数（不再手动设 cap/chunk）：
+   - EN: `tps=1.984`, `k_len_cap=1932`, `native_hits=363`
+   - ZH: `tps=1.998`, `k_len_cap=1848`, `native_hits=447`
+   - 说明默认行为已切换到 `cap24` 档位并保持稳定。
+
+#### 当前状态
+- decode 默认策略从“保守 cap16”升级到“验证通过的 cap24 + chunk32”。
+- 主瓶颈继续向 `k>32` 区间集中（`k=33~64` 与 `65+` 仍是主要回退来源）。
+
+#### 下一步（精确）
+1. 进入 D-5：针对 `k=33~64` 设计 decode 专项核（优先 `qk=v=128`），目标是把 `k_len_cap` 主峰继续下压。
+2. 在实验开关下推进 `cap32` A/B，并与 D-5 专项核联动验证是否能稳定超过当前默认。
+3. 若 D-5 收益不足，再推进 subgroup 规约原型并对标 Metal 的 reduction/dispatch 组织方式。
+
+### 2026-02-10 主线推进（阶段 D-5：decode d128 k<=64 专项核，部分完成）🟡
+
+#### 本轮目标
+- 在 D-3 (`k<=32`) 基础上继续覆盖 `k=33~64` 区间，进一步压缩 `k_len_cap` 回退。
+
+#### 已完成变更（代码已在工作区，尚未提交）
+1. 新增 decode 专用 shader：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_d128_k64.comp`
+   - 约束：`qk_dim==128 && v_dim==128 && k_len<=64 && mask_mode=none`
+   - 设计：two-pass softmax + bf16 pair 向量化读写。
+2. Vulkan 注册链路已接通：
+   - `mlx/backend/vulkan/CMakeLists.txt` 添加 `sdpa_bf16_decode_q1_d128_k64.comp`
+   - `mlx/backend/vulkan/kernel_registry.{h,cpp}` 新增
+     `SDPA_BF16_DECODE_Q1_D128_K64`
+   - 新增 `sdpa_bf16_decode_q1_d128_k64.spv/.h`
+3. 调度门禁已接通：
+   - `mlx/backend/vulkan/primitives/fallback.cpp` 新增 gate
+     `MLX_VK_ENABLE_SDPA_DECODE_D128_K64`（默认 ON）
+   - decode direct 路径在 `k_len<=64 && mask_mode=0` 时优先选 `K64` kernel（在 `K32` 之后）。
+
+#### 已完成验证（初步）
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+2. Qwen EN 80-token 初步 A/B（`cap64`、单次）：
+   - `k64=ON`: `2.019 tok/s`, `k_len_cap=812`, `native_hits=1483`
+   - `k64=OFF`: `2.006 tok/s`, `k_len_cap=812`, `native_hits=1483`
+
+#### 当前状态
+- `k<=64` 专项核已集成并通过基础回归，但多样本门禁尚未完成，仍属“部分完成”。
+
+#### 下一步（精确）
+1. 继续补齐 `k64` 的 EN/ZH + 40/80-token 多次均值门禁（至少 3 次），确认在 `cap64` 下是否稳定正收益。
+2. 与 decode 无硬 cap / 动态 split-k 主线联动验证，优先消除 `k_len_cap` 退化原因。
+3. 若稳定收益成立，更新默认策略与文档（`AGENTS.md` / `PROGRESS.md`）。
+
+### 2026-02-10 主线推进（阶段 D-6：decode 去硬 cap + 动态 split-k 直通）✅
+
+#### 本轮目标
+- 将 decode 从“固定 `k_len` 上限”切换为“默认无限制 + 动态 split-k 分块”，对齐 Metal/Ollama 的全 K 轴技术路线。
+
+#### 本轮代码变更
+1. `mlx/backend/vulkan/primitives/fallback.cpp`
+   - 新增 `sdpa_len_within_cap_or_unlimited(len, cap)`，约定 `cap==0` 表示 unlimited。
+   - `native_sdpa_max_k_len_decode()` 默认值改为 `0`（不再默认限制 decode `k_len`）。
+   - 在 native gate 与 `use_fallback` 两处 `k_len_cap` 判定统一改为 `cap==0` 不拦截。
+2. 保持兼容：
+   - `MLX_VK_SDPA_MAX_K_LEN_DECODE` 仍可显式设置非零值恢复上限策略。
+   - prefill cap 行为不变（本轮只放开 decode）。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen3 实卡 80-token（默认参数，无手动 cap）：
+   - EN `Hi what is your name`：`Generation: 2.009 tok/s`
+   - ZH `你好啊`：`Generation: 2.030 tok/s`
+3. SDPA 命中统计（两组均一致）：
+   - `use_fallback_rejects=0`
+   - `native_gate_rejects=0`
+   - `final_fallbacks=0`
+   - `native_hits=2295`
+   - 命中 bucket 已覆盖 decode `k=65+`（不再出现 `k_len_cap` 拦截）。
+4. Qwen3 10-token 正确性复核：
+   - EN：`Generation: 10 tokens, 2.573 tok/s`，输出前缀正常。
+   - ZH：`Generation: 10 tokens, 2.625 tok/s`，输出前缀正常。
+
+#### 结论
+- ✅ decode 主路径已从“硬 cap 策略”切换到“无硬 cap + 动态 split-k”，并在实卡模型推理中确认 `k_len_cap` 回退清零。
+- ✅ correctness/稳定性门禁无回归。
+- ⚠️ 当前吞吐提升有限（约 `~2.0 tok/s` 量级），下一瓶颈已转移到 `k=65+` 区间 native kernel 算效，而不是命中率。
+
+#### 下一步（精确）
+1. 在 decode `k=65+` 路径推进 subgroup/reduction 优化，优先降低 split-k stage1/reduce 开销。
+2. 补齐 EN/ZH + 40/80-token 的 3 次均值门禁，对比 “cap24 旧默认” 与 “decode-unlimited 新默认” 的稳定收益。
+3. 在保持 decode 无硬 cap 的前提下，评估是否同步放宽 prefill cap（先实验开关，再默认）。
+
+### 2026-02-10 执行约定（方案分析基线）
+
+#### 约定
+1. 后续每次技术方案设计与问题分析，必须同时对照：
+   - `mlx/backend/metal/*`（Metal 实现与调度机制）
+   - Ollama/ggml Vulkan 实现（尤其 attention/split-k/dispatch 组织）
+2. 每次分析后，必须在 `PROGRESS.md` 同轮记录：
+   - 分析结论（学到的机制差异、可迁移点、不可迁移点）
+   - 本轮目标（要验证/要落地的具体改动）
+   - 验证结果（通过/失败与下一步）
+
+#### 目的
+- 保证 Vulkan 主线持续对齐“MLX Metal 机制 + Ollama Vulkan 工程经验”，避免只做局部微优化而偏离最终路线。

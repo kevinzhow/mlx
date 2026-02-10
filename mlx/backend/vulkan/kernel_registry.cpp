@@ -21,6 +21,7 @@
 #include "shaders/sdpa_bf16_decode_q1_spv.h"
 #include "shaders/sdpa_bf16_decode_q1_d128_spv.h"
 #include "shaders/sdpa_bf16_decode_q1_d128_k32_spv.h"
+#include "shaders/sdpa_bf16_decode_q1_d128_k64_spv.h"
 #include "shaders/sdpa_bf16_decode_splitk_stage1_spv.h"
 #include "shaders/sdpa_bf16_decode_splitk_reduce_spv.h"
 #include "shaders/sdpa_bf16_prefill_q1_spv.h"
@@ -48,6 +49,8 @@ const char* KernelRegistry::SDPA_BF16_DECODE_Q1 = "sdpa_bf16_decode_q1";
 const char* KernelRegistry::SDPA_BF16_DECODE_Q1_D128 = "sdpa_bf16_decode_q1_d128";
 const char* KernelRegistry::SDPA_BF16_DECODE_Q1_D128_K32 =
     "sdpa_bf16_decode_q1_d128_k32";
+const char* KernelRegistry::SDPA_BF16_DECODE_Q1_D128_K64 =
+    "sdpa_bf16_decode_q1_d128_k64";
 const char* KernelRegistry::SDPA_BF16_DECODE_SPLITK_STAGE1 =
     "sdpa_bf16_decode_splitk_stage1";
 const char* KernelRegistry::SDPA_BF16_DECODE_SPLITK_REDUCE =
@@ -142,6 +145,14 @@ void KernelRegistry::register_builtin_shaders() {
       sdpa_bf16_decode_q1_d128_k32_spv,
       sdpa_bf16_decode_q1_d128_k32_spv_len);
   shaders_[SDPA_BF16_DECODE_Q1_D128_K32] = std::move(sdpa_d128_k32_spirv);
+
+  std::vector<uint32_t> sdpa_d128_k64_spirv(
+      (sdpa_bf16_decode_q1_d128_k64_spv_len + 3) / 4);
+  std::memcpy(
+      sdpa_d128_k64_spirv.data(),
+      sdpa_bf16_decode_q1_d128_k64_spv,
+      sdpa_bf16_decode_q1_d128_k64_spv_len);
+  shaders_[SDPA_BF16_DECODE_Q1_D128_K64] = std::move(sdpa_d128_k64_spirv);
 
   std::vector<uint32_t> sdpa_prefill_spirv((sdpa_bf16_prefill_q1_spv_len + 3) / 4);
   std::memcpy(

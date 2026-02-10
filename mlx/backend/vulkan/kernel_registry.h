@@ -64,6 +64,7 @@ class KernelRegistry {
   static const char* SDPA_BF16_DECODE_Q1;
   static const char* SDPA_BF16_DECODE_Q1_D128;
   static const char* SDPA_BF16_DECODE_Q1_D128_K32;
+  static const char* SDPA_BF16_DECODE_Q1_D128_K64;
   static const char* SDPA_BF16_DECODE_SPLITK_STAGE1;
   static const char* SDPA_BF16_DECODE_SPLITK_REDUCE;
   static const char* SDPA_BF16_PREFILL_Q1;
