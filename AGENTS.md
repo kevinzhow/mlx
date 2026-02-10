@@ -47,6 +47,16 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - Every fallback path must include a short TODO and remain stream-safe and correct.
 - Replace fallback paths incrementally with Vulkan implementations.
 
+## Optimization Workflow Rule (Mandatory)
+
+- Always do hit analysis first, then optimize.
+- For Vulkan decode/prefill hotspots, use runtime stats/profile first (for example `MLX_VK_QMM_STATS=1`, `MLX_VK_SDPA_STATS=1`) to identify the dominant buckets/shapes.
+- Do not prioritize low-hit paths before dominant-hit paths are addressed.
+- Every optimization change must include:
+  - before/after hit distribution
+  - before/after throughput on standard serial Qwen3 runs
+  - explicit rollback note if no measurable gain
+
 ## Priority Order
 
 1. Fix build/link/runtime contract blockers.
@@ -89,6 +99,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - Default native gates expected on current mainline:
   - `MLX_VK_ENABLE_QMM_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1=1` (default ON, decode `rows==1` 专核路径)
+  - `MLX_VK_ENABLE_QMM_NATIVE_M16=1` (default ON, prefill `9<=rows<=16` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M2=1` (default ON, small-batch `rows==2` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M4=1` (default ON, small-batch `rows==4` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M8=1` (default ON, small-batch `rows==8` 专核路径)
@@ -131,6 +142,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - Native gate toggles for isolation:
   - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1=0|1`
+  - `MLX_VK_ENABLE_QMM_NATIVE_M16=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M2=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M4=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M8=0|1`

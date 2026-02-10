@@ -67,6 +67,7 @@ class KernelRegistry {
   static const char* LOGSUMEXP_BF16_ROW1;
   static const char* QMM_AFFINE_BF16_T4_G128;
   static const char* QMM_AFFINE_BF16_T4_G128_M1;
+  static const char* QMM_AFFINE_BF16_T4_G128_M16;
   static const char* QMM_AFFINE_BF16_T4_G128_M2;
   static const char* QMM_AFFINE_BF16_T4_G128_M4;
   static const char* QMM_AFFINE_BF16_T4_G128_M8;

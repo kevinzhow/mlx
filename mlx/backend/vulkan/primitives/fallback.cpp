@@ -818,6 +818,12 @@ inline bool native_qmm_m1_enabled() {
   return enabled;
 }
 
+inline bool native_qmm_m16_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_QMM_NATIVE_M16");
+  return enabled;
+}
+
 inline bool native_qmm_m2_enabled() {
   static const bool enabled =
       env_flag_default_true("MLX_VK_ENABLE_QMM_NATIVE_M2");
@@ -2228,6 +2234,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           static_cast<uint32_t>(inputs[1].shape(-1));
       const uint32_t out_words = (out_elems + 1u) / 2u;
       const bool use_m1_kernel = native_qmm_m1_enabled() && (rows == 1u);
+      const bool use_m16_kernel =
+          native_qmm_m16_enabled() && (rows > 8u) && (rows <= 16u);
       const bool use_m2_kernel = native_qmm_m2_enabled() && (rows == 2u);
       const bool use_m4_kernel = native_qmm_m4_enabled() && (rows == 4u);
       const bool use_m8_kernel = native_qmm_m8_enabled() && (rows == 8u);
@@ -2237,13 +2245,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       const char* qmm_kernel =
           use_m1_kernel
           ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1
-          : (use_m2_kernel
+          : (use_m16_kernel
+                 ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M16
+                 : (use_m2_kernel
                  ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M2
                  : (use_m4_kernel
                         ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M4
                         : (use_m8_kernel
                                ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M8
-                               : vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128)));
+                               : vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128))));
       qmm_kernel_for_stats = qmm_kernel;
 
       const std::vector<uint32_t> push_consts{
