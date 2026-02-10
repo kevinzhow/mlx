@@ -260,13 +260,39 @@ inline const char* sdpa_native_path_name(SdpaNativePathKind path_kind) {
   return path_kind == SdpaNativePathKind::Decode ? "decode" : "prefill";
 }
 
+inline bool native_sdpa_decode_d128_kernel_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_SDPA_DECODE_D128");
+  return enabled;
+}
+
+inline bool native_sdpa_decode_d128_k32_kernel_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_SDPA_DECODE_D128_K32");
+  return enabled;
+}
+
 inline std::string sdpa_bucket_key(uint32_t q_len, uint32_t k_len) {
   return std::string("stage=") + sdpa_stage_name(q_len) + " q=" +
       sdpa_len_bucket(q_len) + " k=" + sdpa_len_bucket(k_len);
 }
 
 inline const char* sdpa_native_direct_kernel(
-    SdpaNativePathKind path_kind) {
+    SdpaNativePathKind path_kind,
+    uint32_t qk_dim,
+    uint32_t v_dim,
+    uint32_t k_len,
+    uint32_t mask_mode,
+    uint32_t split_k) {
+  if (path_kind == SdpaNativePathKind::Decode && split_k <= 1u &&
+      qk_dim == 128u && v_dim == 128u &&
+      native_sdpa_decode_d128_kernel_enabled()) {
+    if (k_len <= 32u && mask_mode == 0u &&
+        native_sdpa_decode_d128_k32_kernel_enabled()) {
+      return mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1_D128_K32;
+    }
+    return mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1_D128;
+  }
   return path_kind == SdpaNativePathKind::Decode
       ? mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1
       : mlx::core::vulkan::KernelRegistry::SDPA_BF16_PREFILL_Q1;
@@ -2396,7 +2422,13 @@ void fast::ScaledDotProductAttention::eval_gpu(
             encode_push_constant_f32(scale_)};
 
         encoder.record_algo_dispatch(
-            sdpa_native_direct_kernel(path_kind),
+            sdpa_native_direct_kernel(
+                path_kind,
+                qk_dim_local,
+                v_dim_local,
+                k_len_local,
+                mask_mode_local,
+                split_k_local),
             {q_tensor, k_tensor, v_tensor, out_tensor, mask_tensor},
             {n_rows, 1, 1},
             push_consts);

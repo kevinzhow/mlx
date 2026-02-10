@@ -2763,3 +2763,128 @@ python -m unittest discover -v
 1. 针对 decode `k=17~32` 做内核级优化（优先减少每 token 的全局访存与指数/归约开销，评估 subgroup 规约版本）。
 2. 先在实验开关下验证该区间是否能跑赢 fallback，再考虑把 `cap=24/32` 纳入默认。
 3. 继续沿用 `MLX_VK_SDPA_STATS=1` + 40/80-token 串行门禁，确保“命中提升=吞吐提升”。
+
+### 2026-02-10 主线推进（阶段 D-2：decode d128 特化 + fast-exp）✅
+
+#### 本轮目标
+- 在不放宽默认 cap 的前提下，优先提升 decode native kernel 单位算效，覆盖 Qwen 常见 `qk_dim=128,v_dim=128` 与 softmax 指数热点。
+
+#### 本轮变更
+1. d128 decode 直连特化 kernel
+   - 新增 `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_d128.comp`（`qk_dim==128 && v_dim==128` 专用）。
+   - 新增并接入 `sdpa_bf16_decode_q1_d128.spv/.h`。
+   - `KernelRegistry` 增加 `SDPA_BF16_DECODE_Q1_D128` 常量与注册。
+   - `fallback.cpp` direct kernel 选择增加 d128 分支（decode 且 `split_k<=1` 时优先）。
+   - 新增 gate：`MLX_VK_ENABLE_SDPA_DECODE_D128`（默认开启）。
+2. SDPA 指数热点替换
+   - decode/prefill 的 direct、splitk-stage1、splitk-reduce 将 `exp(x)` 替换为 `exp2(LOG2_E*x)`。
+3. decode V 累加访存优化
+   - `sdpa_bf16_decode_q1.comp` 与 `sdpa_bf16_decode_splitk_stage1.comp` 引入按 bf16 pair 的 V 累加路径，减少 packed word 重复读取。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 10-token（实卡）
+   - EN `Hi what is your name`：`Generation: 3.056 tok/s`
+   - ZH `你好啊`：`Generation: 3.161 tok/s`
+   - 输出前缀正常。
+3. Qwen 80-token EN A/B（`MLX_VK_SDPA_STATS=1`）
+   - `d128=ON`：`Generation: 1.984 tok/s`，`k_len_cap=2156`，`native_hits=139`
+   - `d128=OFF`：`Generation: 1.964 tok/s`，`k_len_cap=2156`，`native_hits=139`
+   - `cap24 + d128=ON`：`Generation: 1.980 tok/s`，`k_len_cap=1932`，`native_hits=363`
+
+#### 结论
+- ✅ d128 特化核在当前卡上有小幅正收益（约 +1% 单次对照）。
+- ⚠️ `cap24` 虽提升命中并降低 `k_len_cap`，但端到端吞吐仍未稳定优于默认 `cap=16`。
+- ⚠️ 主瓶颈仍是 decode `k>16` 区间的算效不足，而非仅命中率不足。
+
+### 2026-02-10 主线推进（阶段 D-2b：decode no-mask 热路径试探）✅
+
+#### 本轮目标
+- 针对 decode 常见 `mask_mode=0` 场景，减少每步 logit 分支/检查开销，验证是否能带来可测吞吐提升。
+
+#### 本轮变更
+1. `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp`
+   - 将 causal 上界计算前置到循环外。
+   - `mask_mode==0` 时走直接 `dot*scale` 路径，不再调用 `masked_logit`。
+2. `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp`
+   - 同步前置 causal 上界与 `mask_mode==0` 直通路径。
+3. `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_d128.comp`
+   - 同步上述 fast-path 逻辑，保持 d128 路径一致。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 80-token EN（`MLX_VK_SDPA_STATS=1`）
+   - `d128=ON`：`1.970 tok/s`、`1.981 tok/s`（两次）
+   - `d128=OFF`：`1.969 tok/s`
+   - 统计键空间不变：`k_len_cap=2156`，`native_hits=139`。
+
+#### 结论
+- ✅ 正确性与稳定性未回归。
+- ⚠️ 吞吐收益不显著（当前硬件与样本下接近噪声水平），暂不据此调整默认策略。
+
+#### 当前状态
+- decode 主线已完成 d128 + fast-exp + no-mask 路径试探，功能稳定。
+- 默认仍建议 `cap=16`，继续以“先提升 `k=17~32` native 算效，再放量 cap”为主线。
+
+#### 下一步（精确）
+1. 进入 D-3：实现 decode `k=17~32` 专项核（优先 `qk=v=128`），目标是该区间 native 明显快于 fallback。
+2. 在实验开关下复测 `cap24/32`（EN/ZH 40/80-token 多次均值），以“吞吐提升且正确性稳定”为准入标准。
+3. 若 D-3 仍收益有限，再推进 subgroup 规约原型，并对标 Metal 的 reduce/dispatch 组织方式。
+
+### 2026-02-10 主线推进（阶段 D-3：decode d128 k<=32 专项核）✅
+
+#### 本轮目标
+- 针对 decode `k=17~32` 区间新增专用 kernel，验证“提升该区间 native 算效”是否能转化为长序列吞吐收益。
+
+#### 本轮变更
+1. 新增 decode 专用 shader：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_d128_k32.comp`
+   - 约束：`qk_dim==128 && v_dim==128 && k_len<=32 && mask_mode=none`。
+   - 采用 two-pass softmax（先算 logits，再归一化累加 V）以减少在线 softmax 的同步开销。
+2. Vulkan 注册链路：
+   - `CMakeLists.txt` 增加 `sdpa_bf16_decode_q1_d128_k32.comp`。
+   - `KernelRegistry` 增加 `SDPA_BF16_DECODE_Q1_D128_K32` 常量/注册。
+   - 新增 `sdpa_bf16_decode_q1_d128_k32.spv/.h` 并接入。
+3. 调度门禁：
+   - `fallback.cpp` 在 decode direct 路径中，当 `split_k<=1 && qk=v=128 && k_len<=32 && mask_mode=0` 时优先选该 kernel。
+   - 新增 gate：`MLX_VK_ENABLE_SDPA_DECODE_D128_K32`（默认 ON）。
+4. 文档同步：
+   - `AGENTS.md` runtime/debug 开关列表新增 `MLX_VK_ENABLE_SDPA_DECODE_D128(_K32)`。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen 10-token（实卡）：
+   - EN `Hi what is your name`：`Generation: 3.111 tok/s`，输出前缀正常。
+3. Qwen 80-token 小规模重复基准（EN，2 次均值）：
+   - `cap24`:
+     - `k32=ON`: `2.017`, `1.989` => **avg `2.003 tok/s`**
+     - `k32=OFF`: `1.987`, `1.961` => **avg `1.974 tok/s`**
+   - `cap16`:
+     - `k32=ON`: `1.981`, `1.991` => avg `1.986 tok/s`
+     - `k32=OFF`: `1.988`, `1.982` => avg `1.985 tok/s`
+
+#### 结论
+- ✅ `k32` 专项核在 `cap24` 下有可测正收益（当前样本约 +`0.029 tok/s`，约 +`1.5%`）。
+- ✅ 对默认 `cap16` 基本中性（均值几乎持平）。
+- ⚠️ 现阶段样本仍偏少且仅 EN；暂不直接把 decode cap 默认升到 `24`。
+
+#### 当前状态
+- `k=17~32` 专项路径已接入并默认可用（可用 env 关闭回退）。
+- 主瓶颈依然存在于更长 `k` 区间（`k>32`）的大量 fallback。
+
+#### 下一步（精确）
+1. 用同样方法补齐 EN/ZH + 40/80-token 的多次均值（至少 3 次）评估 `cap24` 是否可作为默认候选。
+2. 若 `cap24` 在多样本下稳定胜出，再推进 `cap32`（优先 split-k/规约效率）。
+3. 并行准备 subgroup 规约原型，目标覆盖 `k=33~64`，继续压缩 `k_len_cap` 回退占比。

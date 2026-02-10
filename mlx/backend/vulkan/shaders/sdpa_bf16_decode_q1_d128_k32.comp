@@ -1,0 +1,205 @@
+#version 450
+
+// Decode SDPA direct path specialized for:
+// - qk_dim=v_dim=128
+// - k_len <= 32
+// - mask_mode = none
+// This kernel uses two-pass softmax to reduce per-step synchronization overhead.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuffer {
+  uint words[];
+} q_buffer;
+
+layout(set = 0, binding = 1) readonly buffer KBuffer {
+  uint words[];
+} k_buffer;
+
+layout(set = 0, binding = 2) readonly buffer VBuffer {
+  uint words[];
+} v_buffer;
+
+layout(set = 0, binding = 3) buffer OutBuffer {
+  uint words[];
+} out_buffer;
+
+layout(set = 0, binding = 4) readonly buffer MaskBuffer {
+  uint words[];
+} mask_buffer;
+
+layout(push_constant) uniform PushConstants {
+  uint batch_size;
+  uint n_q_heads;
+  uint n_kv_heads;
+  uint q_len;
+  uint k_len;
+  uint qk_dim;
+  uint v_dim;
+  uint k_head_stride;
+  uint k_seq_stride;
+  uint v_head_stride;
+  uint v_seq_stride;
+  uint mask_mode;
+  uint mask_batch_stride;
+  uint mask_head_stride;
+  uint mask_q_stride;
+  uint mask_k_stride;
+  uint causal;
+  float scale;
+} params;
+
+const uint WG_SIZE = 64u;
+const uint D128 = 128u;
+const float NEG_LARGE = -3.4028235e38;
+const float LOG2_E = 1.4426950408889634;
+
+shared float dot_partial[WG_SIZE];
+shared float q_sh[D128];
+shared float logits_sh[32];
+shared float max_logit_sh;
+shared float inv_denom_sh;
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float fast_exp(float x) {
+  return exp2(x * LOG2_E);
+}
+
+float load_q(uint elem_idx) {
+  uint packed = q_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float load_k(uint elem_idx) {
+  uint packed = k_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float load_v(uint elem_idx) {
+  uint packed = v_buffer.words[elem_idx >> 1u];
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+void main() {
+  uint rowq = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+  uint total = params.batch_size * params.n_q_heads * params.q_len;
+  if (rowq >= total || params.q_len == 0u || params.k_len == 0u ||
+      params.k_len > 32u || params.n_kv_heads == 0u ||
+      params.qk_dim != D128 || params.v_dim != D128 ||
+      params.mask_mode != 0u) {
+    return;
+  }
+
+  // For causal mode, this specialization assumes decode shape (q_len == 1),
+  // where all keys are visible.
+  if (params.causal != 0u && params.q_len > 1u) {
+    return;
+  }
+
+  uint bh = rowq / params.q_len;
+  uint q_pos = rowq % params.q_len;
+  uint b = bh / params.n_q_heads;
+  uint hq = bh % params.n_q_heads;
+  uint repeats = params.n_q_heads / params.n_kv_heads;
+  uint hkv = hq / repeats;
+
+  uint q_base = (((b * params.n_q_heads) + hq) * params.q_len + q_pos) * D128;
+  uint kvh = (b * params.n_kv_heads) + hkv;
+  uint k_head_base = kvh * params.k_head_stride;
+  uint v_head_base = kvh * params.v_head_stride;
+
+  for (uint dq = lane; dq < D128; dq += WG_SIZE) {
+    q_sh[dq] = load_q(q_base + dq);
+  }
+  barrier();
+
+  // Pass 1: compute logits.
+  for (uint t = 0u; t < params.k_len; ++t) {
+    uint k_base = k_head_base + t * params.k_seq_stride;
+    float partial = 0.0;
+    for (uint d = lane * 2u; d < D128; d += WG_SIZE * 2u) {
+      uint k_idx = k_base + d;
+      if ((k_idx & 1u) == 0u) {
+        uint k_packed = k_buffer.words[k_idx >> 1u];
+        float q0 = q_sh[d];
+        float q1 = q_sh[d + 1u];
+        float k0 = bf16_to_f32(k_packed & 0xFFFFu);
+        float k1 = bf16_to_f32(k_packed >> 16u);
+        partial += q0 * k0 + q1 * k1;
+      } else {
+        partial += q_sh[d] * load_k(k_idx);
+        partial += q_sh[d + 1u] * load_k(k_idx + 1u);
+      }
+    }
+    dot_partial[lane] = partial;
+
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+      barrier();
+      if (lane < stride) {
+        dot_partial[lane] += dot_partial[lane + stride];
+      }
+    }
+
+    if (lane == 0u) {
+      logits_sh[t] = dot_partial[0] * params.scale;
+    }
+    barrier();
+  }
+
+  if (lane == 0u) {
+    float max_logit = NEG_LARGE;
+    for (uint t = 0u; t < params.k_len; ++t) {
+      max_logit = max(max_logit, logits_sh[t]);
+    }
+    float denom = 0.0;
+    for (uint t = 0u; t < params.k_len; ++t) {
+      denom += fast_exp(logits_sh[t] - max_logit);
+    }
+    max_logit_sh = max_logit;
+    inv_denom_sh = (denom > 0.0) ? (1.0 / denom) : 0.0;
+  }
+  barrier();
+
+  uint out_base = (((b * params.n_q_heads) + hq) * params.q_len + q_pos) * D128;
+  uint out_word_base = out_base >> 1u;
+  if (lane < 64u) {
+    uint dv = lane << 1u;
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    for (uint t = 0u; t < params.k_len; ++t) {
+      float w = fast_exp(logits_sh[t] - max_logit_sh) * inv_denom_sh;
+      uint v_idx = v_head_base + t * params.v_seq_stride + dv;
+      float v0;
+      float v1;
+      if ((v_idx & 1u) == 0u) {
+        uint v_packed = v_buffer.words[v_idx >> 1u];
+        v0 = bf16_to_f32(v_packed & 0xFFFFu);
+        v1 = bf16_to_f32(v_packed >> 16u);
+      } else {
+        v0 = load_v(v_idx);
+        v1 = load_v(v_idx + 1u);
+      }
+      acc0 += w * v0;
+      acc1 += w * v1;
+    }
+    uint lo = f32_to_bf16(acc0) & 0xFFFFu;
+    uint hi = f32_to_bf16(acc1) & 0xFFFFu;
+    out_buffer.words[out_word_base + lane] = lo | (hi << 16u);
+  }
+}

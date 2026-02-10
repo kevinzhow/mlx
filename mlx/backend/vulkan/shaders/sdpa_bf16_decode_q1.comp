@@ -47,6 +47,7 @@ layout(push_constant) uniform PushConstants {
 
 const uint WG_SIZE = 64u;
 const float NEG_LARGE = -3.4028235e38;
+const float LOG2_E = 1.4426950408889634;
 
 shared float dot_partial[WG_SIZE];
 shared float max_logit_sh;
@@ -59,6 +60,10 @@ shared float accum_sh[256];
 
 float bf16_to_f32(uint bf16_bits) {
   return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+float fast_exp(float x) {
+  return exp2(x * LOG2_E);
 }
 
 uint f32_to_bf16(float value) {
@@ -100,17 +105,9 @@ bool load_mask_bool(uint elem_idx) {
   return mask_buffer.words[elem_idx] != 0u;
 }
 
-float masked_logit(float dot, uint q_pos, uint k_pos, uint mask_base, out bool valid) {
+float masked_logit(float dot, uint k_pos, uint mask_base, out bool valid) {
   valid = true;
   float logit = dot * params.scale;
-
-  if (params.causal != 0u) {
-    int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
-    if (int(k_pos) > causal_limit) {
-      valid = false;
-      return 0.0;
-    }
-  }
 
   if (params.mask_mode == 1u) {
     logit += load_mask_add(mask_base + k_pos * params.mask_k_stride);
@@ -175,17 +172,17 @@ void main() {
   for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
     accum_sh[dv] = 0.0;
   }
+  int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
+  bool causal_full_visible =
+      (params.causal == 0u) || (q_pos + 1u >= params.q_len);
   barrier();
 
   // Single-pass online softmax accumulation on V.
   for (uint t = 0u; t < params.k_len; ++t) {
     // For causal attention, the upper-triangular invalid region can be
     // skipped before any QK work.
-    if (params.causal != 0u) {
-      int causal_limit = int(q_pos) + int(params.k_len) - int(params.q_len);
-      if (int(t) > causal_limit) {
-        continue;
-      }
+    if (!causal_full_visible && int(t) > causal_limit) {
+      continue;
     }
 
     uint k_base = k_head_base + t * params.k_seq_stride;
@@ -217,8 +214,11 @@ void main() {
     }
 
     if (lane == 0u) {
-      bool valid = false;
-      float logit = masked_logit(dot_partial[0], q_pos, t, mask_base, valid);
+      bool valid = true;
+      float logit = dot_partial[0] * params.scale;
+      if (params.mask_mode != 0u) {
+        logit = masked_logit(dot_partial[0], t, mask_base, valid);
+      }
       if (!valid) {
         alpha_sh = 1.0;
         beta_sh = 0.0;
@@ -226,8 +226,8 @@ void main() {
       } else {
         float prev_max = max_logit_sh;
         float next_max = max(prev_max, logit);
-        float alpha = (prev_max <= -3.0e38) ? 0.0 : exp(prev_max - next_max);
-        float beta = exp(logit - next_max);
+        float alpha = (prev_max <= -3.0e38) ? 0.0 : fast_exp(prev_max - next_max);
+        float beta = fast_exp(logit - next_max);
         max_logit_sh = next_max;
         denom_sh = denom_sh * alpha + beta;
         alpha_sh = alpha;
@@ -241,8 +241,22 @@ void main() {
     if (valid_sh != 0u) {
       float alpha = alpha_sh;
       float beta = beta_sh;
-      for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
-        accum_sh[dv] = accum_sh[dv] * alpha + beta * load_v(v_base + dv);
+      // Process V in bf16 pairs when aligned to reduce packed-word loads.
+      for (uint dv = lane * 2u; dv < params.v_dim; dv += WG_SIZE * 2u) {
+        uint v_idx = v_base + dv;
+        if (dv + 1u < params.v_dim && (v_idx & 1u) == 0u) {
+          uint v_packed = v_buffer.words[v_idx >> 1u];
+          float v0 = bf16_to_f32(v_packed & 0xFFFFu);
+          float v1 = bf16_to_f32(v_packed >> 16u);
+          accum_sh[dv] = accum_sh[dv] * alpha + beta * v0;
+          accum_sh[dv + 1u] = accum_sh[dv + 1u] * alpha + beta * v1;
+        } else {
+          accum_sh[dv] = accum_sh[dv] * alpha + beta * load_v(v_idx);
+          if (dv + 1u < params.v_dim) {
+            accum_sh[dv + 1u] =
+                accum_sh[dv + 1u] * alpha + beta * load_v(v_idx + 1u);
+          }
+        }
       }
     }
     barrier();

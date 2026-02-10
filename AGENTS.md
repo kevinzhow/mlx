@@ -81,6 +81,8 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_ROPE_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_SDPA_NATIVE=1` (default ON, still narrow gate in code)
+  - `MLX_VK_ENABLE_SDPA_DECODE_D128=1` (default ON)
+  - `MLX_VK_ENABLE_SDPA_DECODE_D128_K32=1` (default ON, decode `k_len<=32` 特化路径)
 
 ### Standard Qwen3 correctness checks
 
@@ -102,6 +104,8 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=0|1`
   - `MLX_VK_ENABLE_ROPE_NATIVE=0|1`
   - `MLX_VK_ENABLE_SDPA_NATIVE=0|1`
+  - `MLX_VK_ENABLE_SDPA_DECODE_D128=0|1`
+  - `MLX_VK_ENABLE_SDPA_DECODE_D128_K32=0|1`
   - `MLX_VK_ENABLE_ADD_BF16=0|1`
   - `MLX_VK_ENABLE_MUL_BF16=0|1`
 - Split-k tuning knobs:

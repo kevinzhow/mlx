@@ -29,6 +29,7 @@ layout(push_constant) uniform PushConstants {
 } params;
 
 const uint WG_SIZE = 64u;
+const float LOG2_E = 1.4426950408889634;
 
 shared float reduce_buf[WG_SIZE];
 shared float final_m;
@@ -40,6 +41,10 @@ uint f32_to_bf16(float value) {
   uint lsb = (bits >> 16u) & 1u;
   uint rounding_bias = 0x7FFFu + lsb;
   return (bits + rounding_bias) >> 16u;
+}
+
+float fast_exp(float x) {
+  return exp2(x * LOG2_E);
 }
 
 void store_out(uint elem_idx, float value) {
@@ -91,7 +96,7 @@ void main() {
     float m = partial_m_buffer.values[row_split_base + part];
     float l = partial_l_buffer.values[row_split_base + part];
     if (l > 0.0) {
-      local_l += exp(m - final_m) * l;
+      local_l += fast_exp(m - final_m) * l;
     }
   }
   reduce_buf[lane] = local_l;
@@ -113,7 +118,7 @@ void main() {
     for (uint part = 0u; part < params.split_k; ++part) {
       uint part_idx = row_split_base + part;
       float m = partial_m_buffer.values[part_idx];
-      float coeff = exp(m - final_m);
+      float coeff = fast_exp(m - final_m);
       acc += coeff * partial_o_buffer.values[part_idx * params.v_dim + dv];
     }
     if (final_l > 0.0) {

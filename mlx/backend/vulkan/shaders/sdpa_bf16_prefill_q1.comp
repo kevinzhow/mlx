@@ -49,6 +49,7 @@ layout(push_constant) uniform PushConstants {
 
 const uint WG_SIZE = 64u;
 const float NEG_LARGE = -3.4028235e38;
+const float LOG2_E = 1.4426950408889634;
 
 shared float dot_partial[WG_SIZE];
 shared float max_logit_sh;
@@ -61,6 +62,10 @@ shared float accum_sh[256];
 
 float bf16_to_f32(uint bf16_bits) {
   return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+float fast_exp(float x) {
+  return exp2(x * LOG2_E);
 }
 
 uint f32_to_bf16(float value) {
@@ -238,8 +243,8 @@ void main() {
       } else {
         float prev_max = max_logit_sh;
         float next_max = max(prev_max, logit);
-        float alpha = (prev_max <= -3.0e38) ? 0.0 : exp(prev_max - next_max);
-        float beta = exp(logit - next_max);
+        float alpha = (prev_max <= -3.0e38) ? 0.0 : fast_exp(prev_max - next_max);
+        float beta = fast_exp(logit - next_max);
         max_logit_sh = next_max;
         denom_sh = denom_sh * alpha + beta;
         alpha_sh = alpha;
