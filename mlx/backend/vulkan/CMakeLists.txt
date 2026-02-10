@@ -102,21 +102,34 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_q1_d128.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_q1_d128_k32.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_q1_d128_k64.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_q1_d128_k128.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_splitk_stage1.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_splitk_reduce.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_splitk_reduce_subgroup.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_splitk_reduce_l32.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_prefill_q1.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_prefill_splitk_stage1.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_prefill_splitk_reduce.comp
+)
+
+# Shaders requiring subgroup ops must target Vulkan 1.1 so glslc emits a
+# compatible SPIR-V version for subgroup instructions.
+set(SUBGROUP_SHADER_FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_splitk_reduce_subgroup.comp
 )
 
 # Compile shaders to SPIR-V
 foreach(shader_src ${SHADER_FILES})
   get_filename_component(shader_name ${shader_src} NAME_WE)
   set(shader_spv ${SHADER_BIN_DIR}/${shader_name}.spv)
+  set(shader_compile_args -fshader-stage=compute)
+  if("${shader_src}" IN_LIST SUBGROUP_SHADER_FILES)
+    list(APPEND shader_compile_args --target-env=vulkan1.1)
+  endif()
   
   add_custom_command(
     OUTPUT ${shader_spv}
-    COMMAND ${GLSLC} -fshader-stage=compute ${shader_src} -o ${shader_spv}
+    COMMAND ${GLSLC} ${shader_compile_args} ${shader_src} -o ${shader_spv}
     DEPENDS ${shader_src}
     COMMENT "Compiling ${shader_name}.comp to SPIR-V"
   )

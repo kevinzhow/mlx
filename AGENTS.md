@@ -67,6 +67,16 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - No duplicate symbols or unresolved symbols.
   - GPU path links and initializes with Vulkan enabled.
   - Covered operators match CPU results.
+- Shader update rule (mandatory):
+  - Vulkan runtime uses embedded shader headers `*_spv.h` (via `kernel_registry`), not `.comp` files directly.
+  - Any shader change must follow: `.comp -> .spv -> *_spv.h` in the same cycle.
+  - If shader uses subgroup ops (`subgroupAdd` etc.), compile with Vulkan 1.1 target env to emit compatible SPIR-V:
+    - `glslc --target-env=vulkan1.1 -fshader-stage=compute <shader>.comp -o <shader>.spv`
+    - Avoid default `glslc` target for subgroup shaders (may fail with `subgroup op requires SPIR-V 1.3`).
+  - Minimum commands:
+    - `glslc -fshader-stage=compute <shader>.comp -o <shader>.spv`
+    - `xxd -i -n <symbol_name> <shader>.spv > <shader>_spv.h`
+  - Do not claim shader performance/correctness results unless corresponding `*_spv.h` is regenerated and built.
 
 ## Runtime Parameters (Vulkan + Qwen3)
 
@@ -84,9 +94,14 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_SDPA_DECODE_D128=1` (default ON)
   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K32=1` (default ON, decode `k_len<=32` 特化路径)
   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K64=1` (default ON, decode `k_len<=64` 特化路径)
+  - `MLX_VK_ENABLE_SDPA_DECODE_D128_K128=1` (default ON, decode `k_len<=128` 特化路径)
+  - `MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_L32=1` (default ON, decode split-k reduce `local_size=32` 路径)
+  - `MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_SUBGROUP=0` (default OFF, decode split-k subgroup reduce 实验路径)
 - Current decode SDPA defaults (without env override):
   - `MLX_VK_SDPA_MAX_K_LEN_DECODE=0` (`0` 表示 unlimited)
   - `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE=32`
+  - `MLX_VK_SDPA_SPLITK_MAX_PARTS_DECODE=16`
+  - `MLX_VK_SDPA_SPLITK_TARGET_WG_DECODE=128`
 
 ### Standard Qwen3 correctness checks
 
@@ -111,6 +126,9 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_SDPA_DECODE_D128=0|1`
   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K32=0|1`
   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K64=0|1`
+  - `MLX_VK_ENABLE_SDPA_DECODE_D128_K128=0|1`
+  - `MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_L32=0|1`
+  - `MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_SUBGROUP=0|1`
   - `MLX_VK_ENABLE_ADD_BF16=0|1`
   - `MLX_VK_ENABLE_MUL_BF16=0|1`
 - Split-k tuning knobs:

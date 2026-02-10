@@ -3034,3 +3034,359 @@ python -m unittest discover -v
 
 #### 目的
 - 保证 Vulkan 主线持续对齐“MLX Metal 机制 + Ollama Vulkan 工程经验”，避免只做局部微优化而偏离最终路线。
+
+### 2026-02-10 主线推进（阶段 D-7：decode-unlimited 门禁 + split-k 参数对照）✅
+
+#### 本轮目标
+1. 完成 `decode-unlimited` vs `decode-cap24` 的 EN/ZH + 40/80 + 3 次均值门禁。
+2. 参考 Ollama 的 split-k 动态并行占用思路，做 decode split-k 参数 A/B。
+3. 在不改语义前提下，固化“稳定小幅收益”的 decode split-k 默认参数。
+
+#### Metal / Ollama 对照分析（本轮）
+1. Metal（MLX）：
+   - SDPA 走 tile + 全 K 轴分块（`NQ/NK`），没有 decode 侧固定 `k_len` 硬截断。
+   - 启示：Vulkan 主线应避免“命中率靠硬 cap”，而应靠分块/并行策略覆盖全 K。
+2. Ollama（ggml-vulkan）：
+   - `flash_attn` 通过设备并行度（shader cores / workgroups）推导 split-k，长 KV 下自动提高并行切分，并做 split-k reduce。
+   - 启示：decode 大 K 的瓶颈优先从 split-k 策略与 reduce 组织入手，而不是回到低 cap。
+3. 迁移结论：
+   - 保持 decode unlimited（无 `k_len_cap` 拦截）是正确方向；
+   - 下一阶段核心是 `k=65+` 区间的 split-k stage1/reduce 算效，不是再收紧 cap。
+
+#### 门禁结果 A：`decode-unlimited` vs `decode-cap24`（3 次均值）
+- 原始日志：`/tmp/bench_sdpa_decode_cap_compare_20260210_222651.log`
+
+1. `decode-unlimited`
+   - `en|40`: `avg_tps=2.472`, `avg_native_hits=1175`, `avg_k_len_cap_rejects=0`
+   - `en|80`: `avg_tps=2.022`, `avg_native_hits=2295`, `avg_k_len_cap_rejects=0`
+   - `zh|40`: `avg_tps=2.463`, `avg_native_hits=1175`, `avg_k_len_cap_rejects=0`
+   - `zh|80`: `avg_tps=2.028`, `avg_native_hits=2295`, `avg_k_len_cap_rejects=0`
+2. `decode-cap24`
+   - `en|40`: `avg_tps=2.404`, `avg_native_hits=363`, `avg_k_len_cap_rejects=1624`
+   - `en|80`: `avg_tps=1.963`, `avg_native_hits=363`, `avg_k_len_cap_rejects=3864`
+   - `zh|40`: `avg_tps=2.403`, `avg_native_hits=447`, `avg_k_len_cap_rejects=1456`
+   - `zh|80`: `avg_tps=1.979`, `avg_native_hits=447`, `avg_k_len_cap_rejects=3696`
+
+#### 门禁结论 A
+- ✅ `decode-unlimited` 在 4/4 桶均值优于 `cap24`。
+- ✅ `k_len_cap` 拒绝在 unlimited 下清零，命中 bucket 稳定覆盖 decode `k=65+`。
+- ✅ 证明“去硬 cap”方向正确，后续不再回退到 `cap24` 默认策略。
+
+#### 门禁结果 B：decode split-k 参数 A/B（80-token，EN/ZH，各 2 次）
+- 原始日志：`/tmp/bench_sdpa_splitk_tune_20260210_224022.log`
+
+1. `base`（旧默认：`max_parts=8`, `target_wg=64`）
+   - `en`: `avg_tps=2.008`
+   - `zh`: `avg_tps=2.005`
+2. `maxparts16`
+   - `en`: `avg_tps=2.020`
+   - `zh`: `avg_tps=2.018`
+3. `maxparts16_wg128`
+   - `en`: `avg_tps=2.026`
+   - `zh`: `avg_tps=2.033`
+4. 统计一致性：
+   - 各组 `native_hits=2295`，`final_fallbacks=0`；
+   - `k=65+` 命中计数不变（EN `812` / ZH `728`），收益来自调度/并行度而非覆盖率变化。
+
+#### 本轮代码变更（默认值调优）
+1. `mlx/backend/vulkan/primitives/fallback.cpp`
+   - `native_sdpa_splitk_max_parts_decode()` 默认提升到至少 `16`。
+   - `native_sdpa_splitk_target_workgroups_decode()` 默认 `64 -> 128`。
+2. `AGENTS.md`
+   - 运行参数基线新增 decode split-k 默认：
+     - `MLX_VK_SDPA_SPLITK_MAX_PARTS_DECODE=16`
+     - `MLX_VK_SDPA_SPLITK_TARGET_WG_DECODE=128`
+
+#### 回归验证
+1. `cmake --build build_release_vulkan --target mlx -j` ✅
+2. `python3 setup.py build_ext --inplace` ✅
+3. `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+4. `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+5. Qwen3 80-token 抽检（实卡）：
+   - EN：`2.018 tok/s`
+   - ZH：`2.047 tok/s`
+   - `native_hits=2295`, `final_fallbacks=0`
+
+#### 当前状态
+- decode 已稳定处于“无硬 cap + 动态 split-k”模式，且较 `cap24` 有稳定收益。
+- split-k 默认调优（`max_parts=16`, `target_wg=128`）带来小幅但稳定增益（约 `~1%` 量级）。
+- 主瓶颈已锁定为 `k=65+` 区间的 stage1/reduce 算效。
+
+#### 下一步（精确）
+1. 进入 D-8：针对 `k=65+` 做 subgroup 规约与 reduce kernel 优化（先做 decode 路径）。
+2. 对照 Metal/Ollama 的 tile/reduce 组织方式，减少 stage1/reduce 的 barrier 和全局内存往返。
+3. 保持同口径门禁（EN/ZH + 40/80）验证“算效优化”是否转化为 tok/s 提升。
+
+### 2026-02-10 主线推进（阶段 D-8：decode split-k reduce 专项核实验）🟡
+
+#### 本轮目标
+- 参考 Metal/Ollama 的 reduce 组织方式，先在 decode `split-k` 的 stage2 上做更细粒度 workgroup 专项化，观察 `k=65+` 主瓶颈是否可下压。
+
+#### Metal / Ollama 对照分析（本轮）
+1. Metal（`sdpa_vector_2pass_2`）：
+   - reduce 侧核心依赖 `simdgroup(32)` 组织与线程块内 transpose/reduce，倾向于“较小规约组 + 多组并行”。
+2. Ollama/ggml Vulkan（`flash_attn` 系列）：
+   - 通过多 variant + 运行时条件选择，针对不同分块/并行度采用不同 kernel 形态，而不是单一 reduce kernel 覆盖全部场景。
+3. 迁移结论：
+   - Vulkan decode split-k reduce 应引入“按 split_k 分段”的变体选择，而不是统一 `local_size=64`。
+
+#### 本轮代码变更
+1. 新增 decode reduce 专项 shader（实验）：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_reduce_l32.comp`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_reduce_l32.spv`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_reduce_l32_spv.h`
+2. Vulkan 注册链路：
+   - `mlx/backend/vulkan/CMakeLists.txt` 增加 `sdpa_bf16_decode_splitk_reduce_l32.comp`
+   - `mlx/backend/vulkan/kernel_registry.{h,cpp}` 增加
+     `SDPA_BF16_DECODE_SPLITK_REDUCE_L32`
+3. 调度门禁：
+   - `mlx/backend/vulkan/primitives/fallback.cpp` 在 decode 且 `split_k<=16` 时可选 `L32` kernel；
+   - 新增开关：`MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_L32`；
+   - 默认值：`OFF`（实验开关，避免默认行为抖动）。
+4. 过程修正（重要）：
+   - 明确 Vulkan 运行时实际加载 `*_spv.h`；仅修改 `.comp` 不会改变运行行为。
+   - 本轮所有 shader 改动均执行了 `glslc + xxd`，完成 `.comp -> .spv -> _spv.h` 闭环。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. `L32` 开关 A/B（80-token，EN/ZH，各 2 次）：
+   - `gate=1` (`MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_L32=1`)
+     - EN: `[2.021, 2.026]`, `avg=2.023`
+     - ZH: `[1.988, 2.028]`, `avg=2.008`
+   - `gate=0` (默认路径)
+     - EN: `[2.011, 2.033]`, `avg=2.022`
+     - ZH: `[2.033, 2.019]`, `avg=2.026`
+   - 结论：EN 基本持平，ZH 波动较大且均值偏弱，暂无“稳定收益”证据。
+3. 额外策略探针（decode 80-token, EN，单次）：
+   - `max_parts=16/24/32` => `2.024 / 2.014 / 2.011`（16 最优）
+   - `target_wg=64/128/192` => `1.991 / 2.001 / 2.008`
+   - `target_wg` 二次复测（2 次均值）：
+     - `128`: `2.022`
+     - `192`: `2.024`（差距极小，未达稳定可切换阈值）
+4. Qwen3 10-token 正确性复核（默认路径）：
+   - EN：`Generation: 10 tokens, 2.689 tok/s`，输出前缀正常；
+   - ZH：`Generation: 10 tokens, 2.616 tok/s`，输出前缀正常。
+
+#### 当前状态
+- decode 主线保持 `decode-unlimited + split-k` 稳定；`L32 reduce` 已具备实验能力，但默认关闭。
+- D-8 已完成“专项核 + 开关 + 同口径门禁”第一轮，结果为“可运行但收益不稳定”。
+
+#### 下一步（精确）
+1. 进入 D-8.1：实现真正的 subgroup reduce 原型（先 decode split-k reduce），并做特性可用性守卫。
+2. 引入按 `split_k` 桶化的 decode reduce 变体选择（例如 `<=8`、`<=16`、`>16`），而非单阈值。
+3. 保持 EN/ZH + 40/80 多样本门禁，只有在双语均稳定胜出后才允许默认切换。
+
+### 2026-02-10 执行规则补充（Shader 二进制闭环）✅
+
+#### 本轮变更
+1. 在 `AGENTS.md` 固化强制规则：
+   - Vulkan 运行时实际使用 `*_spv.h`（由 `kernel_registry` 注册），不是直接读取 `.comp`。
+   - 任何 shader 修改必须在同轮完成 `.comp -> .spv -> *_spv.h`。
+   - 未同步 `*_spv.h` 不得宣称 shader 变更已生效。
+2. 已记录标准命令：
+   - `glslc -fshader-stage=compute <shader>.comp -o <shader>.spv`
+   - `xxd -i -n <symbol_name> <shader>.spv > <shader>_spv.h`
+
+#### 当前状态
+- 该规则已成为后续 Vulkan shader 开发与性能验证的硬门禁。
+
+#### 下一步（精确）
+1. 所有 D-8.1 及后续 shader 实验严格遵循该闭环。
+
+### 2026-02-10 主线推进（阶段 D-8.1：decode d128 `k<=128` 直通路径）✅
+
+#### 本轮目标
+- 在不做参数微调的前提下，做一处架构级演进：把 decode `k<=128` 从 split-k 两阶段拉回直通 kernel，减少 `stage1->reduce` 的全局往返。
+
+#### Metal / Ollama 对照分析（本轮）
+1. Metal（MLX）：
+   - `sdpa_vector` / `sdpa_vector_2pass` 按长度分段走不同 kernel 族，不用单一路径覆盖全部 K。
+   - 启示：Vulkan decode 也应在中短 K 区间使用直通专核，避免过早 split-k。
+2. Ollama/ggml Vulkan：
+   - flash-attn 使用多 variant + 运行时策略，优先让“更便宜的 direct variant”覆盖可行 K 区间。
+   - 启示：把 `k<=128` 收敛到直通 kernel 是合理的架构映射。
+3. 迁移结论：
+   - 新增 `k<=128` 专项核，并在 decode d128/no-mask 下强制 `split_k=1`，把 split-k 留给更长 K。
+
+#### 本轮代码变更
+1. 新增 shader：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_d128_k128.comp`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_d128_k128.spv`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_d128_k128_spv.h`
+2. Vulkan 注册链路：
+   - `mlx/backend/vulkan/CMakeLists.txt` 添加 `sdpa_bf16_decode_q1_d128_k128.comp`
+   - `mlx/backend/vulkan/kernel_registry.{h,cpp}` 新增
+     `SDPA_BF16_DECODE_Q1_D128_K128`
+3. 调度层（`mlx/backend/vulkan/primitives/fallback.cpp`）：
+   - 新增 gate：`MLX_VK_ENABLE_SDPA_DECODE_D128_K128`（默认 ON）；
+   - direct kernel 选择链扩展到 `k<=128`；
+   - 新增 `prefer_sdpa_decode_direct_d128(...)`，在 decode d128 + no-mask + `k<=128` 时强制 `split_k=1`；
+   - 同步应用到 layout-repack 二次 native 尝试路径。
+4. 闭环执行：
+   - 本轮已完成 `.comp -> .spv -> *_spv.h` 并构建安装。
+
+#### 验证结果
+1. 回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen3 80-token（EN/ZH 各 3 次均值）：
+   - 变更前基线（同机同口径）：EN `2.015`, ZH `2.021`
+   - 本轮后：EN `2.028`, ZH `2.028`
+   - 增益：EN `+0.6%`，ZH `+0.3%`（小幅正收益）
+3. gate A/B（EN 80-token，2 次均值）：
+   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K128=1`：`2.014`
+   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K128=0`：`1.994`
+   - 说明：专项核本身有正向贡献（约 `+1%` 量级），但未形成“性能蜕变”。
+4. SDPA 统计（抽检）：
+   - `final_fallbacks=0`, `native_hits=2295` 维持稳定，无正确性回退迹象。
+
+#### 当前状态
+- 已完成一处结构性演进（`k<=128` 直通），方向正确但收益仍小。
+- 这进一步验证主瓶颈已集中在 `k=65+` 长 K 的算效与 dispatch 成本，而非命中率本身。
+
+#### D-8.2 预检查（subgroup 编译链）✅
+1. 现象：
+   - 默认 `glslc -fshader-stage=compute` 编译 subgroup 内建（如 `subgroupAdd`）会报：
+     - `subgroup op requires SPIR-V 1.3`
+2. 解决方案（已验证）：
+   - 使用 Vulkan 1.1 目标环境编译：
+     - `glslc --target-env=vulkan1.1 -fshader-stage=compute -o subgroup_probe_v11.spv <shader>`
+   - 验证结果：最小 subgroup probe 编译成功（`compile_ok`）。
+3. 执行规则沉淀：
+   - 已同步写入 `AGENTS.md`：后续所有 subgroup shader 必须使用 `--target-env=vulkan1.1`。
+
+#### 下一步（精确）
+1. 进入 D-8.2：实现 decode split-k reduce 的 subgroup 原型（非参数调优），优先攻击 `k=65+`。
+2. 评估把 stage1+reduce 的中间写回压缩（更小 partial 格式或分段融合），减少全局内存往返。
+3. 并行规划 QMM decode `M=1` 专项核（第二主瓶颈），准备进入 D-9。
+
+### 2026-02-11 主线推进（阶段 D-8.2：decode split-k subgroup reduce 原型）✅
+
+#### 本轮目标
+- 在 decode `split-k` reduce 上引入 subgroup 原型，对齐 Metal/Ollama 的“SIMD 组内规约 + variant 选择”方向，验证 `k=65+` 段是否有稳定收益。
+
+#### Metal / Ollama 对照分析（本轮）
+1. Metal（MLX）：
+   - 依赖 `simdgroup` 做组内规约，尽量减少共享内存和 barrier 压力。
+   - 启示：Vulkan 应优先让规约发生在 subgroup，再做跨 subgroup 合并。
+2. Ollama/ggml Vulkan：
+   - 通过多 kernel 变体 + 运行时门禁，不把所有形态塞进同一个 reduce kernel。
+   - 启示：subgroup 版本应先作为可控变体门禁，不直接全量替换。
+3. 迁移结论：
+   - 先落地 decode split-k subgroup reduce 原型，并保留开关做 A/B 门禁。
+
+#### 本轮代码变更
+1. 新增 subgroup reduce shader：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_reduce_subgroup.comp`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_reduce_subgroup.spv`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_reduce_subgroup_spv.h`
+2. 编译链（闭环）：
+   - `mlx/backend/vulkan/CMakeLists.txt` 增加 subgroup shader；
+   - subgroup shader 使用 `--target-env=vulkan1.1` 编译，其他 shader 保持原路径。
+3. Vulkan 注册链路：
+   - `mlx/backend/vulkan/kernel_registry.{h,cpp}` 增加
+     `SDPA_BF16_DECODE_SPLITK_REDUCE_SUBGROUP` 注册与映射。
+4. 调度门禁：
+   - `mlx/backend/vulkan/primitives/fallback.cpp` 增加 gate：
+     `MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_SUBGROUP`（默认 OFF）；
+   - decode 且 `split_k > 1` 时可切到 subgroup reduce 变体。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. Qwen3 80-token A/B（EN/ZH，各 2 次）：
+   - 日志：`/tmp/bench_d82_subgroup_ab_20260211_002509.log`
+   - 日志：`/tmp/bench_d82_subgroup_ab_round2_20260211_002817.log`
+   - EN：
+     - `gate=0`: `[2.016, 2.021]`, `avg=2.019`
+     - `gate=1`: `[2.034, 2.035]`, `avg=2.035`
+   - ZH：
+     - `gate=0`: `[2.029, 2.004]`, `avg=2.017`
+     - `gate=1`: `[2.021, 2.012]`, `avg=2.017`
+   - 合并 4 样本均值：
+     - `gate=0`: `2.018`
+     - `gate=1`: `2.026`
+3. 命中率与回退一致性：
+   - A/B 全部样本均为 `native_hits=2295`, `final_fallbacks=0`；
+   - 说明收益差异来自 kernel 算效差别，而非命中率变化。
+4. 10-token 正确性复核（`gate=1`）：
+   - EN：`Generation: 10 tokens, 3.231 tok/s`，输出前缀正常；
+   - ZH：`Generation: 10 tokens, 3.105 tok/s`，输出前缀正常。
+
+#### 当前状态
+- subgroup reduce 原型已完成并可稳定运行，正确性无回退。
+- 性能表现为“EN 小幅正向、ZH 持平”，总体仍是边际提升（约 `~0.4%` 量级），未达到默认切换阈值。
+- 现阶段保持 `MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_SUBGROUP=0` 默认更稳妥。
+
+#### 下一步（精确）
+1. 进入 D-8.3：做 decode split-k `stage1+reduce` 融合/压缩中间结果，目标是实质降低全局内存往返。
+2. 结合 Metal/Ollama 继续推进“按 `k_len` 桶化的 decode kernel 家族”，避免单一 reduce 形态覆盖全部长 K。
+3. 并行准备 D-9：QMM decode `M=1` 专项 kernel（当前第二主瓶颈）并建立同口径 A/B 门禁。
+
+### 2026-02-11 主线推进（阶段 D-8.3：split-k 可观测性 + L32 默认切换）✅
+
+#### 本轮目标
+- 修正 D-8.2 的测量盲点（80-token 未覆盖 `k>128` split-k reduce），建立可验证的长序列门禁并做默认策略决策。
+
+#### Metal / Ollama 对照分析（本轮）
+1. Metal（MLX）：
+   - 性能关键在“命中正确 kernel 家族 + 真实工作集测量”，不是只看短序列平均值。
+2. Ollama/ggml Vulkan：
+   - 按上下文长度触发不同注意力路径，长 KV 的 kernel 选择必须在长序列门禁下评估。
+3. 迁移结论：
+   - Vulkan 需要先确认 split-k 变体真实命中，再比较吞吐；否则 A/B 结论无效。
+
+#### 本轮代码变更
+1. 新增 SDPA split-k 统计维度（`MLX_VK_SDPA_STATS=1`）：
+   - `SplitKReduceKernel`：记录 reduce kernel 变体命中；
+   - `SplitKPartsBucket`：记录 `split_k` 桶与 `k_len` 桶分布。
+   - 位置：`mlx/backend/vulkan/primitives/fallback.cpp`。
+2. 默认策略调整：
+   - `MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_L32` 默认 `OFF -> ON`。
+   - `MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_SUBGROUP` 仍默认 `OFF`。
+3. 文档同步：
+   - `AGENTS.md` 运行参数默认值更新（L32 默认 ON，subgroup 默认 OFF）。
+
+#### 验证结果
+1. 构建与回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace` ✅
+   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+2. 长序列门禁（EN，`--max-tokens 160`，日志：`/tmp/bench_d82_longk160_ab_20260211_003508.log`）：
+   - `subgroup=0`：`Generation: 131 tokens, 1.678 tok/s`
+   - `subgroup=1`：`Generation: 131 tokens, 1.660 tok/s`
+   - 两组均命中 `SplitKReduceKernel count=448`，`split_k=5-8`，`k=65+`。
+   - 结论：subgroup 在真实 split-k 场景下当前略慢（约 `-1.1%`）。
+3. 长序列门禁（EN，`L32` A/B，日志：`/tmp/bench_d82_longk160_l32_ab_20260211_003807.log`）：
+   - `l32=0`：`1.670 tok/s`
+   - `l32=1`：`1.692 tok/s`
+   - 同样 `SplitKReduceKernel count=448`（`split_k=5-8`, `k=65+`）。
+   - 增益：约 `+1.3%`。
+4. 长序列门禁（ZH，`L32` A/B，日志：`/tmp/bench_d82_longk160_l32_ab_zh_20260211_004102.log`）：
+   - `l32=0`：`1.475 tok/s`
+   - `l32=1`：`1.496 tok/s`
+   - `SplitKReduceKernel count=1176`（`split_k=5-8`, `k=65+`）。
+   - 增益：约 `+1.4%`。
+5. 默认路径抽检（无手工 `L32` 开关）：
+   - EN `--max-tokens 160`：`1.653 tok/s`；
+   - 统计显示自动命中 `kernel=sdpa_bf16_decode_splitk_reduce_l32`（默认切换生效）。
+
+#### 当前状态
+- 已修复“短序列测不到 split-k”盲点，split-k reduce 评估具备可观测性闭环。
+- 在真实长序列场景下，`L32` 有稳定正收益，`subgroup` 暂无收益。
+- decode split-k reduce 默认已切到 `L32`，subgroup 保持实验开关。
+
+#### 下一步（精确）
+1. 进入 D-8.4：优化 split-k stage1 中间张量（`partial_o/m/l`）写回成本，目标继续压低 `k=65+` decode 开销。
+2. 继续对照 Metal/Ollama，评估“stage1+reduce 融合”可行性（先 decode，再 prefill）。
+3. 启动 D-9：QMM decode `M=1` 专项核（预计是下一主要吞吐瓶颈）。

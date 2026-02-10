@@ -1,0 +1,155 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Stage 2 for decode SDPA split-k (subgroup prototype):
+// reduce partial tuples (o_i, m_i, l_i) into final bf16 output.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer PartialOBuffer {
+  float values[];
+} partial_o_buffer;
+
+layout(set = 0, binding = 1) readonly buffer PartialMBuffer {
+  float values[];
+} partial_m_buffer;
+
+layout(set = 0, binding = 2) readonly buffer PartialLBuffer {
+  float values[];
+} partial_l_buffer;
+
+layout(set = 0, binding = 3) buffer OutBuffer {
+  uint words[];
+} out_buffer;
+
+layout(push_constant) uniform PushConstants {
+  uint batch_size;
+  uint n_q_heads;
+  uint q_len;
+  uint v_dim;
+  uint split_k;
+} params;
+
+const uint WG_SIZE = 64u;
+const float NEG_LARGE = -3.4028235e38;
+const float LOG2_E = 1.4426950408889634;
+
+shared float subgroup_reduce_buf[WG_SIZE];
+shared float final_m;
+shared float final_l;
+shared float out_accum[256];
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float fast_exp(float x) {
+  return exp2(x * LOG2_E);
+}
+
+void store_out(uint elem_idx, float value) {
+  uint word_idx = elem_idx >> 1u;
+  uint packed = out_buffer.words[word_idx];
+  uint bf16_val = f32_to_bf16(value) & 0xFFFFu;
+  if ((elem_idx & 1u) == 0u) {
+    packed = (packed & 0xFFFF0000u) | bf16_val;
+  } else {
+    packed = (packed & 0x0000FFFFu) | (bf16_val << 16u);
+  }
+  out_buffer.words[word_idx] = packed;
+}
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+
+  uint n_rows = params.batch_size * params.n_q_heads * params.q_len;
+  if (row >= n_rows || params.v_dim == 0u || params.v_dim > 256u ||
+      params.split_k == 0u) {
+    return;
+  }
+
+  uint row_split_base = row * params.split_k;
+
+  // Pass 1: M = max_i(m_i)
+  float local_max = NEG_LARGE;
+  for (uint part = lane; part < params.split_k; part += WG_SIZE) {
+    float m = partial_m_buffer.values[row_split_base + part];
+    local_max = max(local_max, m);
+  }
+  float subgroup_max = subgroupMax(local_max);
+  if (gl_SubgroupInvocationID == 0u) {
+    subgroup_reduce_buf[gl_SubgroupID] = subgroup_max;
+  }
+  barrier();
+  if (gl_SubgroupID == 0u) {
+    float subgroup_seed =
+        (lane < gl_NumSubgroups) ? subgroup_reduce_buf[lane] : NEG_LARGE;
+    float group_max = subgroupMax(subgroup_seed);
+    if (gl_SubgroupInvocationID == 0u) {
+      final_m = group_max;
+    }
+  }
+  barrier();
+
+  // Pass 2: L = sum_i(exp(m_i - M) * l_i)
+  float local_l = 0.0;
+  for (uint part = lane; part < params.split_k; part += WG_SIZE) {
+    float m = partial_m_buffer.values[row_split_base + part];
+    float l = partial_l_buffer.values[row_split_base + part];
+    if (l > 0.0) {
+      local_l += fast_exp(m - final_m) * l;
+    }
+  }
+  float subgroup_l = subgroupAdd(local_l);
+  if (gl_SubgroupInvocationID == 0u) {
+    subgroup_reduce_buf[gl_SubgroupID] = subgroup_l;
+  }
+  barrier();
+  if (gl_SubgroupID == 0u) {
+    float subgroup_seed =
+        (lane < gl_NumSubgroups) ? subgroup_reduce_buf[lane] : 0.0;
+    float group_l = subgroupAdd(subgroup_seed);
+    if (gl_SubgroupInvocationID == 0u) {
+      final_l = group_l;
+    }
+  }
+  barrier();
+
+  // Pass 3: O = (sum_i(exp(m_i - M) * o_i)) / L
+  for (uint dv = lane; dv < params.v_dim; dv += WG_SIZE) {
+    float acc = 0.0;
+    for (uint part = 0u; part < params.split_k; ++part) {
+      uint part_idx = row_split_base + part;
+      float m = partial_m_buffer.values[part_idx];
+      float coeff = fast_exp(m - final_m);
+      acc += coeff * partial_o_buffer.values[part_idx * params.v_dim + dv];
+    }
+    if (final_l > 0.0) {
+      acc /= final_l;
+    } else {
+      acc = 0.0;
+    }
+    out_accum[dv] = acc;
+  }
+  barrier();
+
+  uint out_base = row * params.v_dim;
+  if ((params.v_dim & 1u) == 0u) {
+    uint out_word_base = out_base >> 1u;
+    uint out_word_count = params.v_dim >> 1u;
+    for (uint w = lane; w < out_word_count; w += WG_SIZE) {
+      uint dv = w << 1u;
+      uint lo = f32_to_bf16(out_accum[dv]) & 0xFFFFu;
+      uint hi = f32_to_bf16(out_accum[dv + 1u]) & 0xFFFFu;
+      out_buffer.words[out_word_base + w] = lo | (hi << 16u);
+    }
+  } else if (lane == 0u) {
+    for (uint dv = 0u; dv < params.v_dim; ++dv) {
+      store_out(out_base + dv, out_accum[dv]);
+    }
+  }
+}

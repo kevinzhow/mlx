@@ -245,6 +245,22 @@ inline const char* sdpa_len_bucket(uint32_t len) {
   return "65+";
 }
 
+inline const char* sdpa_splitk_bucket(uint32_t split_k) {
+  if (split_k <= 2u) {
+    return "2";
+  }
+  if (split_k <= 4u) {
+    return "3-4";
+  }
+  if (split_k <= 8u) {
+    return "5-8";
+  }
+  if (split_k <= 16u) {
+    return "9-16";
+  }
+  return "17+";
+}
+
 inline const char* sdpa_stage_name(uint32_t q_len) {
   return q_len <= 1u ? "decode" : "prefill";
 }
@@ -278,6 +294,24 @@ inline bool native_sdpa_decode_d128_k64_kernel_enabled() {
   return enabled;
 }
 
+inline bool native_sdpa_decode_d128_k128_kernel_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_SDPA_DECODE_D128_K128");
+  return enabled;
+}
+
+inline bool native_sdpa_decode_splitk_reduce_l32_kernel_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_L32");
+  return enabled;
+}
+
+inline bool native_sdpa_decode_splitk_reduce_subgroup_kernel_enabled() {
+  static const bool enabled =
+      env_flag_default_false("MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_SUBGROUP");
+  return enabled;
+}
+
 inline std::string sdpa_bucket_key(uint32_t q_len, uint32_t k_len) {
   return std::string("stage=") + sdpa_stage_name(q_len) + " q=" +
       sdpa_len_bucket(q_len) + " k=" + sdpa_len_bucket(k_len);
@@ -301,11 +335,30 @@ inline const char* sdpa_native_direct_kernel(
         native_sdpa_decode_d128_k64_kernel_enabled()) {
       return mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1_D128_K64;
     }
+    if (k_len <= 128u && mask_mode == 0u &&
+        native_sdpa_decode_d128_k128_kernel_enabled()) {
+      return mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1_D128_K128;
+    }
     return mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1_D128;
   }
   return path_kind == SdpaNativePathKind::Decode
       ? mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_Q1
       : mlx::core::vulkan::KernelRegistry::SDPA_BF16_PREFILL_Q1;
+}
+
+inline bool prefer_sdpa_decode_direct_d128(
+    SdpaNativePathKind path_kind,
+    uint32_t qk_dim,
+    uint32_t v_dim,
+    uint32_t k_len,
+    uint32_t mask_mode) {
+  return path_kind == SdpaNativePathKind::Decode &&
+      qk_dim == 128u &&
+      v_dim == 128u &&
+      k_len <= 128u &&
+      mask_mode == 0u &&
+      native_sdpa_decode_d128_kernel_enabled() &&
+      native_sdpa_decode_d128_k128_kernel_enabled();
 }
 
 inline const char* sdpa_native_splitk_stage1_kernel(
@@ -316,7 +369,16 @@ inline const char* sdpa_native_splitk_stage1_kernel(
 }
 
 inline const char* sdpa_native_splitk_reduce_kernel(
-    SdpaNativePathKind path_kind) {
+    SdpaNativePathKind path_kind,
+    uint32_t split_k) {
+  if (path_kind == SdpaNativePathKind::Decode && split_k > 1u &&
+      native_sdpa_decode_splitk_reduce_subgroup_kernel_enabled()) {
+    return mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_SPLITK_REDUCE_SUBGROUP;
+  }
+  if (path_kind == SdpaNativePathKind::Decode && split_k <= 16u &&
+      native_sdpa_decode_splitk_reduce_l32_kernel_enabled()) {
+    return mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_SPLITK_REDUCE_L32;
+  }
   return path_kind == SdpaNativePathKind::Decode
       ? mlx::core::vulkan::KernelRegistry::SDPA_BF16_DECODE_SPLITK_REDUCE
       : mlx::core::vulkan::KernelRegistry::SDPA_BF16_PREFILL_SPLITK_REDUCE;
@@ -337,6 +399,8 @@ struct SdpaStatsState {
   std::unordered_map<std::string, uint64_t> native_reject_reason_counts;
   std::unordered_map<std::string, uint64_t> native_reject_reason_bucket_counts;
   std::unordered_map<std::string, uint64_t> native_hit_bucket_counts;
+  std::unordered_map<std::string, uint64_t> splitk_reduce_kernel_counts;
+  std::unordered_map<std::string, uint64_t> splitk_parts_bucket_counts;
 };
 
 inline SdpaStatsState& sdpa_stats_state() {
@@ -452,6 +516,28 @@ inline void sdpa_stats_record_final_fallback() {
   state.final_fallbacks++;
 }
 
+inline void sdpa_stats_record_splitk_reduce_dispatch(
+    const char* kernel,
+    uint32_t split_k,
+    uint32_t q_len,
+    uint32_t k_len) {
+  if (!sdpa_stats_enabled() || split_k <= 1u) {
+    return;
+  }
+  auto& state = sdpa_stats_state();
+  (void)sdpa_stats_reporter();
+  const std::string kernel_name =
+      (kernel && kernel[0] != '\0') ? kernel : "unknown";
+  const std::string kernel_key =
+      std::string("stage=") + sdpa_stage_name(q_len) + " kernel=" + kernel_name;
+  const std::string splitk_bucket_key =
+      std::string("stage=") + sdpa_stage_name(q_len) + " split_k=" +
+      sdpa_splitk_bucket(split_k) + " k=" + sdpa_len_bucket(k_len);
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.splitk_reduce_kernel_counts[kernel_key]++;
+  state.splitk_parts_bucket_counts[splitk_bucket_key]++;
+}
+
 inline void sdpa_stats_dump() {
   if (!sdpa_stats_enabled()) {
     return;
@@ -476,6 +562,10 @@ inline void sdpa_stats_dump() {
             << " native_reject_reason_keys="
             << state.native_reject_reason_counts.size()
             << " hit_bucket_keys=" << state.native_hit_bucket_counts.size()
+            << " splitk_reduce_kernel_keys="
+            << state.splitk_reduce_kernel_counts.size()
+            << " splitk_parts_bucket_keys="
+            << state.splitk_parts_bucket_counts.size()
             << "\n";
 
   for (const auto& [key, count] :
@@ -501,6 +591,16 @@ inline void sdpa_stats_dump() {
   for (const auto& [key, count] :
        sort_stats_counts(state.native_reject_reason_bucket_counts)) {
     std::cerr << "[VulkanSDPAStats][NativeRejectReasonBucket] " << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.splitk_reduce_kernel_counts)) {
+    std::cerr << "[VulkanSDPAStats][SplitKReduceKernel] " << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.splitk_parts_bucket_counts)) {
+    std::cerr << "[VulkanSDPAStats][SplitKPartsBucket] " << key
               << " count=" << count << "\n";
   }
 }
@@ -700,7 +800,8 @@ inline uint32_t native_sdpa_splitk_max_parts_decode() {
   static const uint32_t value = std::max<uint32_t>(
       1u,
       parse_env_u32(
-          "MLX_VK_SDPA_SPLITK_MAX_PARTS_DECODE", native_sdpa_splitk_max_parts()));
+          "MLX_VK_SDPA_SPLITK_MAX_PARTS_DECODE",
+          std::max<uint32_t>(16u, native_sdpa_splitk_max_parts())));
   return value;
 }
 
@@ -733,7 +834,7 @@ inline uint32_t native_sdpa_splitk_max_parts_prefill() {
 
 inline uint32_t native_sdpa_splitk_target_workgroups_decode() {
   static const uint32_t value = std::max<uint32_t>(
-      1u, parse_env_u32("MLX_VK_SDPA_SPLITK_TARGET_WG_DECODE", 64u));
+      1u, parse_env_u32("MLX_VK_SDPA_SPLITK_TARGET_WG_DECODE", 128u));
   return value;
 }
 
@@ -2506,8 +2607,12 @@ void fast::ScaledDotProductAttention::eval_gpu(
             encode_push_constant_u32(v_dim_local),
             encode_push_constant_u32(split_k_local)};
 
+        const char* reduce_kernel =
+            sdpa_native_splitk_reduce_kernel(path_kind, split_k_local);
+        sdpa_stats_record_splitk_reduce_dispatch(
+            reduce_kernel, split_k_local, q_len_local, k_len_local);
         encoder.record_algo_dispatch(
-            sdpa_native_splitk_reduce_kernel(path_kind),
+            reduce_kernel,
             {splitk_tensors.partial_o_tensor,
              splitk_tensors.partial_m_tensor,
              splitk_tensors.partial_l_tensor,
@@ -2599,7 +2704,11 @@ void fast::ScaledDotProductAttention::eval_gpu(
         n_rows_u64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
         ? std::numeric_limits<uint32_t>::max()
         : static_cast<uint32_t>(n_rows_u64);
-    const uint32_t split_k = select_sdpa_split_k(k_len, q_len, n_rows);
+    uint32_t split_k = select_sdpa_split_k(k_len, q_len, n_rows);
+    if (prefer_sdpa_decode_direct_d128(
+            path_kind, qk_dim, v_dim, k_len, mask_mode)) {
+      split_k = 1u;
+    }
     if (dispatch_native_sdpa(
             path_kind,
             native_inputs,
@@ -2713,8 +2822,16 @@ void fast::ScaledDotProductAttention::eval_gpu(
                 static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
             ? std::numeric_limits<uint32_t>::max()
             : static_cast<uint32_t>(packed_n_rows_u64);
-        const uint32_t packed_split_k =
+        uint32_t packed_split_k =
             select_sdpa_split_k(packed_k_len, packed_q_len, packed_n_rows);
+        if (prefer_sdpa_decode_direct_d128(
+                packed_path_kind,
+                packed_qk_dim,
+                packed_v_dim,
+                packed_k_len,
+                packed_mask_mode)) {
+          packed_split_k = 1u;
+        }
         if (dispatch_native_sdpa(
                 packed_path_kind,
                 packed_native_inputs,
