@@ -574,8 +574,9 @@ public:
   - bool mask -> `-inf` 屏蔽
   - additive mask -> 直接加到 logits
   - causal 在 `q_len <= k_len` 下与 Metal 同步偏移规则
-- 当前 decode 实现里 `supports_bool_mask()` 为 `false`（在 fast 层先转 additive）；
-  后续可在 kernel 直接支持 bool 后切回 `true`。训练/VJP 继续 fallback，确保梯度语义不回退。
+- 当前 decode 实现已支持 `supports_bool_mask() == true`：
+  bool mask 在 native 前重编码为 `uint32`（`mask_mode=2`）并由 kernel 直接按布尔语义屏蔽；
+  additive mask 继续使用 `mask_mode=1`。训练/VJP 继续 fallback，确保梯度语义不回退。
 
 #### 分阶段落地（执行顺序）
 1. `A1`：替换当前 `sdpa_bf16_decode_q1` 为 subgroup 版本，先解除 `k_len<=8` 的性能阻塞。

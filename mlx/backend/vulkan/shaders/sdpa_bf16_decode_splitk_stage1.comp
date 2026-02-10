@@ -98,6 +98,10 @@ float load_mask_add(uint elem_idx) {
   return bf16_to_f32(bf16_bits);
 }
 
+bool load_mask_bool(uint elem_idx) {
+  return mask_buffer.words[elem_idx] != 0u;
+}
+
 float masked_logit(float dot, uint q_pos, uint k_pos, uint mask_base, out bool valid) {
   valid = true;
   float logit = dot * params.scale;
@@ -113,6 +117,11 @@ float masked_logit(float dot, uint q_pos, uint k_pos, uint mask_base, out bool v
   if (params.mask_mode == 1u) {
     logit += load_mask_add(mask_base + k_pos * params.mask_k_stride);
     if (isinf(logit) && logit < 0.0) {
+      valid = false;
+      return 0.0;
+    }
+  } else if (params.mask_mode == 2u) {
+    if (!load_mask_bool(mask_base + k_pos * params.mask_k_stride)) {
       valid = false;
       return 0.0;
     }

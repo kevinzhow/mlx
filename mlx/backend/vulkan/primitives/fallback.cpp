@@ -1021,7 +1021,8 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
   }
 
   if (has_arr_mask) {
-    if (mask->dtype() != mlx::core::bfloat16) {
+    if (mask->dtype() != mlx::core::bfloat16 &&
+        mask->dtype() != mlx::core::uint32) {
       return reject("mask_dtype");
     }
     if (mask->ndim() != 4 || mask->shape(0) != b || mask->shape(1) != hq ||
@@ -1047,7 +1048,7 @@ inline bool can_use_native_sdpa_bf16_decode_q1(
         max_elem_u64 >= static_cast<uint64_t>(mask->data_size())) {
       return reject_layout("mask_layout", *mask);
     }
-    mask_mode = 1u;
+    mask_mode = (mask->dtype() == mlx::core::bfloat16) ? 1u : 2u;
     mask_batch_stride = static_cast<uint32_t>(st[0]);
     mask_head_stride = static_cast<uint32_t>(st[1]);
     mask_q_stride = static_cast<uint32_t>(st[2]);
@@ -1486,10 +1487,8 @@ bool fast::ScaledDotProductAttention::use_fallback(
 }
 
 bool fast::ScaledDotProductAttention::supports_bool_mask() {
-  // Vulkan decode kernel currently consumes additive bf16 mask only.
-  // Returning false makes fast.cpp convert bool mask to additive form
-  // before creating this primitive.
-  return false;
+  // Vulkan decode path supports bool masks via native mask_mode=2.
+  return true;
 }
 
 bool fast::ScaledDotProductAttentionVJP::use_fallback(const array&, Stream) {
@@ -1916,8 +1915,34 @@ void fast::ScaledDotProductAttention::eval_gpu(
     }
   };
 
+  auto prepare_native_inputs = [&](const std::vector<array>& src_inputs) {
+    std::vector<array> native_inputs = src_inputs;
+    if (native_inputs.size() <= 3 || native_inputs[3].dtype() != mlx::core::bool_) {
+      return native_inputs;
+    }
+
+    try {
+      // Repack bool mask to uint32 for shader-side native bool path
+      // (mask_mode=2). This avoids front-end bool->additive conversion.
+      native_inputs[3] = astype(native_inputs[3], mlx::core::uint32, stream);
+      auto& mask_u32 = native_inputs[3];
+      if (mask_u32.status() == array::Status::unscheduled) {
+        mask_u32.eval();
+      }
+    } catch (const std::exception& e) {
+      if (sdpa_debug_reject_enabled() ||
+          env_flag_default_false("MLX_VK_DEBUG_SDPA_ERROR")) {
+        std::cerr << "[VulkanSDPABoolMaskCastError] " << e.what() << "\n";
+      }
+      return src_inputs;
+    }
+    return native_inputs;
+  };
+
+  auto native_inputs = prepare_native_inputs(inputs);
+
   if (native_sdpa_enabled() && can_use_native_sdpa_bf16_decode_q1(
-          inputs,
+          native_inputs,
           outputs,
           do_causal_,
           has_sinks_,
@@ -1941,7 +1966,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
           &native_reject_reason)) {
     const uint32_t split_k = select_sdpa_split_k(k_len);
     if (dispatch_native_decode(
-            inputs,
+            native_inputs,
             batch_size,
             n_q_heads,
             n_kv_heads,
@@ -2000,6 +2025,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
     }
 
     if (repacked_any) {
+      auto packed_native_inputs = prepare_native_inputs(packed_inputs);
       uint32_t packed_batch = 0;
       uint32_t packed_q_heads = 0;
       uint32_t packed_kv_heads = 0;
@@ -2018,7 +2044,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
       uint32_t packed_mask_k_stride = 0;
       const char* packed_reject_reason = nullptr;
       if (can_use_native_sdpa_bf16_decode_q1(
-              packed_inputs,
+              packed_native_inputs,
               outputs,
               do_causal_,
               has_sinks_,
@@ -2042,7 +2068,7 @@ void fast::ScaledDotProductAttention::eval_gpu(
               &packed_reject_reason)) {
         const uint32_t packed_split_k = select_sdpa_split_k(packed_k_len);
         if (dispatch_native_decode(
-                packed_inputs,
+                packed_native_inputs,
                 packed_batch,
                 packed_q_heads,
                 packed_kv_heads,

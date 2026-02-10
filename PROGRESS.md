@@ -1692,3 +1692,55 @@ python -m unittest discover -v
 1. 推进 bool mask kernel 原生支持，移除 fast 层前置 bool->additive 转换。
 2. 在保持正确性的前提下，设计并验证 `K cap` 的下一档扩展（优先 `14~16` 的 decode 真实负载）。
 3. 补 `max_tokens=40` 与更长上下文的串行吞吐门禁，跟踪 `Q/K cap` 调整后的稳定收益。
+
+### 2026-02-10 主线推进（SDPA bool mask native 命中）✅
+
+#### 本轮目标
+- 落地 SDPA bool mask native 路径，移除 fast 层前置 bool->additive 转换。
+
+#### 本轮变更
+1. Vulkan SDPA gate 扩展（mask dtype）：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `can_use_native_sdpa_bf16_decode_q1` 的 `mask_dtype` 从仅 `bfloat16` 扩展为：
+     - `bfloat16` -> `mask_mode=1`（additive）
+     - `uint32` -> `mask_mode=2`（bool）
+2. bool mask 前置转换策略调整：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `supports_bool_mask()` 改为 `true`；
+   - 在 native dispatch 前仅对 bool mask 做轻量重编码：`bool -> uint32`，不再做 `bool -> additive(-inf)`。
+3. SDPA shader 增加 bool 分支：
+   - 文件：
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1.comp`
+     - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1.comp`
+   - 新增 `mask_mode=2` 路径：`mask==false` 直接判为 invalid（与 bool mask 语义对齐）。
+4. 同步 SPIR-V 头文件：
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_q1_spv.h`
+   - `mlx/backend/vulkan/shaders/sdpa_bf16_decode_splitk_stage1_spv.h`
+5. 架构文档同步：
+   - `mlx/backend/vulkan/ARCHITECTURE.md`：更新 `supports_bool_mask` 状态与 `mask_mode=2` 说明。
+
+#### 验证结果
+1. 构建：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+2. Python 回归：
+   - `python -m unittest -v test_fast_sdpa` => `20 passed, 1 skipped` ✅
+3. C++ 回归：
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+4. bool native 命中证据：
+   - `MLX_VK_DEBUG_SDPA_HIT=1` 下，`Q=4, K=13` 的 bool mask 出现：
+     - `VulkanSDPAHit ... mask_mode=2` ✅
+5. Qwen 冒烟（默认实卡路径）：
+   - EN（10-token）`Generation: 3.058 tok/s`
+   - ZH（10-token）`Generation: 3.094 tok/s`
+   - 输出前缀正常，未见乱码/异常。✅
+
+#### 当前状态
+- ✅ bool mask 已进入 Vulkan SDPA native（`mask_mode=2`），不再依赖 fast 层 additive 转换。
+- ✅ additive / causal / array-mask 路径仍保持可用，回归未见退化。
+- ⚠️ 当前主要瓶颈仍是 `K cap=13` 导致 `k_len>=14` decode 回退。
+
+#### 下一步（精确）
+1. 推进 `K cap` 小步扩展（先 `14~16`）并做 Qwen + synthetic A/B（正确性优先，吞吐次之）。
+2. 复测 `max_tokens=40` 与更长上下文，确认 bool-native 接入后无长序列回退。
+3. 开始设计 prefill/full 路径（`Q_len > 13`）native gate，减少 prefill fallback 覆盖空洞。
