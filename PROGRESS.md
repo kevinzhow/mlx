@@ -1744,3 +1744,61 @@ python -m unittest discover -v
 1. 推进 `K cap` 小步扩展（先 `14~16`）并做 Qwen + synthetic A/B（正确性优先，吞吐次之）。
 2. 复测 `max_tokens=40` 与更长上下文，确认 bool-native 接入后无长序列回退。
 3. 开始设计 prefill/full 路径（`Q_len > 13`）native gate，减少 prefill fallback 覆盖空洞。
+
+### 2026-02-10 主线推进（`K cap` A/B + 默认上调到 `16`）✅
+
+#### 本轮目标
+- 完成 `K cap=13/14/16` 实卡对照，基于命中率与吞吐决定是否继续扩大默认 native decode 覆盖。
+
+#### 本轮变更
+1. 默认门限上调（保守小步）：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `native_sdpa_max_k_len()` 默认值从 `13` 调整到 `16`（仍支持 `MLX_VK_SDPA_MAX_K_LEN` 覆盖）。
+2. 对照实验（实卡，Qwen）：
+   - 负载 A：`prompt="Hi"/"你好啊"`, `max_tokens=40`
+   - 负载 B：`prompt="Hi what is your name"`, `max_tokens=10`
+   - 负载 C：`prompt="Hi what is your name"`, `max_tokens=3`（重复多次，观察交互短输出）。
+
+#### 验证结果
+1. `max_tokens=40`（带 reject 计数，`cap=13/14/16`）：
+   - `cap=13`
+     - EN generation: `2.386 tok/s`, `k_len_cap rejects=1008`
+     - ZH generation: `2.396 tok/s`, `k_len_cap rejects=1036`
+   - `cap=14`
+     - EN generation: `2.365 tok/s`, `k_len_cap rejects=980`
+     - ZH generation: `2.407 tok/s`, `k_len_cap rejects=1008`
+   - `cap=16`
+     - EN generation: `2.360 tok/s`, `k_len_cap rejects=924`
+     - ZH generation: `2.393 tok/s`, `k_len_cap rejects=952`
+   - 结论：吞吐基本同量级，但 `cap=16` 明显减少 `k_len_cap` 回退（约 8%）。
+2. `max_tokens=40`（无 debug，`cap=13` vs `16`）：
+   - `cap=13`: EN `2.393 tok/s`, ZH `2.405 tok/s`
+   - `cap=16`: EN `2.398 tok/s`, ZH `2.409 tok/s`
+   - 结论：无明显回退，略有正向漂移。
+3. `max_tokens=10`（EN，重复）：
+   - `cap=13`: `3.080 / 3.038 / 3.026 tok/s`
+   - `cap=16`: `2.986 / 3.085 / 3.042 tok/s`
+   - 结论：基本持平（噪声范围内）。
+4. `max_tokens=3`（EN，重复）：
+   - `cap=13`: `4.308 / 4.301 / 4.248 / 4.307 / 4.186 tok/s`
+   - `cap=16`: `4.491 / 4.367 / 4.334 / 4.417 / 4.332 tok/s`
+   - 结论：短输出交互场景中 `cap=16` 有稳定小幅提升。
+5. 默认 `cap=16` 生效验证（不设环境变量）：
+   - EN 10-token: `Generation: 3.105 tok/s`
+   - ZH 10-token: `Generation: 3.080 tok/s`
+   - EN 40-token: `Generation: 2.391 tok/s`, `k_len_cap rejects=924`
+6. 回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+   - `python -m unittest -v test_fast_sdpa` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+
+#### 当前状态
+- ✅ 默认 `K cap` 已从 `13` 上调到 `16`，native decode 覆盖进一步扩大且未见稳定吞吐回退。
+- ✅ `Q cap=13` + `K cap=16` 组合在当前模型/实卡负载下保持正确性与稳定输出。
+- ⚠️ `k_len > 16` 仍会触发 `k_len_cap` 回退，长上下文 decode 仍有明显 CPU fallback 比例。
+
+#### 下一步（精确）
+1. 继续 `K cap` 分段扩展实验（`20/24`），并与 split-k 参数联动，寻找长上下文收益拐点。
+2. 在 `max_tokens=40/80` 与更长 prompt 下建立固定门禁，持续跟踪 `k_len_cap` 回退比例。
+3. 启动 prefill/full（`Q_len>13`）native 路径设计，优先补齐与 Metal 对齐的高收益覆盖空洞。

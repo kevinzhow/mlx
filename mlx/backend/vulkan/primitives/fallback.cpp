@@ -212,9 +212,9 @@ inline bool native_sdpa_enabled() {
 
 inline uint32_t native_sdpa_max_k_len() {
   static const uint32_t max_k_len = []() -> uint32_t {
-    // Conservative default widened after SDPA SPIR-V sync and long-sequence
-    // verification; env override remains available for controlled rollout.
-    constexpr uint32_t kDefault = 13u;
+    // Default widened after K-cap A/B (13/14/16): hit-rate improves on early
+    // decode steps while throughput remains neutral in 10/40-token workloads.
+    constexpr uint32_t kDefault = 16u;
     const char* v = std::getenv("MLX_VK_SDPA_MAX_K_LEN");
     if (!v || v[0] == '\0') {
       return kDefault;
