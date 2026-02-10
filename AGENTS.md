@@ -77,6 +77,15 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - No duplicate symbols or unresolved symbols.
   - GPU path links and initializes with Vulkan enabled.
   - Covered operators match CPU results.
+- Qwen3 run rule (mandatory):
+  - This serial-only rule applies to Qwen3 `mlx_lm generate` correctness/perf runs.
+  - Do not launch multiple Qwen3 generate commands in parallel shells/processes.
+  - `ctest` / regular Python unit tests are not constrained by this rule.
+- Python extension refresh rule (mandatory):
+  - Any C++/Vulkan/shader-header change can make existing Python extension artifacts stale.
+  - Before any Python-side test/benchmark/correctness claim, rebuild and reinstall the extension in-place:
+    - `python3 setup.py build_ext --inplace`
+  - Treat results as invalid if this rebuild step was skipped after source changes.
 - Shader update rule (mandatory):
   - Vulkan runtime uses embedded shader headers `*_spv.h` (via `kernel_registry`), not `.comp` files directly.
   - Any shader change must follow: `.comp -> .spv -> *_spv.h` in the same cycle.
@@ -100,12 +109,14 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_QMM_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1=1` (default ON, decode `rows==1` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=1` (default ON, decode `rows==1` 并行归约路径)
+  - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1` (default ON, decode `rows==1` subgroup 归约路径；若 dispatch 失败会在进程内自动降级关闭)
   - `MLX_VK_ENABLE_QMM_NATIVE_M16=1` (default ON, prefill `9<=rows<=16` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M2=1` (default ON, small-batch `rows==2` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M4=1` (default ON, small-batch `rows==4` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M8=1` (default ON, small-batch `rows==8` 专核路径)
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_ROPE_NATIVE=1` (default ON)
+  - `MLX_VK_ENABLE_ROPE_HS_TRANSPOSED=1` (default ON, 允许 RoPE 读取 head/seq 转置输入布局)
   - `MLX_VK_ENABLE_SDPA_NATIVE=1` (default ON, still narrow gate in code)
   - `MLX_VK_ENABLE_ARGREDUCE_ARGMAX_LASTDIM=1` (default ON, `ArgMax + axis=last + row-contiguous` 原生路径)
   - `MLX_VK_ENABLE_COMPILED_SIGMOID_MUL_MUL_BF16=1` (default ON, `CompiledSigmoidMultiplyMultiply` bf16 专项原生路径)
@@ -144,12 +155,14 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=0|1`
+  - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M16=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M2=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M4=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M8=0|1`
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=0|1`
   - `MLX_VK_ENABLE_ROPE_NATIVE=0|1`
+  - `MLX_VK_ENABLE_ROPE_HS_TRANSPOSED=0|1`
   - `MLX_VK_ENABLE_SDPA_NATIVE=0|1`
   - `MLX_VK_ENABLE_ARGREDUCE_ARGMAX_LASTDIM=0|1`
   - `MLX_VK_ENABLE_COMPILED_SIGMOID_MUL_MUL_BF16=0|1`
@@ -172,7 +185,8 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 
 ### Benchmarking Notes
 
-- Run `mlx_lm generate` benchmarks serially (not in parallel shells/processes) to avoid transient JIT cache races under `/tmp/mlx/.../*.so` (e.g. `file too short`) that can skew results.
+- Run Qwen3 `mlx_lm generate` benchmarks serially (not in parallel shells/processes) to avoid transient JIT cache races under `/tmp/mlx/.../*.so` (e.g. `file too short`) that can skew results.
+- Recommended Qwen3 benchmark order: build/update -> `python3 setup.py build_ext --inplace` -> run Qwen3 benchmark(s) serially.
 
 ## Definition of Done
 

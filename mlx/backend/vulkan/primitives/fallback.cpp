@@ -1,6 +1,7 @@
 // Copyright © 2026 MLX Vulkan Backend
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -824,6 +825,29 @@ inline bool native_qmm_m1_reduce_enabled() {
   return enabled;
 }
 
+inline std::atomic<bool>& native_qmm_m1_reduce_subgroup_runtime_disabled() {
+  static std::atomic<bool> disabled{false};
+  return disabled;
+}
+
+inline bool native_qmm_m1_reduce_subgroup_enabled() {
+  static const bool enabled = env_flag_default_true(
+      "MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP");
+  return enabled &&
+      !native_qmm_m1_reduce_subgroup_runtime_disabled().load(
+          std::memory_order_relaxed);
+}
+
+inline void disable_native_qmm_m1_reduce_subgroup_runtime() {
+  auto& disabled = native_qmm_m1_reduce_subgroup_runtime_disabled();
+  bool expected = false;
+  if (disabled.compare_exchange_strong(
+          expected, true, std::memory_order_relaxed)) {
+    std::cerr
+        << "[VulkanQMM] disable m1_reduce_subgroup after dispatch failure\n";
+  }
+}
+
 inline bool native_qmm_m16_enabled() {
   static const bool enabled =
       env_flag_default_true("MLX_VK_ENABLE_QMM_NATIVE_M16");
@@ -1206,14 +1230,8 @@ inline uint32_t select_sdpa_split_k(uint32_t k_len, uint32_t q_len, uint32_t n_r
 }
 
 inline bool native_rope_hs_transposed_enabled() {
-  static const bool enabled = []() {
-    const char* v = std::getenv("MLX_VK_ENABLE_ROPE_HS_TRANSPOSED");
-    if (!v) {
-      return false;
-    }
-    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "on") == 0;
-  }();
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_ROPE_HS_TRANSPOSED");
   return enabled;
 }
 
@@ -2242,6 +2260,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       const bool use_m1_kernel = native_qmm_m1_enabled() && (rows == 1u);
       const bool use_m1_reduce_kernel =
           native_qmm_m1_reduce_enabled() && (rows == 1u);
+      const bool use_m1_reduce_subgroup_kernel =
+          use_m1_reduce_kernel && native_qmm_m1_reduce_subgroup_enabled();
       const bool use_m16_kernel =
           native_qmm_m16_enabled() && (rows > 8u) && (rows <= 16u);
       const bool use_m2_kernel = native_qmm_m2_enabled() && (rows == 2u);
@@ -2252,20 +2272,24 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           use_m1_reduce_kernel
           ? std::max<uint32_t>(1, out_words)
           : std::max<uint32_t>(1, (out_words + wg_size_x - 1u) / wg_size_x);
-      const char* qmm_kernel =
-          use_m1_reduce_kernel
-          ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE
-          : (use_m1_kernel
-          ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1
-          : (use_m16_kernel
-                 ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M16
-                 : (use_m2_kernel
-                 ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M2
-                 : (use_m4_kernel
-                        ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M4
-                        : (use_m8_kernel
-                               ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M8
-                               : vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128)))));
+      const char* qmm_kernel_base = vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128;
+      if (use_m1_reduce_kernel) {
+        qmm_kernel_base = vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE;
+      } else if (use_m1_kernel) {
+        qmm_kernel_base = vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1;
+      } else if (use_m16_kernel) {
+        qmm_kernel_base = vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M16;
+      } else if (use_m2_kernel) {
+        qmm_kernel_base = vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M2;
+      } else if (use_m4_kernel) {
+        qmm_kernel_base = vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M4;
+      } else if (use_m8_kernel) {
+        qmm_kernel_base = vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M8;
+      }
+      const char* qmm_kernel_fallback = qmm_kernel_base;
+      const char* qmm_kernel = use_m1_reduce_subgroup_kernel
+          ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP
+          : qmm_kernel_base;
       qmm_kernel_for_stats = qmm_kernel;
 
       const std::vector<uint32_t> push_consts{
@@ -2301,18 +2325,35 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       if (biases_cached.cacheable && biases_cached.needs_sync) {
         mark_qmm_const_tensor_uploaded(biases_cached.key);
       }
-      encoder.record_algo_dispatch(
-          qmm_kernel,
-          {x_tensor,
-           w_cached.tensor,
-           scales_cached.tensor,
-           biases_cached.tensor,
-           out_tensor},
-          {groups_x, 1, 1},
-          push_consts);
-      device.mark_tensor_host_dirty(out, stream.index);
-      qmm_stats_record_native_dispatch_success(rows, qmm_kernel);
-      return;
+      const std::vector<std::shared_ptr<kp::Tensor>> dispatch_tensors{
+          x_tensor,
+          w_cached.tensor,
+          scales_cached.tensor,
+          biases_cached.tensor,
+          out_tensor};
+      auto dispatch_qmm = [&](const char* kernel_name) {
+        encoder.record_algo_dispatch(
+            kernel_name,
+            dispatch_tensors,
+            {groups_x, 1, 1},
+            push_consts);
+        device.mark_tensor_host_dirty(out, stream.index);
+      };
+
+      try {
+        dispatch_qmm(qmm_kernel);
+        qmm_stats_record_native_dispatch_success(rows, qmm_kernel);
+        return;
+      } catch (const std::exception&) {
+        if (use_m1_reduce_subgroup_kernel) {
+          disable_native_qmm_m1_reduce_subgroup_runtime();
+          qmm_kernel_for_stats = qmm_kernel_fallback;
+          dispatch_qmm(qmm_kernel_fallback);
+          qmm_stats_record_native_dispatch_success(rows, qmm_kernel_fallback);
+          return;
+        }
+        throw;
+      }
     } catch (const std::exception&) {
       qmm_stats_record_native_dispatch_fail(rows_hint, qmm_kernel_for_stats);
       // Fall through to CPU fallback.

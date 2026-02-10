@@ -11,11 +11,15 @@
 - 构建状态：`MLX_BUILD_VULKAN=ON` 下 `mlx` 与 `tests` 均可稳定构建链接。
 - 回归状态：`ctest` 全量 `223/223` 通过；`python/tests/test_fast_sdpa.py` 通过（`20 passed, 1 skipped`）。
 - 模型正确性：Qwen3-0.6B-MLX-4bit（EN/ZH，10 token）输出正常，无乱码/`!!!!!!!!!!` 回归。
+- 流程约束（新增）：Qwen3 `mlx_lm generate` 正确性/性能口径需串行执行；任意 C++/Vulkan/shader 变更后，Python 侧验证前必须先执行 `python3 setup.py build_ext --inplace`，避免旧扩展产物导致误判。
 - 近期吞吐（实卡 Vulkan，串行口径）：
   - 10-token（EN）：约 `4.63 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=1`）
-  - 40-token（EN）：约 `3.63 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=1`，默认 ON）
+  - 40-token（EN）：约 `3.67 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1`，默认 ON）
+  - 80-token（EN）：约 `2.96 tok/s`（同口径）
 - decode 主线 fallback 占比（同口径 profile）：
   - 由 `18.40%` 降到 `13.50%`
+- RoPE 回退状态（Qwen3 EN 40-token 样本）：
+  - `MLX_VK_ENABLE_ROPE_HS_TRANSPOSED=1` 时 `VulkanRoPEReject` 由 `55` 次降到 `0`。
 
 ## 历史完成摘要（已压缩）
 1. Vulkan 基础链路与运行时契约已打通  
@@ -146,12 +150,64 @@
 - 实测：Qwen3 EN 40-token 吞吐无稳定正收益（约 `3.32~3.33 tok/s`，未优于基线）。
 - 结论：已回退该实现，保持当前稳定核。
 
+### D-9.7：流程护栏修正（已完成）
+- 背景：出现过“源码已更新但 Python 扩展未重编，导致运行仍落在旧产物”的问题，干扰性能/正确性判断。
+- 本轮修正：
+  - 将“Qwen3 `mlx_lm generate` 口径必须串行执行（不并行）”写入 `AGENTS.md` 强制规则。
+  - 明确该串行约束仅针对 Qwen3 生成测试，不约束 `ctest`/常规 Python 单测。
+  - 将“Python 侧验证前必须先 `python3 setup.py build_ext --inplace`”写入 `AGENTS.md` 强制规则。
+  - 将该流程护栏同步记录到 `PROGRESS.md` 当前快照，作为后续默认执行前置条件。
+- 影响：
+  - 避免并行执行导致的瞬时缓存/产物竞争噪声。
+  - 避免旧扩展产物造成的假结论（尤其是 shader/C++ 改动后）。
+
+### D-9.8：RoPE head/seq 转置布局默认放开（已完成）
+- 背景：
+  - Qwen3 decode 样本中 RoPE fallback 主因集中为 `in_or_out_layout`。
+  - 典型输入布局：`shape=[1,8|16,12,128]`，`strides=[B,128,H*128,1]`，即 head/seq 转置视图。
+- 变更：
+  - 将 `MLX_VK_ENABLE_ROPE_HS_TRANSPOSED` 从默认 OFF 改为默认 ON（仍可 env 关闭）。
+  - 不改变 `MLX_VK_ENABLE_ROPE_NATIVE` 总开关语义。
+- 验证：
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 EN 40-token（实卡 Vulkan，串行）：`VulkanRoPEReject` 由 `55` -> `0`。
+  - 吞吐无负收益（40-token A/B 约持平，`~3.63 tok/s`）。
+- 结论：
+  - RoPE 高频布局回退已消除，后续优化重心继续放在 QMM 主耗时与剩余小算子回退尾部。
+
+### D-9.9：QMM `M1_REDUCE` subgroup 归约路径（已完成，默认 ON）
+- 背景（Metal/Ollama 对照）：
+  - Metal 路线长期依赖 SIMD-group / wave 级归约减少 workgroup 级 barrier 开销。
+  - Ollama/ggml Vulkan 路线同样在 decode 热核优先利用 subgroup/wave 原语，减少 shared-memory 归约树。
+  - 当前 QMM `rows=1` 是绝对主命中（`~8k` 次/40-token），适合作为 subgroup 先行落点。
+- 变更：
+  - 新增 shader：`qmm_affine_bf16_t4_g128_m1_reduce_subgroup.comp`（`subgroupAdd` 两级归约）。
+  - 新增 kernel 注册：`QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP`。
+  - `QuantizedMatmul::eval_gpu` 新增派发策略：
+    - 默认优先 `M1_REDUCE_SUBGROUP`。
+    - 若 subgroup kernel dispatch 异常，进程内自动降级关闭该路径并回退到 `M1_REDUCE`，避免重复异常。
+  - 新增 gate：`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP`（默认 ON，可显式关闭）。
+  - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h`。
+- 验证：
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 ZH 10-token 正确性：输出正常，无乱码，约 `4.648 tok/s`。
+- 吞吐 A/B（实卡 Vulkan，串行，EN）：
+  - 40-token：`3.669 tok/s`（subgroup ON） vs `3.632 tok/s`（subgroup OFF），`+1.0%`。
+  - 80-token：`2.959 tok/s`（subgroup ON） vs `2.915 tok/s`（subgroup OFF），`+1.5%`。
+  - 命中确认：`qmm_affine_bf16_t4_g128_m1_reduce_subgroup` 覆盖 `rows=1` 主桶（`8077/15957`）。
+- 结论：
+  - subgroup 路径带来小幅稳定正收益，说明方向正确。
+  - 但距离“性能蜕变”仍远，下一阶段必须进入更激进的架构级重构（不仅是微调）。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
-- 仍是端到端主耗时大头；`M=1` 已优化，下一阶段是 `M>1` 与向量化/子组化深挖。
+- 仍是端到端主耗时大头；`M1_REDUCE_SUBGROUP` 仅带来 `~1%` 级增益，说明需要更深层内核重构（访存与解量化融合策略）。
 
-2. `fast::RoPE`  
-- 总耗时仍高，且存在少量 fallback（近期样本约 `55` 次）。
+2. `fast::RMSNorm / fast::ScaledDotProductAttention`
+- 在 RoPE 回退清理后，二者成为次级原生耗时来源，需继续做 kernel 级效率优化。
 
 3. 高频小算子 fallback 尾部  
 - `Multiply`、`BitwiseBinary` 等仍有较高调用次数的 fallback。
@@ -160,17 +216,18 @@
 - 当前 decode-unlimited + split-k 已稳定，但 `k=65+` 的 stage1/reduce 仍有进一步优化空间。
 
 ## 下一步（精确执行入口）
-1. 继续 D-9.4：向量化/子组化路线  
-- 在 `M1_REDUCE` 已上线基础上，主攻进一步向量化（`uvec4` 载入/解包）与指令级优化。
+1. QMM decode 主核架构升级（对标 Metal/Ollama）  
+- 目标：从“微调归约”升级到“访存/解量化/归约一体化”内核，优先作用于 `rows=1` 主桶。
+- 方向：`uvec4`/向量化加载、scale/bias 访问复用、减少重复解包与无效算术、压缩指令路径。
 
-2. 拆解并减少 `RoPE` 剩余 fallback  
-- 用 `MLX_VK_DEBUG_ROPE_REJECT=1` 聚类 reject 原因，先补命中最高布局桶。
+2. SDPA decode 次热点并行推进  
+- 对照 Metal/Ollama 的 decode attention 内核拆分策略，继续优化 `k=33~128` 区间的 stage1/reduce 配置与核形态。
 
 3. 清理 `Multiply` 高频 fallback  
 - 继续沿 Metal/Ollama 的“高频小算子专核”路线，先做 decode 高频形态桶。
 
-4. `M=1` 主核向量化第二轮  
-- 评估 `uvec4` 载入/解包优化，确保每次优化都作用于 decode 主命中路径。
+4. 维持命中优先与串行口径  
+- 每轮必须先跑 `MLX_VK_QMM_STATS=1` / `MLX_VK_SDPA_STATS=1` 确认命中，再做优化与 A/B。
 
 5. 门禁与评估口径保持一致  
 - 继续用 EN/ZH `10/40/80` 串行压测 + profile 对照，确保“命中提升 = 吞吐提升”。
