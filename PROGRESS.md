@@ -12,8 +12,8 @@
 - 回归状态：`ctest` 全量 `223/223` 通过；`python/tests/test_fast_sdpa.py` 通过（`20 passed, 1 skipped`）。
 - 模型正确性：Qwen3-0.6B-MLX-4bit（EN/ZH，10 token）输出正常，无乱码/`!!!!!!!!!!` 回归。
 - 近期吞吐（实卡 Vulkan，串行口径）：
-  - 10-token（EN）：约 `4.10 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1=1`）
-  - 40-token（EN）：约 `3.34 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1=1`，含 `M2/M4/M8` 分桶）
+  - 10-token（EN）：约 `4.63 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=1`）
+  - 40-token（EN）：约 `3.63 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=1`，默认 ON）
 - decode 主线 fallback 占比（同口径 profile）：
   - 由 `18.40%` 降到 `13.50%`
 
@@ -122,6 +122,25 @@
   - 当前工作负载主命中为 `M1`，次热点为 `rows=9-16`，且两者均已专核化。
   - 下一阶段聚焦 `M1` 主核向量化/子组化，避免继续扩低命中桶。
 
+### D-9.6：QMM `M1` 并行归约路径（已完成，默认 ON）
+- 目标：直接优化 decode 主命中路径（`rows=1`），提升每 token 生成吞吐。
+- 变更：
+  - 新增 shader：`qmm_affine_bf16_t4_g128_m1_reduce.comp`。
+  - 新增 kernel 注册：`QMM_AFFINE_BF16_T4_G128_M1_REDUCE`。
+  - `QuantizedMatmul::eval_gpu` 增加 `rows==1` 归约路径派发。
+  - gate：`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE`（默认 ON，可关闭回退旧 `M1` 路径）。
+- 命中验证（`MLX_VK_QMM_STATS=1`，Qwen3 EN 40-token）：
+  - `qmm_affine_bf16_t4_g128_m1_reduce`: `8077`
+  - `qmm_affine_bf16_t4_g128_m16`: `191`
+  - 说明：主命中 `rows=1` 已切换到新归约核，`rows=9-16` 维持 `m16`。
+- 吞吐 A/B（串行）：
+  - 40-token：`3.62 / 3.58 tok/s`（`M1_REDUCE=1`） vs `3.34 / 3.35 tok/s`（`M1_REDUCE=0`）
+  - 平均提升约 `+8~9%`。
+- 稳定性：
+  - `ctest` 全量 `223/223` 通过。
+  - `python/tests/test_fast_sdpa.py` 通过（`20 passed, 1 skipped`）。
+  - Qwen3 EN/ZH 输出正确，无乱码回归。
+
 ### E-9.5a：QMM `M=1` 多累加器展开实验（已回退）
 - 假设：通过多累加器 + 最内层显式展开降低依赖链，提升 decode 吞吐。
 - 实测：Qwen3 EN 40-token 吞吐无稳定正收益（约 `3.32~3.33 tok/s`，未优于基线）。
@@ -142,7 +161,7 @@
 
 ## 下一步（精确执行入口）
 1. 继续 D-9.4：向量化/子组化路线  
-- 基于 `MLX_VK_QMM_STATS=1` 结果，主攻 `M1`（decode 主命中）向量化/子组化，避免继续扩低命中桶。
+- 在 `M1_REDUCE` 已上线基础上，主攻进一步向量化（`uvec4` 载入/解包）与指令级优化。
 
 2. 拆解并减少 `RoPE` 剩余 fallback  
 - 用 `MLX_VK_DEBUG_ROPE_REJECT=1` 聚类 reject 原因，先补命中最高布局桶。
@@ -151,7 +170,7 @@
 - 继续沿 Metal/Ollama 的“高频小算子专核”路线，先做 decode 高频形态桶。
 
 4. `M=1` 主核向量化第二轮  
-- 评估 `uvec4` 载入/子组归约，确保每次优化都作用于 decode 主命中路径。
+- 评估 `uvec4` 载入/解包优化，确保每次优化都作用于 decode 主命中路径。
 
 5. 门禁与评估口径保持一致  
 - 继续用 EN/ZH `10/40/80` 串行压测 + profile 对照，确保“命中提升 = 吞吐提升”。
