@@ -1647,3 +1647,48 @@ python -m unittest discover -v
 1. 继续 SDPA v3：评估 `MLX_VK_SDPA_MAX_Q_LEN` 从 `8` 上调到 `16` 的正确性与吞吐收益（先 `Q=8/16` 合成与 Qwen prefill A/B）。
 2. 推进 bool mask kernel 原生支持，去掉前置转换开销。
 3. 结合 split-k 参数再做长上下文（`max_tokens=40` 及以上）串行吞吐复测，更新稳定基线。
+
+### 2026-02-10 主线推进（`Q cap` A/B + 默认上调到 `13`）✅
+
+#### 本轮目标
+- 完成 `MLX_VK_SDPA_MAX_Q_LEN` 的实卡 A/B（`8` vs `16`），并基于命中率与吞吐决定默认值。
+
+#### 本轮变更
+1. `Q cap` 实卡对照（Qwen prefill 场景）：
+   - 负载：`Qwen/Qwen3-0.6B-MLX-4bit`, `prompt="Hi what is your name"`, `max_tokens=10`, `temp=0`。
+   - 对照：
+     - `MLX_VK_SDPA_MAX_Q_LEN=8`
+     - `MLX_VK_SDPA_MAX_Q_LEN=16`
+     - 补充对照：`MLX_VK_SDPA_MAX_Q_LEN=13`
+2. 默认门限上调（保守）：
+   - 文件：`mlx/backend/vulkan/primitives/fallback.cpp`
+   - `native_sdpa_max_q_len()` 默认值从 `8` 调整到 `13`（与当前默认 `K cap=13` 对齐，仍支持 `MLX_VK_SDPA_MAX_Q_LEN` 覆盖）。
+3. 运行参数文档修正：
+   - 文件：`AGENTS.md`
+   - `LD_LIBRARY_PATH` 基线补齐 `fmt` 与 `python/mlx/lib` 路径，避免 `libfmt.so.10` 缺失导致误判。
+
+#### 验证结果
+1. `Q cap` A/B（10-token）：
+   - `cap=8`：`Prompt: 13 tokens, 8.465 tok/s`；`Generation: 10 tokens, 3.084 tok/s`
+   - `cap=16`：`Prompt: 13 tokens, 8.508 tok/s`；`Generation: 10 tokens, 3.032 tok/s`
+   - `cap=13`：`Prompt: 13 tokens, 8.259 tok/s`；`Generation: 10 tokens, 3.090 tok/s`
+2. 命中率证据（`MLX_VK_DEBUG_SDPA_HIT=1`）：
+   - `cap=8`：prefill `q_len=12` 连续 `q_len_cap` reject（未命中 native）。
+   - `cap=13/16`：prefill `q_len=12, k_len=12` 出现 `VulkanSDPAHit`（命中 native）。
+3. 默认值生效验证（不设 `MLX_VK_SDPA_MAX_Q_LEN`）：
+   - `q_len=12` prefill 出现 `VulkanSDPAHit`，确认默认 `q cap=13` 已生效。
+4. 回归：
+   - `cmake --build build_release_vulkan --target mlx -j` ✅
+   - `python3 setup.py build_ext --inplace`（Vulkan Release）✅
+   - `python -m unittest -v test_fast_sdpa` => `20 passed, 1 skipped` ✅
+   - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120` => `223/223` ✅
+
+#### 当前状态
+- ✅ 默认 `Q cap` 已从 `8` 上调到 `13`，`q_len=9~13` prefill 不再被门禁提前挡回 CPU 路径。
+- ✅ 在当前实卡与该负载下，`cap=13/16` 相比 `cap=8` 命中率显著提升，吞吐未见负向回归。
+- ⚠️ `K cap=13` 仍是 decode 长上下文的主限制（`k_len>=14` 继续 fallback），后续优化重点仍在 `K cap` 与 SDPA kernel 扩展。
+
+#### 下一步（精确）
+1. 推进 bool mask kernel 原生支持，移除 fast 层前置 bool->additive 转换。
+2. 在保持正确性的前提下，设计并验证 `K cap` 的下一档扩展（优先 `14~16` 的 decode 真实负载）。
+3. 补 `max_tokens=40` 与更长上下文的串行吞吐门禁，跟踪 `Q/K cap` 调整后的稳定收益。

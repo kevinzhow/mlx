@@ -234,7 +234,9 @@ inline uint32_t native_sdpa_max_k_len() {
 
 inline uint32_t native_sdpa_max_q_len() {
   static const uint32_t max_q_len = []() -> uint32_t {
-    constexpr uint32_t kDefault = 8u;
+    // Keep Q cap aligned with current default K cap so causal prefill up to
+    // the native K window can hit Vulkan SDPA without extra env toggles.
+    constexpr uint32_t kDefault = 13u;
     const char* v = std::getenv("MLX_VK_SDPA_MAX_Q_LEN");
     if (!v || v[0] == '\0') {
       return kDefault;
