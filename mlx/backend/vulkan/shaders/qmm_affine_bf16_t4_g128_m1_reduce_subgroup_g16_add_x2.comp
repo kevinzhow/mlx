@@ -1,0 +1,332 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Decode-specialized fused QMM(+residual add) kernel for rows==1 and
+// groups_per_col==16.
+// One workgroup computes two packed output words (4 bf16 values) to reuse
+// x-buffer loads across neighboring columns.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuffer {
+  uint words[];
+} x_buffer;
+
+layout(set = 0, binding = 1) readonly buffer WBuffer {
+  uint words[];
+} w_buffer;
+
+layout(set = 0, binding = 2) readonly buffer ScaleBuffer {
+  uint words[];
+} scale_buffer;
+
+layout(set = 0, binding = 3) readonly buffer BiasBuffer {
+  uint words[];
+} bias_buffer;
+
+layout(set = 0, binding = 4) readonly buffer ResidualBuffer {
+  uint words[];
+} residual_buffer;
+
+layout(set = 0, binding = 5) writeonly buffer OutBuffer {
+  uint words[];
+} out_buffer;
+
+layout(push_constant) uniform PushConstants {
+  uint out_elems;
+  uint n;
+  uint k;
+  uint groups_per_col;
+  uint w_words_per_col;
+} params;
+
+shared float subgroup_reduce00[64];
+shared float subgroup_reduce01[64];
+shared float subgroup_reduce10[64];
+shared float subgroup_reduce11[64];
+shared float deq00_cache[16u * 16u];
+shared float deq01_cache[16u * 16u];
+shared float deq10_cache[16u * 16u];
+shared float deq11_cache[16u * 16u];
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float load_bf16_from_packed(uint packed, uint elem_idx) {
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float load_residual_elem(uint elem_idx) {
+  return load_bf16_from_packed(residual_buffer.words[elem_idx >> 1u], elem_idx);
+}
+
+void main() {
+  const uint lane = gl_LocalInvocationID.x;
+  const uint out_words = (params.out_elems + 1u) / 2u;
+  const uint out_word_base = gl_WorkGroupID.x * 2u;
+  if (out_word_base >= out_words) {
+    return;
+  }
+
+  const uint out_word_0 = out_word_base;
+  const uint out_word_1 = out_word_base + 1u;
+  const bool has_out_word_1 = out_word_1 < out_words;
+
+  const uint out_elem_00 = out_word_0 * 2u;
+  const uint out_elem_01 = out_elem_00 + 1u;
+  const bool has_out_01 = out_elem_01 < params.out_elems;
+
+  const uint out_elem_10 = out_word_1 * 2u;
+  const uint out_elem_11 = out_elem_10 + 1u;
+  const bool has_out_10 = has_out_word_1;
+  const bool has_out_11 = has_out_word_1 && (out_elem_11 < params.out_elems);
+
+  if (lane < 16u) {
+    const uint g = lane;
+    const uint base = g * 16u;
+
+    const uint scale_bias_idx00 = out_elem_00 * 16u + g;
+    const float scale00 = load_bf16_from_packed(
+        scale_buffer.words[scale_bias_idx00 >> 1u], scale_bias_idx00);
+    const float bias00 = load_bf16_from_packed(
+        bias_buffer.words[scale_bias_idx00 >> 1u], scale_bias_idx00);
+    for (uint q = 0u; q < 16u; ++q) {
+      deq00_cache[base + q] = scale00 * float(q) + bias00;
+    }
+
+    if (has_out_01) {
+      const uint scale_bias_idx01 = out_elem_01 * 16u + g;
+      const float scale01 = load_bf16_from_packed(
+          scale_buffer.words[scale_bias_idx01 >> 1u], scale_bias_idx01);
+      const float bias01 = load_bf16_from_packed(
+          bias_buffer.words[scale_bias_idx01 >> 1u], scale_bias_idx01);
+      for (uint q = 0u; q < 16u; ++q) {
+        deq01_cache[base + q] = scale01 * float(q) + bias01;
+      }
+    }
+
+    if (has_out_10) {
+      const uint scale_bias_idx10 = out_elem_10 * 16u + g;
+      const float scale10 = load_bf16_from_packed(
+          scale_buffer.words[scale_bias_idx10 >> 1u], scale_bias_idx10);
+      const float bias10 = load_bf16_from_packed(
+          bias_buffer.words[scale_bias_idx10 >> 1u], scale_bias_idx10);
+      for (uint q = 0u; q < 16u; ++q) {
+        deq10_cache[base + q] = scale10 * float(q) + bias10;
+      }
+    }
+
+    if (has_out_11) {
+      const uint scale_bias_idx11 = out_elem_11 * 16u + g;
+      const float scale11 = load_bf16_from_packed(
+          scale_buffer.words[scale_bias_idx11 >> 1u], scale_bias_idx11);
+      const float bias11 = load_bf16_from_packed(
+          bias_buffer.words[scale_bias_idx11 >> 1u], scale_bias_idx11);
+      for (uint q = 0u; q < 16u; ++q) {
+        deq11_cache[base + q] = scale11 * float(q) + bias11;
+      }
+    }
+  }
+  barrier();
+
+  float partial00 = 0.0;
+  float partial01 = 0.0;
+  float partial10 = 0.0;
+  float partial11 = 0.0;
+  for (uint unit = lane; unit < 256u; unit += 64u) {
+    const uint g = unit >> 4u;
+    const uint ww = unit & 0xFu;
+    const uint deq_base = g * 16u;
+
+    const uint w_word_idx00 =
+        out_elem_00 * params.w_words_per_col + g * 16u + ww;
+    const uint wi00 = w_buffer.words[w_word_idx00];
+    uint wi01 = 0u;
+    if (has_out_01) {
+      const uint w_word_idx01 =
+          out_elem_01 * params.w_words_per_col + g * 16u + ww;
+      wi01 = w_buffer.words[w_word_idx01];
+    }
+    uint wi10 = 0u;
+    if (has_out_10) {
+      const uint w_word_idx10 =
+          out_elem_10 * params.w_words_per_col + g * 16u + ww;
+      wi10 = w_buffer.words[w_word_idx10];
+    }
+    uint wi11 = 0u;
+    if (has_out_11) {
+      const uint w_word_idx11 =
+          out_elem_11 * params.w_words_per_col + g * 16u + ww;
+      wi11 = w_buffer.words[w_word_idx11];
+    }
+
+    const uint x_word_base = g * 64u + ww * 4u;
+    const uvec4 x_words = uvec4(
+        x_buffer.words[x_word_base + 0u],
+        x_buffer.words[x_word_base + 1u],
+        x_buffer.words[x_word_base + 2u],
+        x_buffer.words[x_word_base + 3u]);
+
+    const float x00 = load_bf16_from_packed(x_words.x, 0u);
+    const float x01 = load_bf16_from_packed(x_words.x, 1u);
+    const float x02 = load_bf16_from_packed(x_words.y, 0u);
+    const float x03 = load_bf16_from_packed(x_words.y, 1u);
+    const float x04 = load_bf16_from_packed(x_words.z, 0u);
+    const float x05 = load_bf16_from_packed(x_words.z, 1u);
+    const float x06 = load_bf16_from_packed(x_words.w, 0u);
+    const float x07 = load_bf16_from_packed(x_words.w, 1u);
+
+    const uint q000 = (wi00 >> 0u) & 0xFu;
+    const uint q001 = (wi00 >> 4u) & 0xFu;
+    const uint q002 = (wi00 >> 8u) & 0xFu;
+    const uint q003 = (wi00 >> 12u) & 0xFu;
+    const uint q004 = (wi00 >> 16u) & 0xFu;
+    const uint q005 = (wi00 >> 20u) & 0xFu;
+    const uint q006 = (wi00 >> 24u) & 0xFu;
+    const uint q007 = (wi00 >> 28u) & 0xFu;
+    partial00 += x00 * deq00_cache[deq_base + q000];
+    partial00 += x01 * deq00_cache[deq_base + q001];
+    partial00 += x02 * deq00_cache[deq_base + q002];
+    partial00 += x03 * deq00_cache[deq_base + q003];
+    partial00 += x04 * deq00_cache[deq_base + q004];
+    partial00 += x05 * deq00_cache[deq_base + q005];
+    partial00 += x06 * deq00_cache[deq_base + q006];
+    partial00 += x07 * deq00_cache[deq_base + q007];
+
+    if (has_out_01) {
+      const uint q010 = (wi01 >> 0u) & 0xFu;
+      const uint q011 = (wi01 >> 4u) & 0xFu;
+      const uint q012 = (wi01 >> 8u) & 0xFu;
+      const uint q013 = (wi01 >> 12u) & 0xFu;
+      const uint q014 = (wi01 >> 16u) & 0xFu;
+      const uint q015 = (wi01 >> 20u) & 0xFu;
+      const uint q016 = (wi01 >> 24u) & 0xFu;
+      const uint q017 = (wi01 >> 28u) & 0xFu;
+      partial01 += x00 * deq01_cache[deq_base + q010];
+      partial01 += x01 * deq01_cache[deq_base + q011];
+      partial01 += x02 * deq01_cache[deq_base + q012];
+      partial01 += x03 * deq01_cache[deq_base + q013];
+      partial01 += x04 * deq01_cache[deq_base + q014];
+      partial01 += x05 * deq01_cache[deq_base + q015];
+      partial01 += x06 * deq01_cache[deq_base + q016];
+      partial01 += x07 * deq01_cache[deq_base + q017];
+    }
+
+    if (has_out_10) {
+      const uint q100 = (wi10 >> 0u) & 0xFu;
+      const uint q101 = (wi10 >> 4u) & 0xFu;
+      const uint q102 = (wi10 >> 8u) & 0xFu;
+      const uint q103 = (wi10 >> 12u) & 0xFu;
+      const uint q104 = (wi10 >> 16u) & 0xFu;
+      const uint q105 = (wi10 >> 20u) & 0xFu;
+      const uint q106 = (wi10 >> 24u) & 0xFu;
+      const uint q107 = (wi10 >> 28u) & 0xFu;
+      partial10 += x00 * deq10_cache[deq_base + q100];
+      partial10 += x01 * deq10_cache[deq_base + q101];
+      partial10 += x02 * deq10_cache[deq_base + q102];
+      partial10 += x03 * deq10_cache[deq_base + q103];
+      partial10 += x04 * deq10_cache[deq_base + q104];
+      partial10 += x05 * deq10_cache[deq_base + q105];
+      partial10 += x06 * deq10_cache[deq_base + q106];
+      partial10 += x07 * deq10_cache[deq_base + q107];
+    }
+
+    if (has_out_11) {
+      const uint q110 = (wi11 >> 0u) & 0xFu;
+      const uint q111 = (wi11 >> 4u) & 0xFu;
+      const uint q112 = (wi11 >> 8u) & 0xFu;
+      const uint q113 = (wi11 >> 12u) & 0xFu;
+      const uint q114 = (wi11 >> 16u) & 0xFu;
+      const uint q115 = (wi11 >> 20u) & 0xFu;
+      const uint q116 = (wi11 >> 24u) & 0xFu;
+      const uint q117 = (wi11 >> 28u) & 0xFu;
+      partial11 += x00 * deq11_cache[deq_base + q110];
+      partial11 += x01 * deq11_cache[deq_base + q111];
+      partial11 += x02 * deq11_cache[deq_base + q112];
+      partial11 += x03 * deq11_cache[deq_base + q113];
+      partial11 += x04 * deq11_cache[deq_base + q114];
+      partial11 += x05 * deq11_cache[deq_base + q115];
+      partial11 += x06 * deq11_cache[deq_base + q116];
+      partial11 += x07 * deq11_cache[deq_base + q117];
+    }
+  }
+
+  const float subgroup_sum00 = subgroupAdd(partial00);
+  const float subgroup_sum01 = subgroupAdd(partial01);
+  const float subgroup_sum10 = subgroupAdd(partial10);
+  const float subgroup_sum11 = subgroupAdd(partial11);
+  if (gl_NumSubgroups == 1u) {
+    if (gl_SubgroupInvocationID == 0u) {
+      uint packed0 = f32_to_bf16(subgroup_sum00 + load_residual_elem(out_elem_00)) & 0xFFFFu;
+      if (has_out_01) {
+        packed0 |= (f32_to_bf16(subgroup_sum01 + load_residual_elem(out_elem_01)) &
+                    0xFFFFu)
+            << 16u;
+      }
+      out_buffer.words[out_word_0] = packed0;
+      if (has_out_word_1) {
+        uint packed1 =
+            f32_to_bf16(subgroup_sum10 + load_residual_elem(out_elem_10)) &
+            0xFFFFu;
+        if (has_out_11) {
+          packed1 |= (f32_to_bf16(subgroup_sum11 + load_residual_elem(out_elem_11)) &
+                      0xFFFFu)
+              << 16u;
+        }
+        out_buffer.words[out_word_1] = packed1;
+      }
+    }
+    return;
+  }
+
+  if (gl_SubgroupInvocationID == 0u) {
+    subgroup_reduce00[gl_SubgroupID] = subgroup_sum00;
+    subgroup_reduce01[gl_SubgroupID] = subgroup_sum01;
+    subgroup_reduce10[gl_SubgroupID] = subgroup_sum10;
+    subgroup_reduce11[gl_SubgroupID] = subgroup_sum11;
+  }
+  barrier();
+
+  if (gl_SubgroupID == 0u) {
+    const float seed00 =
+        (lane < gl_NumSubgroups) ? subgroup_reduce00[lane] : 0.0;
+    const float seed01 =
+        (lane < gl_NumSubgroups) ? subgroup_reduce01[lane] : 0.0;
+    const float seed10 =
+        (lane < gl_NumSubgroups) ? subgroup_reduce10[lane] : 0.0;
+    const float seed11 =
+        (lane < gl_NumSubgroups) ? subgroup_reduce11[lane] : 0.0;
+    const float total00 = subgroupAdd(seed00);
+    const float total01 = subgroupAdd(seed01);
+    const float total10 = subgroupAdd(seed10);
+    const float total11 = subgroupAdd(seed11);
+    if (gl_SubgroupInvocationID == 0u) {
+      uint packed0 = f32_to_bf16(total00 + load_residual_elem(out_elem_00)) & 0xFFFFu;
+      if (has_out_01) {
+        packed0 |= (f32_to_bf16(total01 + load_residual_elem(out_elem_01)) &
+                    0xFFFFu)
+            << 16u;
+      }
+      out_buffer.words[out_word_0] = packed0;
+      if (has_out_word_1) {
+        uint packed1 = f32_to_bf16(total10 + load_residual_elem(out_elem_10)) & 0xFFFFu;
+        if (has_out_11) {
+          packed1 |= (f32_to_bf16(total11 + load_residual_elem(out_elem_11)) &
+                      0xFFFFu)
+              << 16u;
+        }
+        out_buffer.words[out_word_1] = packed1;
+      }
+    }
+  }
+}

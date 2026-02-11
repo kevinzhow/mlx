@@ -119,6 +119,8 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_X2=0` (default OFF, decode `rows==1` 双-word/工作组实验路径；当前默认关闭以避免回退)
   - `MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE=1` (default ON, 图侧 `QuantizedMatmulAdd` 融合 gate；支持 `groups_per_col in {8,16,24}`)
   - `MLX_VK_ENABLE_QMM_ADD_FUSE_G8=0` (legacy alias，保留兼容；若 `..._DECODE` 已设置则以 `..._DECODE` 为准；可显式设 `..._DECODE=0` 关闭融合)
+  - `MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE_G16_X2=0` (default OFF, decode `groups_per_col==16` 双-word tile 实验路径)
+  - `MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE_G24_X2=0` (default OFF, decode `groups_per_col==24` 双-word tile 实验路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M16=1` (default ON, prefill `9<=rows<=16` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M2=1` (default ON, small-batch `rows==2` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M4=1` (default ON, small-batch `rows==4` 专核路径)
@@ -178,6 +180,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - `MLX_VK_PROFILE_COMPILED_DETAIL=1`（将 profile 中 `Compiled` 拆分为 `Compiled::<subgraph>`，默认 OFF）
 - `MLX_VK_SDPA_STATS=1` (进程退出时打印 SDPA 命中/回退分布与 `k_len_cap` 占比)
 - `MLX_VK_QMM_STATS=1` (进程退出时打印 QMM native kernel 命中、rows 桶、gpc 精确分布与 shape 桶分布，用于命中优先优化)
+- `MLX_VK_QMM_ADD_FUSE_STATS=1` (进程退出时打印 QMM+Add 融合创建/执行命中与 fallback 原因分布)
 - `MLX_VK_ALGO_STATS=1` (进程退出时打印 Vulkan 算法缓存请求/hit/miss 与按-kernel miss 分布)
 - Native gate toggles for isolation:
   - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
@@ -192,6 +195,8 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_X2=0|1`
   - `MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE=0|1`
   - `MLX_VK_ENABLE_QMM_ADD_FUSE_G8=0|1` (legacy alias)
+  - `MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE_G16_X2=0|1`
+  - `MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE_G24_X2=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M16=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M2=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M4=0|1`

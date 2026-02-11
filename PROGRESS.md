@@ -39,6 +39,10 @@
     - `final_fallbacks=54`（均为 `shape_reject`）
     - `NativeKernel`: `g16_add=308`, `g24_add=308`
     - 吞吐：`5.403 tok/s`
+  - D-9.36 `g16/g24 x2` 双-word tile 实验（EN，串行）：
+    - 40-token：`x2 on 4.966 tok/s` vs `x2 off 4.999 tok/s`
+    - 80-token：`x2 on 4.854 tok/s` vs `x2 off 4.850 tok/s`
+    - 结论：收益不稳定且接近噪声，`x2` 维持实验开关默认 OFF。
 - 运行时新默认（D-9.21）：
   - `MLX_VK_ENABLE_ALGO_CACHE=0`（默认 OFF）
   - 原因：当前 decode 主线算法缓存命中率为 `0`，默认关闭可减少无效 key/map 开销。
@@ -992,6 +996,36 @@
   - 默认 ON 路径在当前 workload 下已经稳定落在 `g16/g24`，且无 dispatch 失败。
   - 剩余回退主要是 shape 约束问题，不是运行时稳定性问题；下一步应按统计优先做 `QMM + residual add + norm` 更大粒度融合，并先覆盖这 54 次 `shape_reject` 高频形态。
 
+### D-9.36：QMM+Add `g16/g24` 双-word tile（x2）实验（已完成，默认 OFF）
+- 背景（Metal/Ollama 对照）：
+  - 两条路线都强调 decode 热核“减少 launch 数 + 提高单次 dispatch 负载”。
+  - 本轮在已命中的 `g16/g24` QMM+Add 路径上验证 x2 形态（单 workgroup 处理 2 个 output words）是否带来阶跃提升。
+- 本轮实现：
+  - 新增 subgroup shader：
+    - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g16_add_x2`
+    - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g24_add_x2`
+  - 完整接线：
+    - `CMakeLists`、`KernelRegistry`（含 `.comp -> .spv -> *_spv.h` 同轮闭环）
+    - `QuantizedMatmulAdd` dispatch 增加 `x2` 优先 + 失败回退到非 x2 kernel 的安全逻辑
+  - 新增实验 gate（默认 OFF）：
+    - `MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE_G16_X2`
+    - `MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE_G24_X2`
+- 验证：
+  - 构建与回归：
+    - `cmake --build build_release_vulkan --target mlx -j 8` 通过。
+    - `python3 setup.py build_ext --inplace` 通过。
+    - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+    - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3（实卡 Vulkan，串行，EN）：
+    - 40-token：`x2 on 4.966 tok/s` vs `x2 off 4.999 tok/s`
+    - 80-token：`x2 on 4.854 tok/s` vs `x2 off 4.850 tok/s`
+  - 命中确认（`MLX_VK_QMM_ADD_FUSE_STATS=1`）：
+    - x2 ON 时命中 `g16_add_x2/g24_add_x2`；
+    - 默认（x2 OFF）回到 `g16_add/g24_add`，主线稳定。
+- 结论：
+  - 该路径未形成稳定 >2% 提升，不满足“架构升级阶跃”标准。
+  - 保留 x2 作为实验开关，主线默认关闭，下一步继续推进更高杠杆的 `QMM + residual add + norm` 融合与 dispatch 压降。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`g8_x2` A1-Phase1 与 A1.2 重排均未形成稳定收益，后续需转向更深层内核重构（数据布局 + 中间态组织）。
@@ -1002,6 +1036,7 @@
 - D-9.28 已验证 `add+rmsnorm` 小粒度融合本身不足以带来稳定吞吐提升，后续需转向更大粒度热链路重构。
 - D-9.34 已将 QMM+Add decode 融合切入默认路径（40-token 约 `+3.9%`），但距目标仍远；下一阶段瓶颈依旧是“launch 总量 + 主核 epilogue 融合深度”。
 - D-9.35 统计显示当前 fused fallback 主因已收敛到 `shape_reject`（10-token 样本 54 次），下一阶段应优先覆盖该高频形态而不是继续加门禁。
+- D-9.36 显示 `g16/g24 x2` 双-word tile 未形成稳定阶跃（<2%），主线应继续聚焦更大粒度融合而非继续堆 x2 变体。
 
 3. `fast::RMSNorm / fast::ScaledDotProductAttention`
 - D-9.30 已完成 RMSNorm 并行归约升级，串行实现瓶颈已缓解；下一步重心转向 SDPA 长上下文与 QMM 主核。

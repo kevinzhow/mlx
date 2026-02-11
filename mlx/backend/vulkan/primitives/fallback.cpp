@@ -1695,6 +1695,18 @@ inline bool native_qmm_add_fuse_decode_enabled() {
   return enabled;
 }
 
+inline bool native_qmm_add_fuse_decode_g16_x2_enabled() {
+  static const bool enabled =
+      env_flag_default_false("MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE_G16_X2");
+  return enabled;
+}
+
+inline bool native_qmm_add_fuse_decode_g24_x2_enabled() {
+  static const bool enabled =
+      env_flag_default_false("MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE_G24_X2");
+  return enabled;
+}
+
 inline bool native_rmsnorm_enabled() {
   static const bool enabled =
       env_flag_default_true("MLX_VK_ENABLE_RMSNORM_NATIVE");
@@ -2483,6 +2495,7 @@ inline bool dispatch_native_qmm_add_fuse_decode(
     int group_size) {
   uint32_t groups_per_col = 0u;
   const char* kernel_name = nullptr;
+  const char* fallback_kernel_name = nullptr;
   try {
     if (!out.data_shared_ptr()) {
       out.set_data(mlx::core::allocator::malloc(out.nbytes()));
@@ -2535,15 +2548,32 @@ inline bool dispatch_native_qmm_add_fuse_decode(
     groups_per_col = static_cast<uint32_t>(
         k / static_cast<uint32_t>(group_size));
     const uint32_t w_words_per_col = static_cast<uint32_t>(inputs[1].shape(-1));
+    uint32_t dispatch_groups = std::max<uint32_t>(1u, out_words);
     if (groups_per_col == 8u) {
       kernel_name = mlx::core::vulkan::KernelRegistry::
           QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_ADD;
     } else if (groups_per_col == 16u) {
-      kernel_name = mlx::core::vulkan::KernelRegistry::
+      fallback_kernel_name = mlx::core::vulkan::KernelRegistry::
           QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G16_ADD;
+      if (native_qmm_add_fuse_decode_g16_x2_enabled() && out_words >= 2u) {
+        kernel_name = mlx::core::vulkan::KernelRegistry::
+            QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G16_ADD_X2;
+        dispatch_groups = std::max<uint32_t>(1u, (out_words + 1u) / 2u);
+      } else {
+        kernel_name = fallback_kernel_name;
+        fallback_kernel_name = nullptr;
+      }
     } else if (groups_per_col == 24u) {
-      kernel_name = mlx::core::vulkan::KernelRegistry::
+      fallback_kernel_name = mlx::core::vulkan::KernelRegistry::
           QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G24_ADD;
+      if (native_qmm_add_fuse_decode_g24_x2_enabled() && out_words >= 2u) {
+        kernel_name = mlx::core::vulkan::KernelRegistry::
+            QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G24_ADD_X2;
+        dispatch_groups = std::max<uint32_t>(1u, (out_words + 1u) / 2u);
+      } else {
+        kernel_name = fallback_kernel_name;
+        fallback_kernel_name = nullptr;
+      }
     } else {
       return false;
     }
@@ -2555,17 +2585,32 @@ inline bool dispatch_native_qmm_add_fuse_decode(
         encode_push_constant_u32(groups_per_col),
         encode_push_constant_u32(w_words_per_col)};
 
-    encoder.record_algo_dispatch(
-        kernel_name,
-        {x_tensor,
-         w_cached.tensor,
-         scales_cached.tensor,
-         biases_cached.tensor,
-         residual_tensor,
-         out_tensor},
-        {std::max<uint32_t>(1u, out_words), 1, 1},
-        push_consts);
-    qmm_add_fuse_stats_record_native_success(groups_per_col, kernel_name);
+    const std::vector<std::shared_ptr<kp::Tensor>> dispatch_tensors{
+        x_tensor,
+        w_cached.tensor,
+        scales_cached.tensor,
+        biases_cached.tensor,
+        residual_tensor,
+        out_tensor};
+
+    auto dispatch_kernel = [&](const char* name, uint32_t groups_x) {
+      encoder.record_algo_dispatch(
+          name, dispatch_tensors, {groups_x, 1, 1}, push_consts);
+      qmm_add_fuse_stats_record_native_success(groups_per_col, name);
+    };
+
+    try {
+      dispatch_kernel(kernel_name, dispatch_groups);
+    } catch (const std::exception&) {
+      qmm_add_fuse_stats_record_native_fail(groups_per_col, kernel_name);
+      if (fallback_kernel_name == nullptr) {
+        throw;
+      }
+      kernel_name = fallback_kernel_name;
+      fallback_kernel_name = nullptr;
+      dispatch_kernel(kernel_name, std::max<uint32_t>(1u, out_words));
+    }
+
     device.mark_tensor_host_dirty(out, stream.index);
     return true;
   } catch (const std::exception&) {
