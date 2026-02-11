@@ -11,7 +11,11 @@
 // 嵌入的 SPIR-V shader
 #include "shaders/add_spv.h"
 #include "shaders/add_bf16_spv.h"
+#include "shaders/add_bf16_scalar_spv.h"
+#include "shaders/add_bf16_bcast_spv.h"
 #include "shaders/mul_bf16_spv.h"
+#include "shaders/mul_bf16_scalar_spv.h"
+#include "shaders/mul_bf16_bcast_spv.h"
 #include "shaders/silu_mul_bf16_spv.h"
 #include "shaders/sub_bf16_spv.h"
 #include "shaders/sub_bf16_scalar_spv.h"
@@ -53,8 +57,12 @@ namespace mlx::core::vulkan {
 const char* KernelRegistry::ADD_F32 = "add_f32";
 const char* KernelRegistry::ADD_F16 = "add_f16";
 const char* KernelRegistry::ADD_BF16 = "add_bf16";
+const char* KernelRegistry::ADD_BF16_SCALAR = "add_bf16_scalar";
+const char* KernelRegistry::ADD_BF16_BCAST = "add_bf16_bcast";
 const char* KernelRegistry::MUL_F32 = "mul_f32";
 const char* KernelRegistry::MUL_BF16 = "mul_bf16";
+const char* KernelRegistry::MUL_BF16_SCALAR = "mul_bf16_scalar";
+const char* KernelRegistry::MUL_BF16_BCAST = "mul_bf16_bcast";
 const char* KernelRegistry::SILU_MUL_BF16 = "silu_mul_bf16";
 const char* KernelRegistry::SUB_F32 = "sub_f32";
 const char* KernelRegistry::SUB_F32_SCALAR = "sub_f32_scalar";
@@ -134,10 +142,36 @@ void KernelRegistry::register_builtin_shaders() {
   std::vector<uint32_t> add_bf16_spirv((add_bf16_spv_len + 3) / 4);
   std::memcpy(add_bf16_spirv.data(), add_bf16_spv, add_bf16_spv_len);
   shaders_[ADD_BF16] = std::move(add_bf16_spirv);
+  std::vector<uint32_t> add_bf16_scalar_spirv(
+      (add_bf16_scalar_spv_len + 3) / 4);
+  std::memcpy(
+      add_bf16_scalar_spirv.data(),
+      add_bf16_scalar_spv,
+      add_bf16_scalar_spv_len);
+  shaders_[ADD_BF16_SCALAR] = std::move(add_bf16_scalar_spirv);
+  std::vector<uint32_t> add_bf16_bcast_spirv((add_bf16_bcast_spv_len + 3) / 4);
+  std::memcpy(
+      add_bf16_bcast_spirv.data(),
+      add_bf16_bcast_spv,
+      add_bf16_bcast_spv_len);
+  shaders_[ADD_BF16_BCAST] = std::move(add_bf16_bcast_spirv);
 
   std::vector<uint32_t> mul_bf16_spirv((mul_bf16_spv_len + 3) / 4);
   std::memcpy(mul_bf16_spirv.data(), mul_bf16_spv, mul_bf16_spv_len);
   shaders_[MUL_BF16] = std::move(mul_bf16_spirv);
+  std::vector<uint32_t> mul_bf16_scalar_spirv(
+      (mul_bf16_scalar_spv_len + 3) / 4);
+  std::memcpy(
+      mul_bf16_scalar_spirv.data(),
+      mul_bf16_scalar_spv,
+      mul_bf16_scalar_spv_len);
+  shaders_[MUL_BF16_SCALAR] = std::move(mul_bf16_scalar_spirv);
+  std::vector<uint32_t> mul_bf16_bcast_spirv((mul_bf16_bcast_spv_len + 3) / 4);
+  std::memcpy(
+      mul_bf16_bcast_spirv.data(),
+      mul_bf16_bcast_spv,
+      mul_bf16_bcast_spv_len);
+  shaders_[MUL_BF16_BCAST] = std::move(mul_bf16_bcast_spirv);
 
   std::vector<uint32_t> silu_mul_bf16_spirv((silu_mul_bf16_spv_len + 3) / 4);
   std::memcpy(

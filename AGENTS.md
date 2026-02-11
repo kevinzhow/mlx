@@ -126,6 +126,8 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_SDPA_DECODE_D128_K128=1` (default ON, decode `k_len<=128` 特化路径)
   - `MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_L32=1` (default ON, decode split-k reduce `local_size=32` 路径)
   - `MLX_VK_ENABLE_SDPA_DECODE_SPLITK_REDUCE_SUBGROUP=0` (default OFF, decode split-k subgroup reduce 实验路径)
+  - `MLX_VK_ENABLE_ADD_BF16=1` (default ON, 包含 bf16 equal-shape / scalar / broadcast-view 路径)
+  - `MLX_VK_ENABLE_MUL_BF16=1` (default ON, 包含 bf16 equal-shape / scalar / broadcast-view 路径)
 - Current decode SDPA defaults (without env override):
   - `MLX_VK_SDPA_MAX_K_LEN_DECODE=0` (`0` 表示 unlimited)
   - `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE=32`
@@ -150,6 +152,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - `MLX_VK_DEBUG_SDPA_REJECT=1`
 - `MLX_VK_DEBUG_SDPA_SPLITK=1`
 - `MLX_VK_DEBUG_ARGREDUCE_REJECT=1`
+- `MLX_VK_DEBUG_BINARY_FALLBACK=1`（打印 Add/Multiply fallback 的 dtype/shape/stride 签名，每种仅一次）
 - `MLX_VK_DEBUG_COMPILED_DETAIL=1`（打印 `Compiled` 子图 name/lib 与输入输出 layout，默认每种子图仅打印一次）
 - `MLX_VK_PROFILE_COMPILED_DETAIL=1`（将 profile 中 `Compiled` 拆分为 `Compiled::<subgraph>`，默认 OFF）
 - `MLX_VK_SDPA_STATS=1` (进程退出时打印 SDPA 命中/回退分布与 `k_len_cap` 占比)

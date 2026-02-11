@@ -1,0 +1,82 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufferA {
+  uint words[];
+} buffer_a;
+
+layout(set = 0, binding = 1) readonly buffer BufferB {
+  uint words[];
+} buffer_b;
+
+layout(set = 0, binding = 2) writeonly buffer BufferC {
+  uint words[];
+} buffer_c;
+
+layout(push_constant) uniform PushConstants {
+  uint size;
+  uint d0;
+  uint d1;
+  uint d2;
+  uint d3;
+  uint sb0;
+  uint sb1;
+  uint sb2;
+  uint sb3;
+} params;
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float load_bf16_from_word(uint packed, uint elem_idx) {
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+uint linear_to_b_idx(uint idx) {
+  uint i3 = idx % params.d3;
+  uint t = idx / params.d3;
+  uint i2 = t % params.d2;
+  t = t / params.d2;
+  uint i1 = t % params.d1;
+  uint i0 = t / params.d1;
+  return i0 * params.sb0 + i1 * params.sb1 + i2 * params.sb2 + i3 * params.sb3;
+}
+
+float load_b_bf16_linear(uint idx) {
+  uint b_idx = linear_to_b_idx(idx);
+  uint packed = buffer_b.words[b_idx >> 1u];
+  return load_bf16_from_word(packed, b_idx);
+}
+
+void main() {
+  uint word_idx = gl_GlobalInvocationID.x;
+  uint elem0 = word_idx * 2u;
+  if (elem0 >= params.size) {
+    return;
+  }
+
+  uint a_word = buffer_a.words[word_idx];
+  float a0 = load_bf16_from_word(a_word, elem0);
+  float b0 = load_b_bf16_linear(elem0);
+  uint out_word = f32_to_bf16(a0 * b0) & 0xFFFFu;
+
+  uint elem1 = elem0 + 1u;
+  if (elem1 < params.size) {
+    float a1 = load_bf16_from_word(a_word, elem1);
+    float b1 = load_b_bf16_linear(elem1);
+    out_word |= (f32_to_bf16(a1 * b1) & 0xFFFFu) << 16u;
+  }
+
+  buffer_c.words[word_idx] = out_word;
+}

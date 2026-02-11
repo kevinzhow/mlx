@@ -13,11 +13,11 @@
 - 模型正确性：Qwen3-0.6B-MLX-4bit（EN/ZH，10 token）输出正常，无乱码/`!!!!!!!!!!` 回归。
 - 流程约束（新增）：Qwen3 `mlx_lm generate` 正确性/性能口径需串行执行；任意 C++/Vulkan/shader 变更后，Python 侧验证前必须先执行 `python3 setup.py build_ext --inplace`，避免旧扩展产物导致误判。
 - 近期吞吐（实卡 Vulkan，串行口径）：
-  - 10-token（EN）：约 `4.63 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=1`）
-  - 40-token（EN）：约 `3.65 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1`，默认 ON）
-  - 80-token（EN）：约 `2.97 tok/s`（同口径）
+  - 10-token（EN）：约 `4.51 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1`，默认 ON）
+  - 40-token（EN）：约 `3.54 tok/s`（同口径）
+  - 80-token（EN）：约 `2.86 tok/s`（同口径）
 - decode 主线 fallback 占比（同口径 profile）：
-  - 由 `18.40%` 降到 `13.50%`
+  - 由 `18.40%` 降到 `13.50%`（D-9.2），再降到 `3.98%`（D-9.11）
 - RoPE 回退状态（Qwen3 EN 40-token 样本）：
   - `MLX_VK_ENABLE_ROPE_HS_TRANSPOSED=1` 时 `VulkanRoPEReject` 由 `55` 次降到 `0`。
 
@@ -240,6 +240,38 @@
   - 当前阶段“提交窗口”不是主瓶颈，`100` 已在本机口径下接近最优。
   - 后续主线继续回到 QMM/SDPA kernel 级架构优化，而不是 command-buffer 阈值调参。
 
+### D-9.11：Add/Multiply bf16 broadcast-view native 化（已完成）
+- 背景（Metal/Ollama 对照）：
+  - Metal 与 Ollama 路线都强调“先清理高频小算子 fallback 尾部”，避免 CPU 往返吞掉 decode 吞吐。
+  - profile_each 显示 decode 主链路中 `Add/Multiply` 仍有高频 fallback，且形态集中为 bf16 broadcast view（`data_size != size`）。
+- 变更：
+  - 新增 shader：
+    - `add_bf16_scalar.comp`
+    - `mul_bf16_scalar.comp`
+    - `add_bf16_bcast.comp`
+    - `mul_bf16_bcast.comp`
+  - 新增 kernel 注册：
+    - `ADD_BF16_SCALAR`、`ADD_BF16_BCAST`
+    - `MUL_BF16_SCALAR`、`MUL_BF16_BCAST`
+  - `binary.cpp` 新增 bf16 广播视图门禁与 push-const 索引映射（`ndim<=4`），并支持附加 push constants 派发。
+  - 增加安全护栏：broadcast 维度/stride 必须可安全落在 `uint32` 范围，避免索引溢出。
+  - 增加调试开关：`MLX_VK_DEBUG_BINARY_FALLBACK=1`（同签名仅打印一次）。
+  - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h` 同轮完成并构建。
+- 验证：
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 EN/ZH 10-token 串行正确性通过，无乱码。
+- 命中与收益（Qwen3 EN，实卡 Vulkan，串行）：
+  - profile_each（40-token）：
+    - `Add` fallback：`2392 -> 0`
+    - `Multiply` fallback：`42 -> 0`
+    - 总 fallback 比例：`15.51% -> 3.98%`
+    - 剩余主要 fallback：`BitwiseBinary=672`、`Gather=126`、`fast::Quantize=42`
+  - 吞吐 A/B（ON vs `MLX_VK_ENABLE_ADD_BF16=0 MLX_VK_ENABLE_MUL_BF16=0`）：
+    - 40-token：`3.543 vs 3.277 tok/s`（`+8.1%`）
+    - 80-token：`2.861 vs 2.580 tok/s`（`+10.9%`）
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`M1_REDUCE_SUBGROUP` 仅带来 `~1%` 级增益，说明需要更深层内核重构（访存与解量化融合策略）。
@@ -248,7 +280,7 @@
 - 在 RoPE 回退清理后，二者成为次级原生耗时来源，需继续做 kernel 级效率优化。
 
 3. 高频小算子 fallback 尾部  
-- `Multiply`、`BitwiseBinary` 等仍有较高调用次数的 fallback。
+- `BitwiseBinary`、`Gather`、`fast::Quantize` 仍是 decode 口径下的主要 fallback 尾部。
 
 4. SDPA 长上下文效率  
 - 当前 decode-unlimited + split-k 已稳定，但 `k=65+` 的 stage1/reduce 仍有进一步优化空间。
@@ -261,8 +293,8 @@
 2. SDPA decode 次热点并行推进  
 - 对照 Metal/Ollama 的 decode attention 内核拆分策略，继续优化 `k=33~128` 区间的 stage1/reduce 配置与核形态。
 
-3. 清理 `Multiply` 高频 fallback  
-- 继续沿 Metal/Ollama 的“高频小算子专核”路线，先做 decode 高频形态桶。
+3. 清理 `BitwiseBinary / Gather / fast::Quantize` 尾部  
+- 继续沿 Metal/Ollama 的“高频小算子专核”路线，先做 decode 高频形态桶，优先处理 fallback 次数最高的 `BitwiseBinary`。
 
 4. 维持命中优先与串行口径  
 - 每轮必须先跑 `MLX_VK_QMM_STATS=1` / `MLX_VK_SDPA_STATS=1` 确认命中，再做优化与 A/B。
