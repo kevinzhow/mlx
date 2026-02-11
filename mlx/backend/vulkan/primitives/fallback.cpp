@@ -1349,6 +1349,118 @@ inline QmmStatsReporter& qmm_stats_reporter() {
   return reporter;
 }
 
+inline bool qmm_add_fuse_stats_enabled() {
+  static const bool enabled = env_flag_default_false("MLX_VK_QMM_ADD_FUSE_STATS");
+  return enabled;
+}
+
+struct QmmAddFuseRuntimeStatsState {
+  std::mutex mtx;
+  uint64_t native_dispatch_success{0};
+  uint64_t native_dispatch_fail{0};
+  uint64_t final_fallbacks{0};
+  std::unordered_map<std::string, uint64_t> native_kernel_counts;
+  std::unordered_map<std::string, uint64_t> native_gpc_counts;
+  std::unordered_map<std::string, uint64_t> fallback_reason_counts;
+};
+
+inline QmmAddFuseRuntimeStatsState& qmm_add_fuse_runtime_stats_state() {
+  static QmmAddFuseRuntimeStatsState state;
+  return state;
+}
+
+struct QmmAddFuseRuntimeStatsReporter;
+inline QmmAddFuseRuntimeStatsReporter& qmm_add_fuse_runtime_stats_reporter();
+
+inline void qmm_add_fuse_stats_record_native_success(
+    uint32_t groups_per_col,
+    const char* kernel_name) {
+  if (!qmm_add_fuse_stats_enabled()) {
+    return;
+  }
+  auto& state = qmm_add_fuse_runtime_stats_state();
+  (void)qmm_add_fuse_runtime_stats_reporter();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.native_dispatch_success++;
+  const std::string kernel =
+      (kernel_name && kernel_name[0] != '\0') ? kernel_name : "unknown";
+  state.native_kernel_counts[kernel]++;
+  state.native_gpc_counts[std::string("gpc=") + std::to_string(groups_per_col)]++;
+}
+
+inline void qmm_add_fuse_stats_record_native_fail(
+    uint32_t groups_per_col,
+    const char* kernel_name) {
+  if (!qmm_add_fuse_stats_enabled()) {
+    return;
+  }
+  auto& state = qmm_add_fuse_runtime_stats_state();
+  (void)qmm_add_fuse_runtime_stats_reporter();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.native_dispatch_fail++;
+  const std::string kernel =
+      (kernel_name && kernel_name[0] != '\0') ? kernel_name : "unknown";
+  state.native_kernel_counts[std::string("fail:") + kernel]++;
+  state.native_gpc_counts[std::string("gpc=") + std::to_string(groups_per_col)]++;
+}
+
+inline void qmm_add_fuse_stats_record_fallback(const char* reason) {
+  if (!qmm_add_fuse_stats_enabled()) {
+    return;
+  }
+  auto& state = qmm_add_fuse_runtime_stats_state();
+  (void)qmm_add_fuse_runtime_stats_reporter();
+  const std::string key = (reason && reason[0] != '\0') ? reason : "unknown";
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.final_fallbacks++;
+  state.fallback_reason_counts[key]++;
+}
+
+inline void qmm_add_fuse_runtime_stats_dump() {
+  if (!qmm_add_fuse_stats_enabled()) {
+    return;
+  }
+  auto& state = qmm_add_fuse_runtime_stats_state();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  if (state.native_dispatch_success == 0 && state.native_dispatch_fail == 0 &&
+      state.final_fallbacks == 0) {
+    return;
+  }
+
+  std::cerr << "[VulkanQMMAddFuseStats] native_dispatch_success="
+            << state.native_dispatch_success
+            << " native_dispatch_fail=" << state.native_dispatch_fail
+            << " final_fallbacks=" << state.final_fallbacks
+            << " native_kernel_keys=" << state.native_kernel_counts.size()
+            << " native_gpc_keys=" << state.native_gpc_counts.size()
+            << " fallback_reason_keys=" << state.fallback_reason_counts.size()
+            << "\n";
+  for (const auto& [key, count] : sort_stats_counts(state.native_kernel_counts)) {
+    std::cerr << "[VulkanQMMAddFuseStats][NativeKernel] kernel=" << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] : sort_stats_counts(state.native_gpc_counts)) {
+    std::cerr << "[VulkanQMMAddFuseStats][NativeGPC] " << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.fallback_reason_counts)) {
+    std::cerr << "[VulkanQMMAddFuseStats][FallbackReason] reason=" << key
+              << " count=" << count << "\n";
+  }
+}
+
+struct QmmAddFuseRuntimeStatsReporter {
+  ~QmmAddFuseRuntimeStatsReporter() {
+    qmm_add_fuse_runtime_stats_dump();
+  }
+};
+
+inline QmmAddFuseRuntimeStatsReporter& qmm_add_fuse_runtime_stats_reporter() {
+  static QmmAddFuseRuntimeStatsReporter reporter;
+  return reporter;
+}
+
 inline bool native_qmm_enabled() {
   static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_QMM_NATIVE");
   return enabled;
@@ -2369,6 +2481,8 @@ inline bool dispatch_native_qmm_add_fuse_decode(
     const std::vector<mlx::core::array>& inputs,
     mlx::core::array& out,
     int group_size) {
+  uint32_t groups_per_col = 0u;
+  const char* kernel_name = nullptr;
   try {
     if (!out.data_shared_ptr()) {
       out.set_data(mlx::core::allocator::malloc(out.nbytes()));
@@ -2418,10 +2532,9 @@ inline bool dispatch_native_qmm_add_fuse_decode(
     const uint32_t out_words = (out_elems + 1u) / 2u;
     const uint32_t n = static_cast<uint32_t>(out.shape(-1));
     const uint32_t k = static_cast<uint32_t>(inputs[0].shape(-1));
-    const uint32_t groups_per_col = static_cast<uint32_t>(
+    groups_per_col = static_cast<uint32_t>(
         k / static_cast<uint32_t>(group_size));
     const uint32_t w_words_per_col = static_cast<uint32_t>(inputs[1].shape(-1));
-    const char* kernel_name = nullptr;
     if (groups_per_col == 8u) {
       kernel_name = mlx::core::vulkan::KernelRegistry::
           QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_ADD;
@@ -2452,9 +2565,11 @@ inline bool dispatch_native_qmm_add_fuse_decode(
          out_tensor},
         {std::max<uint32_t>(1u, out_words), 1, 1},
         push_consts);
+    qmm_add_fuse_stats_record_native_success(groups_per_col, kernel_name);
     device.mark_tensor_host_dirty(out, stream.index);
     return true;
   } catch (const std::exception&) {
+    qmm_add_fuse_stats_record_native_fail(groups_per_col, kernel_name);
     return false;
   }
 }
@@ -3396,14 +3511,24 @@ void QuantizedMatmulAdd::eval_gpu(
   vulkan::OpProfileScope profile("QuantizedMatmulAdd");
   auto stream = out.primitive().stream();
 
-  if (native_qmm_add_fuse_decode_enabled() &&
-      can_use_native_qmm_add_fuse_decode(
-          inputs, out, group_size_, bits_, transpose_, mode_)) {
+  const bool gate_on = native_qmm_add_fuse_decode_enabled();
+  if (!gate_on) {
+    qmm_add_fuse_stats_record_fallback("gate_off");
+  }
+
+  const bool can_use = gate_on && can_use_native_qmm_add_fuse_decode(
+      inputs, out, group_size_, bits_, transpose_, mode_);
+  if (gate_on && !can_use) {
+    qmm_add_fuse_stats_record_fallback("shape_reject");
+  }
+
+  if (can_use) {
     prepare_inputs_for_cpu_fallback(inputs, stream);
     if (dispatch_native_qmm_add_fuse_decode(
             stream, inputs, out, group_size_)) {
       return;
     }
+    qmm_add_fuse_stats_record_fallback("dispatch_fail");
   }
 
   profile.mark_fallback();

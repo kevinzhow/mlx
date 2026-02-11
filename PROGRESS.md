@@ -33,6 +33,12 @@
     - `default(on)`: `5.011 tok/s`
     - `force off`: `4.821 tok/s`
     - 约 `+3.9%`。
+  - D-9.35 增加运行时执行统计后（EN 10-token，串行）：
+    - `native_dispatch_success=616`
+    - `native_dispatch_fail=0`
+    - `final_fallbacks=54`（均为 `shape_reject`）
+    - `NativeKernel`: `g16_add=308`, `g24_add=308`
+    - 吞吐：`5.403 tok/s`
 - 运行时新默认（D-9.21）：
   - `MLX_VK_ENABLE_ALGO_CACHE=0`（默认 OFF）
   - 原因：当前 decode 主线算法缓存命中率为 `0`，默认关闭可减少无效 key/map 开销。
@@ -955,6 +961,37 @@
   - 在当前机型与口径下，默认开启具备可复现正收益且稳定性通过。
   - 后续继续推进更大粒度融合（`QMM + residual add + norm`）以争取下一阶跃。
 
+### D-9.35：QMM+Add 运行时执行统计闭环（已完成）
+- 背景（Metal/Ollama 对照）：
+  - 两条路线都强调“先建立可观测命中分布，再做内核/图融合优化”，避免在低命中段反复微调。
+  - D-9.34 已把 QMM+Add decode 融合设为默认 ON，本轮补齐运行时执行统计，确认真实 native 落地比例与失败原因。
+- 本轮实现：
+  - 在 `QuantizedMatmulAdd` Vulkan 路径新增运行时统计（复用 `MLX_VK_QMM_ADD_FUSE_STATS=1` 开关）：
+    - `native_dispatch_success/native_dispatch_fail/final_fallbacks`
+    - `NativeKernel` 命中分布
+    - `NativeGPC` 命中分布
+    - `FallbackReason` 分布（`gate_off/shape_reject/dispatch_fail`）
+  - 统计打印前缀：
+    - `[VulkanQMMAddFuseStats]`
+    - `[VulkanQMMAddFuseStats][NativeKernel]`
+    - `[VulkanQMMAddFuseStats][NativeGPC]`
+    - `[VulkanQMMAddFuseStats][FallbackReason]`
+- 验证：
+  - 构建与扩展：
+    - `cmake --build build_release_vulkan --target mlx -j 8` 通过。
+    - `python3 setup.py build_ext --inplace` 通过。
+  - 回归：
+    - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+    - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3（实卡 Vulkan，串行，EN 10-token，`MLX_VK_QMM_ADD_FUSE_STATS=1`）：
+    - 吞吐：`5.403 tok/s`
+    - `native_dispatch_success=616`，`native_dispatch_fail=0`
+    - `final_fallbacks=54`（`shape_reject=54`）
+    - `NativeKernel`: `g16_add=308`, `g24_add=308`
+- 结论：
+  - 默认 ON 路径在当前 workload 下已经稳定落在 `g16/g24`，且无 dispatch 失败。
+  - 剩余回退主要是 shape 约束问题，不是运行时稳定性问题；下一步应按统计优先做 `QMM + residual add + norm` 更大粒度融合，并先覆盖这 54 次 `shape_reject` 高频形态。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`g8_x2` A1-Phase1 与 A1.2 重排均未形成稳定收益，后续需转向更深层内核重构（数据布局 + 中间态组织）。
@@ -964,6 +1001,7 @@
 - D-9.22 已完成“提交异步化 + inflight 窗口”但收益有限；下一阶段需继续减少 `manager.algorithm`/`OpAlgoDispatch` 总次数（链路融合/dispatch 合并）。
 - D-9.28 已验证 `add+rmsnorm` 小粒度融合本身不足以带来稳定吞吐提升，后续需转向更大粒度热链路重构。
 - D-9.34 已将 QMM+Add decode 融合切入默认路径（40-token 约 `+3.9%`），但距目标仍远；下一阶段瓶颈依旧是“launch 总量 + 主核 epilogue 融合深度”。
+- D-9.35 统计显示当前 fused fallback 主因已收敛到 `shape_reject`（10-token 样本 54 次），下一阶段应优先覆盖该高频形态而不是继续加门禁。
 
 3. `fast::RMSNorm / fast::ScaledDotProductAttention`
 - D-9.30 已完成 RMSNorm 并行归约升级，串行实现瓶颈已缓解；下一步重心转向 SDPA 长上下文与 QMM 主核。
@@ -987,7 +1025,7 @@
   - A1.5：对齐 Metal/Ollama 路线推进“少 dispatch 高负载”执行图，优先把 decode 热链路（QMM->RMSNorm->RoPE->SDPA）的 launch 数量压降到当前的一半量级。
   - A1.6（下一入口）：在 D-9.34 默认开启 QMM+Add decode 融合后，进入“更大粒度融合”：
     - 推进 `QMM + residual add + norm` 主核 epilogue 原型，减少单 token 的 kernel 数量。
-    - 结合 `MLX_VK_ALGO_STATS` 复测 decode token-step 的 dispatch 构成，优先消减 `QMM/RMSNorm` 邻接段的 launch 碎片。
+    - 结合 `MLX_VK_ALGO_STATS` + `MLX_VK_QMM_ADD_FUSE_STATS` 复测 decode token-step 的 dispatch/shape 构成，优先消减 `QMM/RMSNorm` 邻接段的 launch 碎片与 `shape_reject` 高频桶。
 
 2. 架构主线 B：decode 链路融合/提交模型升级  
 - 对标 Metal command-buffer 与 Ollama 持续化 decode 路线，减少 token-step 内 kernel 启动碎片。
