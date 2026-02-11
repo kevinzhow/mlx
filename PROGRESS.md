@@ -19,6 +19,9 @@
   - 10-token（EN）：约 `5.20~5.24 tok/s`（D-9.30 后）
   - 40-token（EN）：约 `4.87~4.93 tok/s`（D-9.30 后）
   - 80-token（EN）：约 `4.80 tok/s`（D-9.30 样本）
+- QMM+Add 融合命中现状（D-9.31）：
+  - 图构建阶段已可观测到 `Add` 的 QMM 操作数（`qmm_operand_seen=168`，1-token 样本）。
+  - 但当前默认稳定门禁下 `fused_created=0`，拒绝主因是 `groups_per_col != 8`（`reject_groups_unsupported=168`）。
 - 运行时新默认（D-9.21）：
   - `MLX_VK_ENABLE_ALGO_CACHE=0`（默认 OFF）
   - 原因：当前 decode 主线算法缓存命中率为 `0`，默认关闭可减少无效 key/map 开销。
@@ -813,6 +816,39 @@
 - 结论：
   - 本轮通过“核内并行度升级”带来可复现吞吐抬升（相对 D-9.26 的 `4.64~4.73 tok/s`，40-token 提升到 `4.87~4.93 tok/s`）。
   - `add+rmsnorm` 小融合路径继续保留为实验开关，不进入默认主线。
+
+### D-9.31：QMM+Add 图侧融合原型（已完成命中分析，稳定门禁保守）
+- 背景（Metal/Ollama 对照）：
+  - Metal 与 Ollama 都将高频后处理尽量前推到主核/图侧，避免“先算 QMM 再单独 Add”的二次 dispatch。
+  - Vulkan 侧此前尝试在 `Add::eval_gpu` 做运行时融合未命中，根因是到该阶段图结构已退化为 leaf。
+- 本轮实现：
+  - 新增图侧融合原语 `QuantizedMatmulAdd`，在 `ops.cpp::add()` 构建图时识别 `Add(qmm, residual)`。
+  - Vulkan 新增 fused kernel：
+    - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_add`（已接线）
+    - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_add`（通用原型，暂不启用）
+  - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h`。
+  - 增加图侧统计：
+    - `MLX_VK_QMM_ADD_FUSE_STATS=1` 输出 `add_calls/qmm_operand_seen/fused_created/reject_*`。
+- 验证与结果：
+  - 构建/回归：
+    - `cmake --build build_release_vulkan --target mlx/tests -j` 通过。
+    - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+    - `python3 setup.py build_ext --inplace` 通过。
+    - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3（实卡 Vulkan，串行）：
+    - EN 10-token（默认）：`5.250 tok/s`
+    - EN 10-token（`MLX_VK_ENABLE_QMM_ADD_FUSE_G8=1`）：`5.342 tok/s`
+    - ZH 10-token（gate=1）输出正常，无乱码。
+  - 命中分析（1-token，gate=1，`MLX_VK_QMM_ADD_FUSE_STATS=1`）：
+    - `qmm_operand_seen=168`，`fused_created=0`
+    - 拒绝主因：`reject_groups_unsupported=168`（当前命中的 Add 关联 QMM 组数不在 g8）。
+- 风险与处置：
+  - 通用 subgroup add（`groups_per_col<=256`）原型在实测中触发运行时内存破坏（`free(): corrupted unsorted chunks`）。
+  - 本轮已回退到稳定门禁（仅 `groups_per_col==8` 可尝试），确保 gate=1 不崩溃。
+- 结论：
+  - 方向确认：必须走“图侧融合”，运行时 Add 融合无效。
+  - 现阶段收益尚未释放：当前 workload 下 g8 不命中，主命中在 g16/g24 等桶。
+  - 下一步优先修复通用 fused kernel 的正确性，再放开 `groups_per_col` 覆盖。
 
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  

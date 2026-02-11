@@ -40,8 +40,10 @@
 #include "shaders/qmm_affine_bf16_t4_g128_m1_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_spv.h"
+#include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_add_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_x2_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_spv.h"
+#include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_add_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g16_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g24_spv.h"
@@ -305,10 +307,14 @@ const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE =
     "qmm_affine_bf16_t4_g128_m1_reduce";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP =
     "qmm_affine_bf16_t4_g128_m1_reduce_subgroup";
+const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_ADD =
+    "qmm_affine_bf16_t4_g128_m1_reduce_subgroup_add";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_X2 =
     "qmm_affine_bf16_t4_g128_m1_reduce_subgroup_x2";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8 =
     "qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8";
+const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_ADD =
+    "qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_add";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_X2 =
     "qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G16 =
@@ -544,6 +550,14 @@ void KernelRegistry::register_builtin_shaders() {
       qmm_affine_bf16_t4_g128_m1_reduce_subgroup_spv_len);
   shaders_[QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP] =
       std::move(qmm_m1_reduce_subgroup_spirv);
+  std::vector<uint32_t> qmm_m1_reduce_subgroup_add_spirv(
+      (qmm_affine_bf16_t4_g128_m1_reduce_subgroup_add_spv_len + 3) / 4);
+  std::memcpy(
+      qmm_m1_reduce_subgroup_add_spirv.data(),
+      qmm_affine_bf16_t4_g128_m1_reduce_subgroup_add_spv,
+      qmm_affine_bf16_t4_g128_m1_reduce_subgroup_add_spv_len);
+  shaders_[QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_ADD] =
+      std::move(qmm_m1_reduce_subgroup_add_spirv);
   std::vector<uint32_t> qmm_m1_reduce_subgroup_x2_spirv(
       (qmm_affine_bf16_t4_g128_m1_reduce_subgroup_x2_spv_len + 3) / 4);
   std::memcpy(
@@ -560,6 +574,14 @@ void KernelRegistry::register_builtin_shaders() {
       qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_spv_len);
   shaders_[QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8] =
       std::move(qmm_m1_reduce_subgroup_g8_spirv);
+  std::vector<uint32_t> qmm_m1_reduce_subgroup_g8_add_spirv(
+      (qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_add_spv_len + 3) / 4);
+  std::memcpy(
+      qmm_m1_reduce_subgroup_g8_add_spirv.data(),
+      qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_add_spv,
+      qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_add_spv_len);
+  shaders_[QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_ADD] =
+      std::move(qmm_m1_reduce_subgroup_g8_add_spirv);
   std::vector<uint32_t> qmm_m1_reduce_subgroup_g8_x2_spirv(
       (qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2_spv_len + 3) / 4);
   std::memcpy(

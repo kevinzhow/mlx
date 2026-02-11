@@ -1032,6 +1032,27 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
   }
 }
 
+void QuantizedMatmulAdd::eval_cpu(
+    const std::vector<array>& inputs,
+    array& out) {
+  assert(inputs.size() == 5);
+  std::vector<array> qmm_inputs{
+      inputs[0], inputs[1], inputs[2], inputs[3]};
+  array qmm_out(out.shape(), out.dtype(), nullptr, {});
+  QuantizedMatmul qmm(stream(), group_size_, bits_, mode_, transpose_);
+  qmm.eval_cpu(qmm_inputs, qmm_out);
+  Add add(stream());
+  add.eval_cpu({qmm_out, inputs[4]}, out);
+}
+
+#ifndef MLX_USE_VULKAN
+void QuantizedMatmulAdd::eval_gpu(
+    const std::vector<array>& inputs,
+    array& out) {
+  eval_cpu(inputs, out);
+}
+#endif
+
 void GatherQMM::eval_cpu(const std::vector<array>& inputs, array& out) {
   auto& x_pre = inputs[0];
   auto& w_pre = inputs[1];

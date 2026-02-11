@@ -2,9 +2,13 @@
 
 // Required for using M_PI in MSVC.
 #define _USE_MATH_DEFINES
+#include <atomic>
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -55,6 +59,170 @@ std::tuple<Shape, std::vector<int>, bool> compute_reduce_shape(
 
 Dtype at_least_float(const Dtype& d) {
   return issubdtype(d, inexact) ? d : promote_types(d, float32);
+}
+
+bool qmm_add_fuse_g8_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_ENABLE_QMM_ADD_FUSE_G8");
+    if (!v || v[0] == '\0') {
+      return false;
+    }
+    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+        std::strcmp(v, "off") == 0) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
+bool qmm_add_fuse_stats_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_QMM_ADD_FUSE_STATS");
+    if (!v || v[0] == '\0') {
+      return false;
+    }
+    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+        std::strcmp(v, "off") == 0) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
+struct QmmAddFuseCreateStats {
+  std::atomic<uint64_t> add_calls{0};
+  std::atomic<uint64_t> gate_off{0};
+  std::atomic<uint64_t> no_qmm_operand{0};
+  std::atomic<uint64_t> qmm_operand_seen{0};
+  std::atomic<uint64_t> qmm_operand_reject{0};
+  std::atomic<uint64_t> fused_created{0};
+  std::atomic<uint64_t> reject_out_type{0};
+  std::atomic<uint64_t> reject_residual_dtype{0};
+  std::atomic<uint64_t> reject_shape{0};
+  std::atomic<uint64_t> reject_qmm_state{0};
+  std::atomic<uint64_t> reject_qmm_arity{0};
+  std::atomic<uint64_t> reject_k_invalid{0};
+  std::atomic<uint64_t> reject_groups_unsupported{0};
+};
+
+QmmAddFuseCreateStats& qmm_add_fuse_create_stats() {
+  static QmmAddFuseCreateStats stats;
+  return stats;
+}
+
+void dump_qmm_add_fuse_create_stats() {
+  if (!qmm_add_fuse_stats_enabled()) {
+    return;
+  }
+  auto& s = qmm_add_fuse_create_stats();
+  std::cerr << "[QmmAddFuseCreateStats]"
+            << " add_calls=" << s.add_calls.load(std::memory_order_relaxed)
+            << " gate_off=" << s.gate_off.load(std::memory_order_relaxed)
+            << " no_qmm_operand="
+            << s.no_qmm_operand.load(std::memory_order_relaxed)
+            << " qmm_operand_seen="
+            << s.qmm_operand_seen.load(std::memory_order_relaxed)
+            << " qmm_operand_reject="
+            << s.qmm_operand_reject.load(std::memory_order_relaxed)
+            << " fused_created="
+            << s.fused_created.load(std::memory_order_relaxed)
+            << " reject_out_type="
+            << s.reject_out_type.load(std::memory_order_relaxed)
+            << " reject_residual_dtype="
+            << s.reject_residual_dtype.load(std::memory_order_relaxed)
+            << " reject_shape="
+            << s.reject_shape.load(std::memory_order_relaxed)
+            << " reject_qmm_state="
+            << s.reject_qmm_state.load(std::memory_order_relaxed)
+            << " reject_qmm_arity="
+            << s.reject_qmm_arity.load(std::memory_order_relaxed)
+            << " reject_k_invalid="
+            << s.reject_k_invalid.load(std::memory_order_relaxed)
+            << " reject_groups_unsupported="
+            << s.reject_groups_unsupported.load(std::memory_order_relaxed)
+            << "\n";
+}
+
+struct QmmAddFuseCreateStatsReporter {
+  ~QmmAddFuseCreateStatsReporter() {
+    dump_qmm_add_fuse_create_stats();
+  }
+};
+
+QmmAddFuseCreateStatsReporter& qmm_add_fuse_create_stats_reporter() {
+  static QmmAddFuseCreateStatsReporter reporter;
+  return reporter;
+}
+
+bool can_use_qmm_add_fused_primitive(
+    const array& qmm_candidate,
+    const array& residual,
+    Dtype out_type) {
+  auto& stats = qmm_add_fuse_create_stats();
+  if (!qmm_add_fuse_g8_enabled()) {
+    return false;
+  }
+  if (out_type != bfloat16) {
+    if (qmm_add_fuse_stats_enabled()) {
+      stats.reject_out_type.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+  }
+  if (residual.dtype() != bfloat16) {
+    if (qmm_add_fuse_stats_enabled()) {
+      stats.reject_residual_dtype.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+  }
+  if (!qmm_candidate.has_primitive() ||
+      typeid(qmm_candidate.primitive()) != typeid(QuantizedMatmul)) {
+    return false;
+  }
+  if (qmm_candidate.shape() != residual.shape()) {
+    if (qmm_add_fuse_stats_enabled()) {
+      stats.reject_shape.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+  }
+  const auto* qmm_prim =
+      dynamic_cast<const QuantizedMatmul*>(&qmm_candidate.primitive());
+  if (!qmm_prim) {
+    return false;
+  }
+  const auto [group_size, bits, mode, transpose] = qmm_prim->state();
+  if (mode != QuantizationMode::Affine || bits != 4 || group_size != 128 ||
+      !transpose) {
+    if (qmm_add_fuse_stats_enabled()) {
+      stats.reject_qmm_state.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+  }
+  if (qmm_candidate.ndim() < 1 || qmm_candidate.inputs().size() != 4) {
+    if (qmm_add_fuse_stats_enabled()) {
+      stats.reject_qmm_arity.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+  }
+  const int64_t k = qmm_candidate.inputs()[0].shape(-1);
+  if (k <= 0 || (k % group_size) != 0) {
+    if (qmm_add_fuse_stats_enabled()) {
+      stats.reject_k_invalid.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+  }
+  const int64_t groups_per_col = k / group_size;
+  if (groups_per_col != 8) {
+    if (qmm_add_fuse_stats_enabled()) {
+      stats.reject_groups_unsupported.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+    return false;
+  }
+  return true;
 }
 
 array indices_or_default(
@@ -2602,9 +2770,77 @@ array add(const array& a, const array& b, StreamOrDevice s /* = {} */) {
   auto out_type = promote_types(a.dtype(), b.dtype());
   auto inputs =
       broadcast_arrays({astype(a, out_type, s), astype(b, out_type, s)}, s);
-  auto& shape = inputs[0].shape();
+  auto shape = inputs[0].shape();
+  auto& fuse_stats = qmm_add_fuse_create_stats();
+  if (qmm_add_fuse_stats_enabled()) {
+    qmm_add_fuse_create_stats_reporter();
+    fuse_stats.add_calls.fetch_add(1, std::memory_order_relaxed);
+    if (!qmm_add_fuse_g8_enabled()) {
+      fuse_stats.gate_off.fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool has_qmm_operand =
+        (inputs[0].has_primitive() &&
+         typeid(inputs[0].primitive()) == typeid(QuantizedMatmul)) ||
+        (inputs[1].has_primitive() &&
+         typeid(inputs[1].primitive()) == typeid(QuantizedMatmul));
+    if (has_qmm_operand) {
+      fuse_stats.qmm_operand_seen.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      fuse_stats.no_qmm_operand.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  int qmm_index = -1;
+  int residual_index = -1;
+  if (can_use_qmm_add_fused_primitive(inputs[0], inputs[1], out_type)) {
+    qmm_index = 0;
+    residual_index = 1;
+  } else if (can_use_qmm_add_fused_primitive(inputs[1], inputs[0], out_type)) {
+    qmm_index = 1;
+    residual_index = 0;
+  }
+
+  if (qmm_index >= 0) {
+    const auto& qmm_out = inputs[qmm_index];
+    const auto& residual = inputs[residual_index];
+    const auto* qmm_prim =
+        dynamic_cast<const QuantizedMatmul*>(&qmm_out.primitive());
+    auto [group_size, bits, mode, transpose] = qmm_prim->state();
+    const auto& qmm_inputs_ref = qmm_out.inputs();
+    std::vector<array> fused_inputs{
+        qmm_inputs_ref[0],
+        qmm_inputs_ref[1],
+        qmm_inputs_ref[2],
+        qmm_inputs_ref[3],
+        residual};
+    auto fused = array(
+        std::move(shape),
+        out_type,
+        std::make_shared<QuantizedMatmulAdd>(
+            to_stream(s), group_size, bits, mode, transpose),
+        std::move(fused_inputs));
+    if (qmm_add_fuse_stats_enabled()) {
+      fuse_stats.fused_created.fetch_add(1, std::memory_order_relaxed);
+    }
+    return fused;
+  }
+
+  if (qmm_add_fuse_stats_enabled()) {
+    const bool has_qmm_operand =
+        (inputs[0].has_primitive() &&
+         typeid(inputs[0].primitive()) == typeid(QuantizedMatmul)) ||
+        (inputs[1].has_primitive() &&
+         typeid(inputs[1].primitive()) == typeid(QuantizedMatmul));
+    if (has_qmm_operand) {
+      fuse_stats.qmm_operand_reject.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   return array(
-      shape, out_type, std::make_shared<Add>(to_stream(s)), std::move(inputs));
+      std::move(shape),
+      out_type,
+      std::make_shared<Add>(to_stream(s)),
+      std::move(inputs));
 }
 
 array operator+(const array& a, const array& b) {

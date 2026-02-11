@@ -1551,6 +1551,12 @@ inline bool native_qmm_m8_enabled() {
   return enabled;
 }
 
+inline bool native_qmm_add_fuse_g8_enabled() {
+  static const bool enabled =
+      env_flag_default_false("MLX_VK_ENABLE_QMM_ADD_FUSE_G8");
+  return enabled;
+}
+
 inline bool native_rmsnorm_enabled() {
   static const bool enabled =
       env_flag_default_true("MLX_VK_ENABLE_RMSNORM_NATIVE");
@@ -2294,6 +2300,125 @@ inline bool can_use_native_affine_bf16_quantized_matmul(
   }
 
   return true;
+}
+
+inline bool can_use_native_qmm_add_fuse_g8(
+    const std::vector<mlx::core::array>& inputs,
+    const mlx::core::array& out,
+    int group_size,
+    int bits,
+    bool transpose,
+    mlx::core::QuantizationMode mode) {
+  if (inputs.size() != 5) {
+    return false;
+  }
+  const std::vector<mlx::core::array> qmm_inputs{
+      inputs[0], inputs[1], inputs[2], inputs[3]};
+  if (!can_use_native_affine_bf16_quantized_matmul(
+          qmm_inputs, out, group_size, bits, transpose, mode)) {
+    return false;
+  }
+  const auto& residual = inputs[4];
+  if (residual.dtype() != mlx::core::bfloat16 ||
+      !is_row_contiguous_materialized(residual) ||
+      residual.shape() != out.shape() || residual.size() != out.size() ||
+      (residual.size() % 2) != 0) {
+    return false;
+  }
+  const int64_t k = inputs[0].shape(-1);
+  if (k <= 0 || group_size <= 0) {
+    return false;
+  }
+  const int64_t groups_per_col = k / group_size;
+  if (groups_per_col != 8) {
+    return false;
+  }
+  const int64_t rows = static_cast<int64_t>(
+      inputs[0].size() / static_cast<size_t>(k));
+  return rows == 1;
+}
+
+inline bool dispatch_native_qmm_add_fuse_g8(
+    mlx::core::Stream stream,
+    const std::vector<mlx::core::array>& inputs,
+    mlx::core::array& out,
+    int group_size) {
+  try {
+    if (!out.data_shared_ptr()) {
+      out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+    }
+
+    auto& device = mlx::core::vulkan::device(stream.device);
+    auto& encoder = device.get_command_encoder(stream.index);
+    encoder.begin_encoding();
+
+    auto x_tensor = device.get_tensor(inputs[0]);
+    auto w_cached = get_qmm_const_tensor(inputs[1], device);
+    auto scales_cached = get_qmm_const_tensor(inputs[2], device);
+    auto biases_cached = get_qmm_const_tensor(inputs[3], device);
+    auto residual_tensor = device.get_tensor(inputs[4]);
+    auto out_tensor = device.get_tensor(out);
+
+    std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+    if (device.tensor_needs_sync_device(inputs[0])) {
+      sync_tensors.push_back(x_tensor);
+    }
+    if (w_cached.needs_sync) {
+      sync_tensors.push_back(w_cached.tensor);
+    }
+    if (scales_cached.needs_sync) {
+      sync_tensors.push_back(scales_cached.tensor);
+    }
+    if (biases_cached.needs_sync) {
+      sync_tensors.push_back(biases_cached.tensor);
+    }
+    if (device.tensor_needs_sync_device(inputs[4])) {
+      sync_tensors.push_back(residual_tensor);
+    }
+    if (!sync_tensors.empty()) {
+      encoder.record_tensor_sync_device(sync_tensors);
+    }
+    if (w_cached.cacheable && w_cached.needs_sync) {
+      mark_qmm_const_tensor_uploaded(w_cached.key);
+    }
+    if (scales_cached.cacheable && scales_cached.needs_sync) {
+      mark_qmm_const_tensor_uploaded(scales_cached.key);
+    }
+    if (biases_cached.cacheable && biases_cached.needs_sync) {
+      mark_qmm_const_tensor_uploaded(biases_cached.key);
+    }
+
+    const uint32_t out_elems = static_cast<uint32_t>(out.size());
+    const uint32_t out_words = (out_elems + 1u) / 2u;
+    const uint32_t n = static_cast<uint32_t>(out.shape(-1));
+    const uint32_t k = static_cast<uint32_t>(inputs[0].shape(-1));
+    const uint32_t groups_per_col = static_cast<uint32_t>(
+        k / static_cast<uint32_t>(group_size));
+    const uint32_t w_words_per_col = static_cast<uint32_t>(inputs[1].shape(-1));
+
+    const std::vector<uint32_t> push_consts{
+        encode_push_constant_u32(out_elems),
+        encode_push_constant_u32(n),
+        encode_push_constant_u32(k),
+        encode_push_constant_u32(groups_per_col),
+        encode_push_constant_u32(w_words_per_col)};
+
+    encoder.record_algo_dispatch(
+        mlx::core::vulkan::KernelRegistry::
+            QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_ADD,
+        {x_tensor,
+         w_cached.tensor,
+         scales_cached.tensor,
+         biases_cached.tensor,
+         residual_tensor,
+         out_tensor},
+        {std::max<uint32_t>(1u, out_words), 1, 1},
+        push_consts);
+    device.mark_tensor_host_dirty(out, stream.index);
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
 }
 
 inline bool can_use_native_rmsnorm_bf16(
@@ -3224,6 +3349,25 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   profile.mark_fallback();
   qmm_stats_record_final_fallback(rows_hint, k_hint, n_hint, groups_per_col_hint);
+  run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);
+}
+
+void QuantizedMatmulAdd::eval_gpu(
+    const std::vector<array>& inputs,
+    array& out) {
+  vulkan::OpProfileScope profile("QuantizedMatmulAdd");
+  auto stream = out.primitive().stream();
+
+  if (native_qmm_add_fuse_g8_enabled() &&
+      can_use_native_qmm_add_fuse_g8(
+          inputs, out, group_size_, bits_, transpose_, mode_)) {
+    prepare_inputs_for_cpu_fallback(inputs, stream);
+    if (dispatch_native_qmm_add_fuse_g8(stream, inputs, out, group_size_)) {
+      return;
+    }
+  }
+
+  profile.mark_fallback();
   run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);
 }
 

@@ -3470,6 +3470,22 @@ std::vector<Shape> QuantizedMatmul::output_shapes(
   return {std::move(out_shape)};
 }
 
+bool QuantizedMatmulAdd::is_equivalent(const Primitive& other) const {
+  const QuantizedMatmulAdd& qm_other =
+      static_cast<const QuantizedMatmulAdd&>(other);
+  return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&
+      mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_;
+}
+
+std::vector<Shape> QuantizedMatmulAdd::output_shapes(
+    const std::vector<array>& inputs) {
+  auto& w = inputs[1];
+  int w_outer_dims = (transpose_) ? w.shape(-2) : w.shape(-1) * 32 / bits_;
+  auto out_shape = inputs[0].shape();
+  out_shape.back() = w_outer_dims;
+  return {std::move(out_shape)};
+}
+
 bool QQMatmul::is_equivalent(const Primitive& other) const {
   const QQMatmul& qm_other = static_cast<const QQMatmul&>(other);
   return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&
