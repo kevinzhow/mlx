@@ -1,0 +1,28 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufferA {
+  uint values[];
+} buffer_a;
+
+layout(set = 0, binding = 1) readonly buffer BufferB {
+  uint values[];
+} buffer_b;
+
+layout(set = 0, binding = 2) writeonly buffer BufferC {
+  uint values[];
+} buffer_c;
+
+layout(push_constant) uniform PushConstants {
+  uint size;
+} params;
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  if (idx >= params.size) {
+    return;
+  }
+  uint shift = buffer_b.values[0] & 31u;
+  buffer_c.values[idx] = buffer_a.values[idx] >> shift;
+}

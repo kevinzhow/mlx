@@ -272,6 +272,32 @@
     - 40-token：`3.543 vs 3.277 tok/s`（`+8.1%`）
     - 80-token：`2.861 vs 2.580 tok/s`（`+10.9%`）
 
+### D-9.12：BitwiseBinary 命中定位 + 小核实验结论（已完成）
+- 背景（Metal/Ollama 对照）：
+  - 两条路线都强调“先看命中，再决定是否值得做小算子专核”。
+  - 本轮先通过签名日志确认 `BitwiseBinary` 的真实形态，再落最小可行 native 路径做 A/B。
+- 命中定位（`MLX_VK_DEBUG_BITWISE_FALLBACK=1`）：
+  - 主要形态固定为：
+    - `LeftShift` / `RightShift`
+    - `a/out: uint32` 行连续
+    - `b: uint32` 标量广播视图（`strides=[0,0,0]`，`data_size=1`）
+  - 典型 shape：`[1,12,128]`、`[1,1,128]`。
+- 变更：
+  - 新增实验 shader：`lshift_u32_scalar`、`rshift_u32_scalar`（含 `.comp -> .spv -> *_spv.h`）。
+  - 新增 kernel 注册与调度路径：
+    - gate：`MLX_VK_ENABLE_BITWISE_SHIFT_U32`
+    - 默认值设为 `0`（OFF），仅作实验开关保留。
+  - 新增调试开关：`MLX_VK_DEBUG_BITWISE_FALLBACK=1`（同签名仅打印一次）。
+- A/B 结果（Qwen3 EN，实卡 Vulkan，串行）：
+  - 命中：开启后 `BitwiseBinary fallback 672 -> 0`，整体 fallback 比例 `3.98% -> 0.80%`。
+  - 吞吐（ON vs OFF）：
+    - 40-token：`3.375 vs 3.549 tok/s`（`-4.9%`）
+    - 80-token：`2.686 vs 2.863 tok/s`（`-6.2%`）
+- 结论：
+  - 单独把高频 tiny bitwise op 搬到 Vulkan 小核，受每次 dispatch 固定开销影响，端到端反而回退。
+  - 与 Metal/Ollama 启发一致：这类路径更适合“融合到上游/下游大核或减少 launch 次数”，而不是独立微核堆叠。
+  - 因此保留实验路径，但默认关闭，避免主线回退。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`M1_REDUCE_SUBGROUP` 仅带来 `~1%` 级增益，说明需要更深层内核重构（访存与解量化融合策略）。
@@ -281,6 +307,7 @@
 
 3. 高频小算子 fallback 尾部  
 - `BitwiseBinary`、`Gather`、`fast::Quantize` 仍是 decode 口径下的主要 fallback 尾部。
+- 其中 `BitwiseBinary` 已验证“独立 tiny kernel”会回退，后续应优先走融合或 launch 减量路径。
 
 4. SDPA 长上下文效率  
 - 当前 decode-unlimited + split-k 已稳定，但 `k=65+` 的 stage1/reduce 仍有进一步优化空间。
@@ -293,8 +320,8 @@
 2. SDPA decode 次热点并行推进  
 - 对照 Metal/Ollama 的 decode attention 内核拆分策略，继续优化 `k=33~128` 区间的 stage1/reduce 配置与核形态。
 
-3. 清理 `BitwiseBinary / Gather / fast::Quantize` 尾部  
-- 继续沿 Metal/Ollama 的“高频小算子专核”路线，先做 decode 高频形态桶，优先处理 fallback 次数最高的 `BitwiseBinary`。
+3. 清理 `fast::Quantize / Gather` 尾部并规划 Bitwise 融合  
+- 继续沿 Metal/Ollama 的“减少 launch 数量 + 融合高频小算子”路线推进，优先处理 `fast::Quantize` 与 `Gather`，Bitwise 暂不做默认独立专核。
 
 4. 维持命中优先与串行口径  
 - 每轮必须先跑 `MLX_VK_QMM_STATS=1` / `MLX_VK_SDPA_STATS=1` 确认命中，再做优化与 A/B。

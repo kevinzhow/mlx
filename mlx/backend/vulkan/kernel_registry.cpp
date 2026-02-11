@@ -16,6 +16,8 @@
 #include "shaders/mul_bf16_spv.h"
 #include "shaders/mul_bf16_scalar_spv.h"
 #include "shaders/mul_bf16_bcast_spv.h"
+#include "shaders/lshift_u32_scalar_spv.h"
+#include "shaders/rshift_u32_scalar_spv.h"
 #include "shaders/silu_mul_bf16_spv.h"
 #include "shaders/sub_bf16_spv.h"
 #include "shaders/sub_bf16_scalar_spv.h"
@@ -63,6 +65,8 @@ const char* KernelRegistry::MUL_F32 = "mul_f32";
 const char* KernelRegistry::MUL_BF16 = "mul_bf16";
 const char* KernelRegistry::MUL_BF16_SCALAR = "mul_bf16_scalar";
 const char* KernelRegistry::MUL_BF16_BCAST = "mul_bf16_bcast";
+const char* KernelRegistry::LSHIFT_U32_SCALAR = "lshift_u32_scalar";
+const char* KernelRegistry::RSHIFT_U32_SCALAR = "rshift_u32_scalar";
 const char* KernelRegistry::SILU_MUL_BF16 = "silu_mul_bf16";
 const char* KernelRegistry::SUB_F32 = "sub_f32";
 const char* KernelRegistry::SUB_F32_SCALAR = "sub_f32_scalar";
@@ -172,6 +176,20 @@ void KernelRegistry::register_builtin_shaders() {
       mul_bf16_bcast_spv,
       mul_bf16_bcast_spv_len);
   shaders_[MUL_BF16_BCAST] = std::move(mul_bf16_bcast_spirv);
+  std::vector<uint32_t> lshift_u32_scalar_spirv(
+      (lshift_u32_scalar_spv_len + 3) / 4);
+  std::memcpy(
+      lshift_u32_scalar_spirv.data(),
+      lshift_u32_scalar_spv,
+      lshift_u32_scalar_spv_len);
+  shaders_[LSHIFT_U32_SCALAR] = std::move(lshift_u32_scalar_spirv);
+  std::vector<uint32_t> rshift_u32_scalar_spirv(
+      (rshift_u32_scalar_spv_len + 3) / 4);
+  std::memcpy(
+      rshift_u32_scalar_spirv.data(),
+      rshift_u32_scalar_spv,
+      rshift_u32_scalar_spv_len);
+  shaders_[RSHIFT_U32_SCALAR] = std::move(rshift_u32_scalar_spirv);
 
   std::vector<uint32_t> silu_mul_bf16_spirv((silu_mul_bf16_spv_len + 3) / 4);
   std::memcpy(

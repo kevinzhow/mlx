@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -177,6 +178,145 @@ inline bool logsumexp_debug_reject_enabled() {
         std::strcmp(v, "on") == 0;
   }();
   return enabled;
+}
+
+inline bool bitwise_debug_fallback_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_DEBUG_BITWISE_FALLBACK");
+    if (!v) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
+inline void log_bitwise_fallback_once(
+    const mlx::core::BitwiseBinary& prim,
+    const std::vector<mlx::core::array>& inputs,
+    const mlx::core::array& out) {
+  if (!bitwise_debug_fallback_enabled() || inputs.size() < 2) {
+    return;
+  }
+  static std::mutex mtx;
+  static std::unordered_set<std::string> seen;
+  std::ostringstream key;
+  key << prim.name() << "|a_dtype=" << inputs[0].dtype()
+      << "|a_shape=" << shape_string(inputs[0])
+      << "|a_strides=" << strides_string(inputs[0])
+      << "|a_data_size=" << inputs[0].data_size()
+      << "|a_row=" << (inputs[0].flags().row_contiguous ? 1 : 0)
+      << "|b_dtype=" << inputs[1].dtype()
+      << "|b_shape=" << shape_string(inputs[1])
+      << "|b_strides=" << strides_string(inputs[1])
+      << "|b_data_size=" << inputs[1].data_size()
+      << "|b_row=" << (inputs[1].flags().row_contiguous ? 1 : 0)
+      << "|out_dtype=" << out.dtype()
+      << "|out_shape=" << shape_string(out)
+      << "|out_strides=" << strides_string(out)
+      << "|out_data_size=" << out.data_size()
+      << "|out_row=" << (out.flags().row_contiguous ? 1 : 0);
+  const std::string signature = key.str();
+  std::lock_guard<std::mutex> lock(mtx);
+  if (!seen.insert(signature).second) {
+    return;
+  }
+  std::cerr << "[VulkanBitwiseFallback] op=" << prim.name()
+            << " a.dtype=" << inputs[0].dtype()
+            << " a.shape=" << shape_string(inputs[0])
+            << " a.strides=" << strides_string(inputs[0])
+            << " a.size=" << inputs[0].size()
+            << " a.data_size=" << inputs[0].data_size()
+            << " a.row=" << (inputs[0].flags().row_contiguous ? 1 : 0)
+            << " b.dtype=" << inputs[1].dtype()
+            << " b.shape=" << shape_string(inputs[1])
+            << " b.strides=" << strides_string(inputs[1])
+            << " b.size=" << inputs[1].size()
+            << " b.data_size=" << inputs[1].data_size()
+            << " b.row=" << (inputs[1].flags().row_contiguous ? 1 : 0)
+            << " out.dtype=" << out.dtype()
+            << " out.shape=" << shape_string(out)
+            << " out.strides=" << strides_string(out)
+            << " out.size=" << out.size()
+            << " out.data_size=" << out.data_size()
+            << " out.row=" << (out.flags().row_contiguous ? 1 : 0)
+            << "\n";
+}
+
+inline bool native_bitwise_shift_u32_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_ENABLE_BITWISE_SHIFT_U32");
+    if (!v) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
+inline bool can_use_native_bitwise_shift_u32_scalar(
+    const std::vector<mlx::core::array>& inputs,
+    const mlx::core::array& out) {
+  if (inputs.size() != 2) {
+    return false;
+  }
+  const auto& a = inputs[0];
+  const auto& b = inputs[1];
+  if (!(out.size() > 0 && a.dtype() == mlx::core::uint32 &&
+        b.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint32 &&
+        a.size() == b.size() && a.size() == out.size() &&
+        a.shape() == b.shape() && a.shape() == out.shape() &&
+        is_row_contiguous_materialized(a) && out.flags().row_contiguous &&
+        b.data_size() == 1 && b.ndim() > 0)) {
+    return false;
+  }
+  return std::all_of(
+      b.strides().begin(), b.strides().end(), [](int64_t s) { return s == 0; });
+}
+
+inline bool dispatch_native_bitwise_shift_u32(
+    mlx::core::Stream stream,
+    const mlx::core::array& a,
+    const mlx::core::array& b,
+    mlx::core::array& out,
+    const char* kernel_name) {
+  auto& device = mlx::core::vulkan::device(stream.device);
+  auto& encoder = device.get_command_encoder(stream.index);
+  encoder.begin_encoding();
+
+  if (!out.data_shared_ptr()) {
+    out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+  }
+
+  auto a_tensor = device.get_tensor(a);
+  auto b_tensor = device.get_tensor(b);
+  auto out_tensor = device.get_tensor(out);
+  if (!a_tensor || !b_tensor || !out_tensor) {
+    return false;
+  }
+
+  std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+  if (device.tensor_needs_sync_device(a)) {
+    sync_tensors.push_back(a_tensor);
+  }
+  if (device.tensor_needs_sync_device(b)) {
+    sync_tensors.push_back(b_tensor);
+  }
+  if (!sync_tensors.empty()) {
+    encoder.record_tensor_sync_device(sync_tensors);
+  }
+
+  const uint32_t n = static_cast<uint32_t>(out.size());
+  const uint32_t groups_x = std::max<uint32_t>(1, (n + 255u) / 256u);
+  const std::vector<uint32_t> push_consts{n};
+  const std::vector<std::shared_ptr<kp::Tensor>> dispatch_tensors{
+      a_tensor, b_tensor, out_tensor};
+  encoder.record_algo_dispatch(
+      kernel_name, dispatch_tensors, {groups_x, 1, 1}, push_consts);
+  device.mark_tensor_host_dirty(out, stream.index);
+  return true;
 }
 
 inline bool compiled_profile_detail_enabled() {
@@ -2366,6 +2506,37 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);
 }
 
+void BitwiseBinary::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("BitwiseBinary");
+  auto stream = out.primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+
+  if (native_bitwise_shift_u32_enabled() &&
+      out.size() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()) &&
+      can_use_native_bitwise_shift_u32_scalar(inputs, out)) {
+    const char* kernel_name = nullptr;
+    if (op_ == BitwiseBinary::LeftShift) {
+      kernel_name = vulkan::KernelRegistry::LSHIFT_U32_SCALAR;
+    } else if (op_ == BitwiseBinary::RightShift) {
+      kernel_name = vulkan::KernelRegistry::RSHIFT_U32_SCALAR;
+    }
+    if (kernel_name != nullptr) {
+      try {
+        if (dispatch_native_bitwise_shift_u32(
+                stream, inputs[0], inputs[1], out, kernel_name)) {
+          return;
+        }
+      } catch (const std::exception&) {
+        // Fall through to CPU fallback.
+      }
+    }
+  }
+
+  log_bitwise_fallback_once(*this, inputs, out);
+  profile.mark_fallback();
+  run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);
+}
+
 VULKAN_CPU_FALLBACK(Abs)
 VULKAN_CPU_FALLBACK(AddMM)
 VULKAN_CPU_FALLBACK(Arange)
@@ -2378,7 +2549,6 @@ VULKAN_CPU_FALLBACK(ArcTan2)
 VULKAN_CPU_FALLBACK(ArcTanh)
 VULKAN_CPU_FALLBACK(ArgPartition)
 VULKAN_CPU_FALLBACK(ArgSort)
-VULKAN_CPU_FALLBACK(BitwiseBinary)
 VULKAN_CPU_FALLBACK(BitwiseInvert)
 VULKAN_CPU_FALLBACK(BlockMaskedMM)
 VULKAN_CPU_FALLBACK(Ceil)

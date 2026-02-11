@@ -57,6 +57,8 @@ class KernelRegistry {
   static const char* MUL_BF16;
   static const char* MUL_BF16_SCALAR;
   static const char* MUL_BF16_BCAST;
+  static const char* LSHIFT_U32_SCALAR;
+  static const char* RSHIFT_U32_SCALAR;
   static const char* SILU_MUL_BF16;
   static const char* SUB_F32;
   static const char* SUB_F32_SCALAR;
