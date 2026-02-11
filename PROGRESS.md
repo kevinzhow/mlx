@@ -16,15 +16,18 @@
 - 模型正确性：Qwen3-0.6B-MLX-4bit（EN/ZH，10 token）输出正常，无乱码/`!!!!!!!!!!` 回归。
 - 流程约束（新增）：Qwen3 `mlx_lm generate` 正确性/性能口径需串行执行；任意 C++/Vulkan/shader 变更后，Python 侧验证前必须先执行 `python3 setup.py build_ext --inplace`，避免旧扩展产物导致误判。
 - 近期吞吐（实卡 Vulkan，串行口径）：
-  - 10-token（EN）：约 `5.20~5.23 tok/s`（D-9.25 后）
-  - 40-token（EN）：约 `4.64~4.73 tok/s`（D-9.26 profiling refresh）
-  - 80-token（EN）：约 `3.17~3.34 tok/s`（D-9.23 后）
+  - 10-token（EN）：约 `5.20~5.24 tok/s`（D-9.30 后）
+  - 40-token（EN）：约 `4.87~4.93 tok/s`（D-9.30 后）
+  - 80-token（EN）：约 `4.80 tok/s`（D-9.30 样本）
 - 运行时新默认（D-9.21）：
   - `MLX_VK_ENABLE_ALGO_CACHE=0`（默认 OFF）
   - 原因：当前 decode 主线算法缓存命中率为 `0`，默认关闭可减少无效 key/map 开销。
 - 运行时新默认（D-9.22）：
   - `MLX_VK_MAX_INFLIGHT_SEQUENCES=8`
   - 语义：Vulkan 提交改为 `evalAsync`，并以 inflight 窗口做受控 `evalAwait`，对齐 Metal“提交异步、同步点显式”的行为模型。
+- 运行时新默认（D-9.30）：
+  - `MLX_VK_ENABLE_ADD_RMSNORM_NATIVE=0`（默认 OFF）
+  - 原因：`add+rmsnorm` 融合路径已打通但端到端收益不稳定，暂保留为实验开关。
 - decode 主线 fallback 占比（同口径 profile）：
   - 由 `18.40%` 降到 `13.50%`（D-9.2），再降到 `3.98%`（D-9.11），当前进一步降到 `0.62%`（D-9.13）
 - QMM decode `rows=1` 精确 `gpc` 命中（40-token 样本）：
@@ -753,7 +756,7 @@
     - `RMSNorm::vjp` 支持 fused-add 形态（`da=dx`, `db=dx`, `dw` 按原公式）。
   - Vulkan 侧：
     - 新增 kernel：`add_rmsnorm_bf16`。
-    - 新增 gate：`MLX_VK_ENABLE_ADD_RMSNORM_NATIVE`（默认 ON）。
+    - 新增 gate：`MLX_VK_ENABLE_ADD_RMSNORM_NATIVE`（首版默认 ON，D-9.30 改为默认 OFF）。
     - 新增命中判定与 dispatch：`fast::RMSNorm::eval_gpu` 对 3 输入路径优先走 native。
   - shader 闭环（严格执行）：
     - 已完成 `.comp -> .spv -> *_spv.h`：
@@ -788,6 +791,29 @@
   - 按“<~2% 且不稳定不入默认”规则，本轮不调整默认门禁，`G16/G24` 继续作为可选实验开关。
   - 该方向可保留到后续更大改动（如 QMM 主核重构）后再统一复评。
 
+### D-9.30：RMSNorm 并行归约内核升级（已完成）
+- 背景（Metal/Ollama 对照）：
+  - 两条路线都强调在 decode 热核上提高单次 dispatch 的有效并行度，避免“1 线程串行扫全行”的低利用率实现。
+  - 现状中 `rmsnorm_bf16`（及 `add_rmsnorm_bf16`）为 `local_size_x=1` 串行行核，是明显的架构短板。
+- 实现：
+  - 将 `rmsnorm_bf16.comp` 从单线程行核改为每行 `local_size_x=128` 并行归约：
+    - 按 lane 分片读取 `axis_words`，shared-memory 树归约求 `sumsq`。
+    - 同一 workgroup 内广播 `inv_rms`，并行写回归一化输出。
+  - 同步将 `add_rmsnorm_bf16.comp` 升级为同构并行归约版本。
+  - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h` 同轮完成。
+  - 将 `MLX_VK_ENABLE_ADD_RMSNORM_NATIVE` 默认改为 OFF（仍可显式开启实验）。
+- 验证：
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 ZH 10-token：输出正常，无乱码。
+  - Qwen3 EN（实卡 Vulkan，串行）：
+    - 40-token（默认）：`4.929 tok/s`
+    - 80-token（默认）：`4.806 tok/s`
+    - `MLX_VK_ENABLE_ADD_RMSNORM_NATIVE=1` 对照：40-token `4.870 tok/s`（无稳定正收益）。
+- 结论：
+  - 本轮通过“核内并行度升级”带来可复现吞吐抬升（相对 D-9.26 的 `4.64~4.73 tok/s`，40-token 提升到 `4.87~4.93 tok/s`）。
+  - `add+rmsnorm` 小融合路径继续保留为实验开关，不进入默认主线。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`g8_x2` A1-Phase1 与 A1.2 重排均未形成稳定收益，后续需转向更深层内核重构（数据布局 + 中间态组织）。
@@ -798,7 +824,7 @@
 - D-9.28 已验证 `add+rmsnorm` 小粒度融合本身不足以带来稳定吞吐提升，后续需转向更大粒度热链路重构。
 
 3. `fast::RMSNorm / fast::ScaledDotProductAttention`
-- 在 RoPE 回退清理后，二者仍是次级原生耗时来源，需继续做 kernel 级效率优化。
+- D-9.30 已完成 RMSNorm 并行归约升级，串行实现瓶颈已缓解；下一步重心转向 SDPA 长上下文与 QMM 主核。
 
 4. 高频小算子 fallback 尾部  
 - `Gather` 目前是 decode 口径下最主要的剩余 fallback 尾部（profile_each 样本 `126` 次）。

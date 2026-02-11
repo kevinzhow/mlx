@@ -1,6 +1,6 @@
 #version 450
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer XBuffer {
   uint words[];
@@ -46,8 +46,12 @@ float load_w_elem(uint elem_idx) {
   return load_bf16(w_buffer.words[elem_idx >> 1u], elem_idx);
 }
 
+shared float shared_sums[128];
+shared float shared_inv;
+
 void main() {
-  uint row = gl_GlobalInvocationID.x;
+  uint row = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
   if (row >= params.n_rows) {
     return;
   }
@@ -56,17 +60,31 @@ void main() {
   uint row_word_base = row_elem_base >> 1u;
   uint axis_words = params.axis_size >> 1u;
 
-  float sumsq = 0.0;
-  for (uint wi = 0u; wi < axis_words; ++wi) {
+  float sumsq = 0.0f;
+  for (uint wi = lane; wi < axis_words; wi += gl_WorkGroupSize.x) {
     uint x_word = x_buffer.words[row_word_base + wi];
     float x0 = load_bf16(x_word, 0u);
     float x1 = load_bf16(x_word, 1u);
     sumsq += x0 * x0 + x1 * x1;
   }
+  shared_sums[lane] = sumsq;
+  barrier();
 
-  float inv = inversesqrt((sumsq / float(params.axis_size)) + params.eps);
+  for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
+    if (lane < stride) {
+      shared_sums[lane] += shared_sums[lane + stride];
+    }
+    barrier();
+  }
 
-  for (uint wi = 0u; wi < axis_words; ++wi) {
+  if (lane == 0u) {
+    shared_inv = inversesqrt((shared_sums[0] / float(params.axis_size)) + params.eps);
+  }
+  barrier();
+
+  float inv = shared_inv;
+
+  for (uint wi = lane; wi < axis_words; wi += gl_WorkGroupSize.x) {
     uint elem0 = row_elem_base + wi * 2u;
     uint elem1 = elem0 + 1u;
 

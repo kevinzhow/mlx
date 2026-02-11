@@ -1559,7 +1559,7 @@ inline bool native_rmsnorm_enabled() {
 
 inline bool native_add_rmsnorm_enabled() {
   static const bool enabled =
-      env_flag_default_true("MLX_VK_ENABLE_ADD_RMSNORM_NATIVE");
+      env_flag_default_false("MLX_VK_ENABLE_ADD_RMSNORM_NATIVE");
   return enabled;
 }
 

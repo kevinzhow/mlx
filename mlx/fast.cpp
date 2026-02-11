@@ -18,7 +18,7 @@ bool fused_add_rmsnorm_enabled() {
   static const bool enabled = []() {
     const char* v = std::getenv("MLX_VK_ENABLE_ADD_RMSNORM_NATIVE");
     if (!v || v[0] == '\0') {
-      return true;
+      return false;
     }
     return std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
         std::strcmp(v, "off") != 0;
