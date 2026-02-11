@@ -1113,6 +1113,58 @@
   - subgroup 路径方向与 Metal/Ollama 启发一致，但当前实现仅边际波动，未达到“稳定 >2% 阶跃”标准。
   - 按主线策略保持默认 OFF，仅保留为后续更大架构改造时的可复用组件。
 
+### D-9.40：2x 目标复盘（热点定量 + 架构预算）
+- 目标定义：
+  - 以当前实卡 Vulkan Qwen3 EN 40-token 串行口径为基线（Generation `~5.0 tok/s`），
+  - “100% 提升”定义为稳定达到 `>=10 tok/s`（同口径）。
+- 最新热点量化（实测）：
+  - `MLX_VK_ALGO_STATS=1`（40-token）：
+    - `requests=17931`，`cache_hits=0`
+    - top kernel 次数：
+      - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8`: `5781`
+      - `rmsnorm_bf16`: `4743`
+      - `rope_bf16_t1`: `2351`
+      - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g16_add`: `1148`
+      - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g24_add`: `1148`
+  - `MLX_VK_PROFILE=1 + PRINT_EACH=1` 汇总（40-token）：
+    - `QuantizedMatmul`: `2.731s`（`5918` 次）
+    - `QuantizedMatmulAdd`: `0.993s`（`2350` 次）
+    - `fast::RMSNorm`: `0.476s`（`4743` 次）
+    - `fast::ScaledDotProductAttention`: `0.402s`（`1175` 次）
+    - `fast::RoPE`: `0.315s`（`2351` 次）
+  - 结论：当前不是“单一 fallback”问题，而是“高频小链路 + 超高 dispatch 次数”问题。
+- 2x 可行路径（对标 Metal/Ollama）：
+  - 仅靠单核微调（`g16/g24`、subgroup 细节等）无法达到 2x；必须做“执行图级”重构。
+  - 必要项（必须叠加）：
+    1. **Decode step 持久化执行计划**（Metal command-buffer 复用 / Ollama 持续化 decode 路线）  
+       - 目标：把每 token 的 kernel 构建与 `manager.algorithm` 请求从“逐 op 重新决策”改为“预录制 + 参数更新 + 直接提交”。
+    2. **QMM 主核从“每次小 dispatch”升级为“更粗粒度 tile/epilogue 超核”**  
+       - 目标：显著减少 `QMM + Add + Norm` 的 launch 数量，而不是继续增加小专核分支。
+    3. **跨层/同层链路融合优先于算子补齐**  
+       - 优先顺序：`QMM -> residual add -> norm -> rope` 邻接段，先减 launch，再谈单核极限。
+  - 经验阈值（执行判据）：
+    - 若改动不能同时带来“dispatch 数显著下降 + tok/s 持续 >2% 提升”，不进入默认路径。
+    - 2x 目标必须来自“多项架构变更叠加”，不再接受单点微调路线。
+
+### D-9.41：Algorithm cache 强引用 LRU 实验（已完成，未进入默认）
+- 背景（对标 Metal/Ollama）：
+  - 目标是削减 decode 每 token 的 host 固定开销，优先验证“跨 token 复用 `kp::Algorithm`”是否可行。
+- 本轮实现：
+  - `KernelRegistry` cache 从 `weak_ptr` 改为强引用 LRU（有界容量）：
+    - 新增上限参数：`MLX_VK_ALGO_CACHE_MAX_ENTRIES`（默认 `8192`，范围 `64..65536`）。
+    - cache key 仍保持 tensor identity（保证 descriptor 绑定正确性）。
+  - 保持默认门禁不变：`MLX_VK_ENABLE_ALGO_CACHE=0`（仅实验开启）。
+- 实测结果（Qwen3 EN 40-token，实卡 Vulkan，串行）：
+  - `MLX_VK_ENABLE_ALGO_CACHE=1 MLX_VK_ALGO_STATS=1`：
+    - 运行中自动关停：`auto-disabled after 2048 requests with zero cache hits`
+    - 终态：`requests=17931, cache_hits=0, cache_misses=17931`
+    - Generation：`4.863 tok/s`
+  - 默认（cache OFF）：
+    - Generation：`4.953 tok/s`
+- 结论：
+  - 即便改为强引用 LRU，当前 decode 链路仍是“零命中”，根因不是引用生命周期，而是“tensor identity 高速变化导致 key 不复用”。
+  - 这进一步确认主线应转向：**decode 持久化执行计划 / 稳定中间张量身份 / launch 数压降**，而不是继续在现有 key 模型上调 cache 策略。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`g8_x2` A1-Phase1 与 A1.2 重排均未形成稳定收益，后续需转向更深层内核重构（数据布局 + 中间态组织）。

@@ -102,6 +102,28 @@ bool algorithm_cache_enabled() {
   return enabled;
 }
 
+size_t algorithm_cache_max_entries() {
+  static const size_t max_entries = []() {
+    const char* v = std::getenv("MLX_VK_ALGO_CACHE_MAX_ENTRIES");
+    if (!v || v[0] == '\0') {
+      return static_cast<size_t>(8192);
+    }
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(v, &end, 10);
+    if (end == v || *end != '\0') {
+      return static_cast<size_t>(8192);
+    }
+    if (parsed < 64ull) {
+      return static_cast<size_t>(64);
+    }
+    if (parsed > 65536ull) {
+      return static_cast<size_t>(65536);
+    }
+    return static_cast<size_t>(parsed);
+  }();
+  return max_entries;
+}
+
 uint64_t algorithm_cache_zero_hit_disable_threshold() {
   static const uint64_t threshold = []() {
     const char* v = std::getenv("MLX_VK_ALGO_CACHE_ZERO_HIT_DISABLE_THRESHOLD");
@@ -857,9 +879,8 @@ std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
   std::stringstream cache_key_ss;
   cache_key_ss
       << build_algorithm_key(kernel_name, params.size(), workgroup, push_consts);
-  // Algorithm objects capture descriptor sets bound to specific Tensor objects.
-  // Include Tensor identity in cache key to avoid reusing pipelines with stale
-  // buffer bindings across different arrays.
+  // Algorithm objects capture descriptor sets bound to specific Tensor objects,
+  // so Tensor identity remains part of the cache key.
   for (const auto& tensor : params) {
     cache_key_ss << "_t" << std::hex
                  << reinterpret_cast<std::uintptr_t>(tensor.get());
@@ -872,13 +893,13 @@ std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
     // 检查缓存
     auto it = algorithms_.find(cache_key);
     if (it != algorithms_.end()) {
-      if (auto algo = it->second.lock()) {
-        record_algorithm_cache_access(kernel_name, true);
-        observe_algorithm_cache_access(true);
-        return algo;
-      }
-      // 已过期，从缓存中移除
-      algorithms_.erase(it);
+      // LRU touch
+      algorithm_lru_.erase(it->second.lru_it);
+      algorithm_lru_.push_front(cache_key);
+      it->second.lru_it = algorithm_lru_.begin();
+      record_algorithm_cache_access(kernel_name, true);
+      observe_algorithm_cache_access(true);
+      return it->second.algorithm;
     }
   }
   
@@ -893,10 +914,32 @@ std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
     algo = manager.algorithm(params, spirv, workgroup, std::vector<float>{}, push_consts);
   }
   
-  // 缓存 algorithm
+  // 缓存 algorithm（strong-ref LRU）
   {
     std::lock_guard<std::mutex> lock(algorithms_mutex_);
-    algorithms_[cache_key] = algo;
+    auto existing = algorithms_.find(cache_key);
+    if (existing != algorithms_.end()) {
+      algorithm_lru_.erase(existing->second.lru_it);
+      algorithm_lru_.push_front(cache_key);
+      existing->second.lru_it = algorithm_lru_.begin();
+      record_algorithm_cache_access(kernel_name, true);
+      observe_algorithm_cache_access(true);
+      return existing->second.algorithm;
+    }
+
+    algorithm_lru_.push_front(cache_key);
+    algorithms_.emplace(
+        cache_key, AlgorithmCacheEntry{algo, algorithm_lru_.begin()});
+
+    const size_t max_entries = algorithm_cache_max_entries();
+    while (algorithms_.size() > max_entries && !algorithm_lru_.empty()) {
+      const std::string& victim_key = algorithm_lru_.back();
+      auto victim_it = algorithms_.find(victim_key);
+      if (victim_it != algorithms_.end()) {
+        algorithms_.erase(victim_it);
+      }
+      algorithm_lru_.pop_back();
+    }
   }
   record_algorithm_cache_access(kernel_name, false);
   observe_algorithm_cache_access(false);
@@ -907,6 +950,7 @@ std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
 void KernelRegistry::clear_cache() {
   std::lock_guard<std::mutex> lock(algorithms_mutex_);
   algorithms_.clear();
+  algorithm_lru_.clear();
 }
 
 std::vector<uint32_t> KernelRegistry::load_spirv_from_file(const std::string& path) {

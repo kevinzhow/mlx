@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <list>
 #include <unordered_map>
 #include <vector>
 
@@ -121,11 +122,18 @@ class KernelRegistry {
   // 从内存加载 SPIR-V (用于嵌入)
   void register_builtin_shaders();
   
-  // Shader 缓存
+ // Shader 缓存
   std::unordered_map<std::string, std::vector<uint32_t>> shaders_;
-  
-  // Algorithm 缓存 (key: kernel_name + params signature)
-  std::unordered_map<std::string, std::weak_ptr<kp::Algorithm>> algorithms_;
+
+  struct AlgorithmCacheEntry {
+    std::shared_ptr<kp::Algorithm> algorithm;
+    std::list<std::string>::iterator lru_it;
+  };
+
+  // Algorithm cache (key: kernel_name + tensor signature).
+  // Uses strong refs with LRU eviction to preserve reuse across decode steps.
+  std::unordered_map<std::string, AlgorithmCacheEntry> algorithms_;
+  std::list<std::string> algorithm_lru_;
   std::mutex algorithms_mutex_;
 };
 

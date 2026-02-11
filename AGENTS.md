@@ -241,6 +241,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_ALGO_CACHE` (`0|1`)
   - `MLX_VK_ENABLE_ALGO_CACHE_AUTO_DISABLE` (`0|1`)
   - `MLX_VK_ALGO_CACHE_ZERO_HIT_DISABLE_THRESHOLD` (uint，`0` 表示禁用 zero-hit 自动关停)
+  - `MLX_VK_ALGO_CACHE_MAX_ENTRIES` (uint，强引用 LRU 容量上限；仅在 `MLX_VK_ENABLE_ALGO_CACHE=1` 时生效，默认 `8192`)
 
 ### Benchmarking Notes
 
