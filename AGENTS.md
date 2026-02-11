@@ -77,6 +77,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - No duplicate symbols or unresolved symbols.
   - GPU path links and initializes with Vulkan enabled.
   - Covered operators match CPU results.
+  - Do not run `ctest` concurrently with `cmake --build` in the same build directory.
 - Qwen3 run rule (mandatory):
   - This serial-only rule applies to Qwen3 `mlx_lm generate` correctness/perf runs.
   - Do not launch multiple Qwen3 generate commands in parallel shells/processes.
@@ -111,6 +112,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=1` (default ON, decode `rows==1` 并行归约路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1` (default ON, decode `rows==1` subgroup 归约路径；若 dispatch 失败会在进程内自动降级关闭)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G8=1` (default ON, decode `rows==1 && groups_per_col==8` 专核路径)
+  - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G8_X2=0` (default OFF, decode `rows==1 && groups_per_col==8` 双-word tile 架构实验路径；当前默认关闭以避免不稳定收益)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G16=0` (default OFF, decode `rows==1 && groups_per_col==16` 实验路径；当前默认关闭以避免回退)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G24=0` (default OFF, decode `rows==1 && groups_per_col==24` 实验路径；当前默认关闭以避免回退)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G32=0` (default OFF, decode `rows==1 && groups_per_col==32` 实验路径；当前默认关闭)
@@ -144,6 +146,11 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - Command-buffer defaults (without env override):
   - `MLX_VK_MAX_OPS_PER_BUFFER=100`
   - `MLX_VK_MAX_MB_PER_BUFFER=50`
+  - `MLX_VK_MAX_INFLIGHT_SEQUENCES=8`（异步提交窗口上限；超过后会 `evalAwait` 最早批次）
+- Algorithm-cache defaults (without env override):
+  - `MLX_VK_ENABLE_ALGO_CACHE=0` (default OFF; tensor-identity keyed cache在当前 decode 主线命中率接近 0，默认关闭以减少无效 key/map 开销)
+  - `MLX_VK_ENABLE_ALGO_CACHE_AUTO_DISABLE=1` (default ON; 当显式开启 cache 时，允许 zero-hit 自动关停)
+  - `MLX_VK_ALGO_CACHE_ZERO_HIT_DISABLE_THRESHOLD=2048` (default; 连续 0 hit 达阈值后进程内自动关闭 cache)
 
 ### Standard Qwen3 correctness checks
 
@@ -168,12 +175,14 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - `MLX_VK_PROFILE_COMPILED_DETAIL=1`（将 profile 中 `Compiled` 拆分为 `Compiled::<subgraph>`，默认 OFF）
 - `MLX_VK_SDPA_STATS=1` (进程退出时打印 SDPA 命中/回退分布与 `k_len_cap` 占比)
 - `MLX_VK_QMM_STATS=1` (进程退出时打印 QMM native kernel 命中、rows 桶、gpc 精确分布与 shape 桶分布，用于命中优先优化)
+- `MLX_VK_ALGO_STATS=1` (进程退出时打印 Vulkan 算法缓存请求/hit/miss 与按-kernel miss 分布)
 - Native gate toggles for isolation:
   - `MLX_VK_ENABLE_QMM_NATIVE=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G8=0|1`
+  - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G8_X2=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G16=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G24=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G32=0|1`
@@ -210,6 +219,11 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - Command-buffer tuning knobs:
   - `MLX_VK_MAX_OPS_PER_BUFFER`
   - `MLX_VK_MAX_MB_PER_BUFFER`
+  - `MLX_VK_MAX_INFLIGHT_SEQUENCES`
+- Algorithm-cache tuning knobs:
+  - `MLX_VK_ENABLE_ALGO_CACHE` (`0|1`)
+  - `MLX_VK_ENABLE_ALGO_CACHE_AUTO_DISABLE` (`0|1`)
+  - `MLX_VK_ALGO_CACHE_ZERO_HIT_DISABLE_THRESHOLD` (uint，`0` 表示禁用 zero-hit 自动关停)
 
 ### Benchmarking Notes
 

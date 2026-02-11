@@ -182,22 +182,50 @@ void CommandEncoder::set_compute_pipeline(const std::string& kernel_name) {
 
 void CommandEncoder::record_tensor_sync_device(const std::vector<std::shared_ptr<kp::Tensor>>& tensors) {
   if (!encoding_begun_) begin_encoding();
-  
-  for (auto& tensor : tensors) {
-    stream_.sequence->record<kp::OpTensorSyncDevice>({tensor});
-    buffer_ops_++;
-    stream_.buffer_ops++;
+
+  std::vector<std::shared_ptr<kp::Tensor>> unique_tensors;
+  unique_tensors.reserve(tensors.size());
+  std::unordered_set<kp::Tensor*> seen;
+  seen.reserve(tensors.size());
+  for (const auto& tensor : tensors) {
+    if (!tensor) {
+      continue;
+    }
+    if (seen.insert(tensor.get()).second) {
+      unique_tensors.push_back(tensor);
+    }
   }
+  if (unique_tensors.empty()) {
+    return;
+  }
+
+  stream_.sequence->record<kp::OpTensorSyncDevice>(unique_tensors);
+  buffer_ops_++;
+  stream_.buffer_ops++;
 }
 
 void CommandEncoder::record_tensor_sync_local(const std::vector<std::shared_ptr<kp::Tensor>>& tensors) {
   if (!encoding_begun_) begin_encoding();
-  
-  for (auto& tensor : tensors) {
-    stream_.sequence->record<kp::OpTensorSyncLocal>({tensor});
-    buffer_ops_++;
-    stream_.buffer_ops++;
+
+  std::vector<std::shared_ptr<kp::Tensor>> unique_tensors;
+  unique_tensors.reserve(tensors.size());
+  std::unordered_set<kp::Tensor*> seen;
+  seen.reserve(tensors.size());
+  for (const auto& tensor : tensors) {
+    if (!tensor) {
+      continue;
+    }
+    if (seen.insert(tensor.get()).second) {
+      unique_tensors.push_back(tensor);
+    }
   }
+  if (unique_tensors.empty()) {
+    return;
+  }
+
+  stream_.sequence->record<kp::OpTensorSyncLocal>(unique_tensors);
+  buffer_ops_++;
+  stream_.buffer_ops++;
 }
 
 void CommandEncoder::record_algo_dispatch(
@@ -300,6 +328,12 @@ DeviceStream::~DeviceStream() {
   if (sequence && buffer_ops > 0) {
     sequence->eval();
   }
+  for (auto& in_flight : inflight_sequences) {
+    if (in_flight) {
+      in_flight->evalAwait();
+    }
+  }
+  inflight_sequences.clear();
 }
 
 void DeviceStream::reset_sequence() {
@@ -317,6 +351,8 @@ Device::Device() {
       "MLX_VK_MAX_OPS_PER_BUFFER", max_ops_per_buffer_, 1, 100000);
   max_mb_per_buffer_ = parse_env_int_clamped(
       "MLX_VK_MAX_MB_PER_BUFFER", max_mb_per_buffer_, 1, 4096);
+  max_inflight_sequences_ = parse_env_int_clamped(
+      "MLX_VK_MAX_INFLIGHT_SEQUENCES", max_inflight_sequences_, 1, 64);
 
   // Create Kompute manager with default GPU
   manager_ = std::make_shared<kp::Manager>();
@@ -332,6 +368,8 @@ Device::~Device() {
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
     tensor_cache_.clear();
+    tensor_storage_index_.clear();
+    dirty_tensors_by_stream_.clear();
   }
   
   if (initialized_buffer_manager_) {
@@ -352,6 +390,110 @@ std::shared_ptr<Buffer> Device::create_buffer(size_t size) {
   return BufferManager::instance().create_temp_buffer(size);
 }
 
+Device::TensorStorageKey Device::make_tensor_storage_key_(
+    const void* data_ptr,
+    const std::shared_ptr<array::Data>& data_ref,
+    Dtype dtype) {
+  return TensorStorageKey{data_ptr, data_ref.get(), dtype};
+}
+
+bool Device::tensor_entry_matches_request_(
+    const TensorCacheEntry& entry,
+    const TensorStorageKey& key,
+    size_t min_elem_count) const {
+  return entry.data_ptr == key.data_ptr && entry.data_owner == key.data_owner &&
+      entry.dtype == key.dtype && entry.elem_count >= min_elem_count &&
+      !entry.data_ref.expired();
+}
+
+void Device::add_tensor_index_locked_(
+    const TensorStorageKey& storage_key,
+    std::uintptr_t key) {
+  auto& keys = tensor_storage_index_[storage_key];
+  if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+    keys.push_back(key);
+  }
+}
+
+void Device::remove_tensor_index_locked_(
+    const TensorStorageKey& storage_key,
+    std::uintptr_t key) {
+  auto it = tensor_storage_index_.find(storage_key);
+  if (it == tensor_storage_index_.end()) {
+    return;
+  }
+  auto& keys = it->second;
+  keys.erase(std::remove(keys.begin(), keys.end(), key), keys.end());
+  if (keys.empty()) {
+    tensor_storage_index_.erase(it);
+  }
+}
+
+void Device::erase_tensor_entry_locked_(
+    std::unordered_map<std::uintptr_t, TensorCacheEntry>::iterator it) {
+  if (it == tensor_cache_.end()) {
+    return;
+  }
+  const auto storage_key =
+      TensorStorageKey{it->second.data_ptr, it->second.data_owner, it->second.dtype};
+  if (it->second.host_dirty && it->second.dirty_stream_index >= 0) {
+    untrack_dirty_tensor_(it->second.dirty_stream_index, it->first);
+  }
+  remove_tensor_index_locked_(storage_key, it->first);
+  tensor_cache_.erase(it);
+}
+
+std::unordered_map<std::uintptr_t, Device::TensorCacheEntry>::iterator
+Device::find_tensor_entry_locked_(
+    std::uintptr_t key,
+    const TensorStorageKey& storage_key,
+    size_t min_elem_count) {
+  auto it = tensor_cache_.find(key);
+  if (it != tensor_cache_.end()) {
+    if (tensor_entry_matches_request_(it->second, storage_key, min_elem_count)) {
+      return it;
+    }
+    erase_tensor_entry_locked_(it);
+  }
+
+  auto index_it = tensor_storage_index_.find(storage_key);
+  if (index_it == tensor_storage_index_.end()) {
+    return tensor_cache_.end();
+  }
+
+  std::uintptr_t best_key = 0;
+  bool has_best = false;
+  size_t best_elem_count = 0;
+  const auto candidate_keys = index_it->second;
+  for (auto candidate_key : candidate_keys) {
+    auto candidate_it = tensor_cache_.find(candidate_key);
+    if (candidate_it == tensor_cache_.end()) {
+      remove_tensor_index_locked_(storage_key, candidate_key);
+      continue;
+    }
+    if (!tensor_entry_matches_request_(
+            candidate_it->second, storage_key, min_elem_count)) {
+      if (candidate_it->second.data_ref.expired() ||
+          candidate_it->second.data_owner != storage_key.data_owner ||
+          candidate_it->second.data_ptr != storage_key.data_ptr ||
+          candidate_it->second.dtype != storage_key.dtype) {
+        erase_tensor_entry_locked_(candidate_it);
+      }
+      continue;
+    }
+    if (candidate_it->second.elem_count >= best_elem_count) {
+      best_elem_count = candidate_it->second.elem_count;
+      best_key = candidate_key;
+      has_best = true;
+    }
+  }
+
+  if (!has_best) {
+    return tensor_cache_.end();
+  }
+  return tensor_cache_.find(best_key);
+}
+
 std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
   const auto key = arr.id();
   const auto data_ptr = arr.data<void>();
@@ -359,48 +501,16 @@ std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
   const auto elem_count = tensor_element_count(arr);
   const auto dtype = arr.dtype();
   const auto data_ref = arr.data_shared_ptr();
+  const auto storage_key = make_tensor_storage_key_(data_ptr, data_ref, dtype);
 
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-    auto matches_request = [&](const TensorCacheEntry& entry) {
-      return entry.data_ptr == data_ptr && entry.dtype == dtype &&
-          entry.elem_count >= elem_count && !entry.data_ref.expired() &&
-          entry.data_ref.lock() == data_ref;
-    };
-
-    auto it = tensor_cache_.find(key);
-    if (it != tensor_cache_.end() && !matches_request(it->second)) {
-      tensor_cache_.erase(it);
-      it = tensor_cache_.end();
-    }
+    auto it = find_tensor_entry_locked_(key, storage_key, elem_count);
     if (it != tensor_cache_.end()) {
       if (auto tensor = it->second.tensor.lock()) {
         return tensor;
       }
-      tensor_cache_.erase(it);
-    }
-
-    // Alias/view fallback: multiple arrays can share identical backing storage
-    // but have different array ids. Reuse the largest compatible tensor view.
-    std::shared_ptr<kp::Tensor> best_tensor;
-    size_t best_elem_count = 0;
-    for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end();) {
-      if (!matches_request(scan->second)) {
-        ++scan;
-        continue;
-      }
-      if (auto tensor = scan->second.tensor.lock()) {
-        if (scan->second.elem_count >= best_elem_count) {
-          best_elem_count = scan->second.elem_count;
-          best_tensor = std::move(tensor);
-        }
-        ++scan;
-        continue;
-      }
-      scan = tensor_cache_.erase(scan);
-    }
-    if (best_tensor) {
-      return best_tensor;
+      erase_tensor_entry_locked_(it);
     }
   }
 
@@ -419,7 +529,17 @@ std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
     tensor_cache_[key] = TensorCacheEntry{
-        tensor, nullptr, data_ref, data_ptr, nbytes, elem_count, dtype, false, -1};
+        tensor,
+        nullptr,
+        data_ref,
+        data_ptr,
+        data_ref.get(),
+        nbytes,
+        elem_count,
+        dtype,
+        false,
+        -1};
+    add_tensor_index_locked_(storage_key, key);
   }
 
   return tensor;
@@ -431,8 +551,16 @@ std::shared_ptr<kp::Tensor> Device::create_tensor(size_t size) {
 }
 
 void Device::invalidate_tensor(const array& arr) {
+  const auto data_ref = arr.data_shared_ptr();
+  const auto storage_key =
+      make_tensor_storage_key_(arr.data<void>(), data_ref, arr.dtype());
   std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-  tensor_cache_.erase(arr.id());
+  auto it =
+      find_tensor_entry_locked_(arr.id(), storage_key, tensor_element_count(arr));
+  if (it == tensor_cache_.end()) {
+    return;
+  }
+  erase_tensor_entry_locked_(it);
 }
 
 void Device::mark_tensor_host_dirty(const array& arr, int stream_index) {
@@ -441,41 +569,27 @@ void Device::mark_tensor_host_dirty(const array& arr, int stream_index) {
   const auto elem_count = tensor_element_count(arr);
   const auto dtype = arr.dtype();
   const auto data_ref = arr.data_shared_ptr();
+  const auto storage_key = make_tensor_storage_key_(data_ptr, data_ref, dtype);
 
   std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-  auto matches_request = [&](const TensorCacheEntry& entry) {
-    return entry.data_ptr == data_ptr && entry.dtype == dtype &&
-        entry.elem_count >= elem_count && !entry.data_ref.expired() &&
-        entry.data_ref.lock() == data_ref;
-  };
-
-  auto it = tensor_cache_.find(key);
-  if (it != tensor_cache_.end() && !matches_request(it->second)) {
-    tensor_cache_.erase(it);
-    it = tensor_cache_.end();
-  }
-  if (it == tensor_cache_.end()) {
-    size_t best_elem_count = 0;
-    for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end(); ++scan) {
-      if (matches_request(scan->second) &&
-          scan->second.elem_count >= best_elem_count) {
-        best_elem_count = scan->second.elem_count;
-        it = scan;
-      }
-    }
-  }
+  auto it = find_tensor_entry_locked_(key, storage_key, elem_count);
   if (it == tensor_cache_.end()) {
     return;
   }
   auto tensor = it->second.tensor.lock();
   if (!tensor) {
-    tensor_cache_.erase(it);
+    erase_tensor_entry_locked_(it);
     return;
+  }
+  if (it->second.host_dirty && it->second.dirty_stream_index >= 0 &&
+      it->second.dirty_stream_index != stream_index) {
+    untrack_dirty_tensor_(it->second.dirty_stream_index, it->first);
   }
   it->second.host_dirty = true;
   it->second.dirty_stream_index = stream_index;
   // Keep tensor alive until host sync copies back dirty data.
   it->second.pinned_tensor = std::move(tensor);
+  track_dirty_tensor_(stream_index, it->first);
 }
 
 bool Device::tensor_needs_sync_device(const array& arr) {
@@ -484,29 +598,10 @@ bool Device::tensor_needs_sync_device(const array& arr) {
   const auto elem_count = tensor_element_count(arr);
   const auto dtype = arr.dtype();
   const auto data_ref = arr.data_shared_ptr();
+  const auto storage_key = make_tensor_storage_key_(data_ptr, data_ref, dtype);
 
   std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-  auto matches_request = [&](const TensorCacheEntry& entry) {
-    return entry.data_ptr == data_ptr && entry.dtype == dtype &&
-        entry.elem_count >= elem_count && !entry.data_ref.expired() &&
-        entry.data_ref.lock() == data_ref;
-  };
-
-  auto it = tensor_cache_.find(key);
-  if (it != tensor_cache_.end() && !matches_request(it->second)) {
-    tensor_cache_.erase(it);
-    it = tensor_cache_.end();
-  }
-  if (it == tensor_cache_.end()) {
-    size_t best_elem_count = 0;
-    for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end(); ++scan) {
-      if (matches_request(scan->second) &&
-          scan->second.elem_count >= best_elem_count) {
-        best_elem_count = scan->second.elem_count;
-        it = scan;
-      }
-    }
-  }
+  auto it = find_tensor_entry_locked_(key, storage_key, elem_count);
   if (it == tensor_cache_.end()) {
     return true;
   }
@@ -514,7 +609,7 @@ bool Device::tensor_needs_sync_device(const array& arr) {
   auto tensor = it->second.pinned_tensor ? it->second.pinned_tensor
                                          : it->second.tensor.lock();
   if (!tensor) {
-    tensor_cache_.erase(it);
+    erase_tensor_entry_locked_(it);
     return true;
   }
 
@@ -530,33 +625,14 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
   const auto elem_count = tensor_element_count(arr);
   const auto dtype = arr.dtype();
   const auto data_ref = arr.data_shared_ptr();
+  const auto storage_key = make_tensor_storage_key_(data_ptr, data_ref, dtype);
 
   std::shared_ptr<kp::Tensor> tensor;
   int dirty_stream_index = -1;
   std::uintptr_t matched_key = 0;
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-    auto matches_request = [&](const TensorCacheEntry& entry) {
-      return entry.data_ptr == data_ptr && entry.dtype == dtype &&
-          entry.elem_count >= elem_count && !entry.data_ref.expired() &&
-          entry.data_ref.lock() == data_ref;
-    };
-
-    auto it = tensor_cache_.find(key);
-    if (it != tensor_cache_.end() && !matches_request(it->second)) {
-      tensor_cache_.erase(it);
-      it = tensor_cache_.end();
-    }
-    if (it == tensor_cache_.end()) {
-      size_t best_elem_count = 0;
-      for (auto scan = tensor_cache_.begin(); scan != tensor_cache_.end(); ++scan) {
-        if (matches_request(scan->second) &&
-            scan->second.elem_count >= best_elem_count) {
-          best_elem_count = scan->second.elem_count;
-          it = scan;
-        }
-      }
-    }
+    auto it = find_tensor_entry_locked_(key, storage_key, elem_count);
     if (it == tensor_cache_.end()) {
       return;
     }
@@ -569,15 +645,14 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
     tensor = it->second.pinned_tensor ? it->second.pinned_tensor
                                       : it->second.tensor.lock();
     if (!tensor) {
-      tensor_cache_.erase(it);
+      erase_tensor_entry_locked_(it);
       return;
     }
   }
 
   // Ensure pending work on the producing stream is submitted before host sync.
   if (dirty_stream_index >= 0) {
-    end_encoding(dirty_stream_index);
-    commit_command_buffer(dirty_stream_index);
+    wait_for_stream(dirty_stream_index);
   }
 
   auto seq = manager_->sequence();
@@ -595,6 +670,9 @@ void Device::sync_array_to_host_if_needed(const array& arr) {
       it->second.host_dirty = false;
       it->second.dirty_stream_index = -1;
       it->second.pinned_tensor.reset();
+      if (dirty_stream_index >= 0) {
+        untrack_dirty_tensor_(dirty_stream_index, matched_key);
+      }
     }
   }
 }
@@ -611,23 +689,32 @@ void Device::sync_dirty_tensors_for_stream(int stream_index) {
   std::vector<PendingCopy> pending;
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-    for (auto it = tensor_cache_.begin(); it != tensor_cache_.end();) {
+    auto tracker_it = dirty_tensors_by_stream_.find(stream_index);
+    if (tracker_it == dirty_tensors_by_stream_.end()) {
+      return;
+    }
+    std::vector<std::uintptr_t> dirty_keys = std::move(tracker_it->second.keys);
+    dirty_tensors_by_stream_.erase(tracker_it);
+
+    for (auto key : dirty_keys) {
+      auto it = tensor_cache_.find(key);
+      if (it == tensor_cache_.end()) {
+        continue;
+      }
       auto& entry = it->second;
       if (!entry.host_dirty || entry.dirty_stream_index != stream_index) {
-        ++it;
         continue;
       }
 
       auto tensor = entry.pinned_tensor ? entry.pinned_tensor : entry.tensor.lock();
       auto data_ref = entry.data_ref.lock();
       if (!tensor || !data_ref) {
-        it = tensor_cache_.erase(it);
+        erase_tensor_entry_locked_(it);
         continue;
       }
 
       pending.push_back(PendingCopy{
           it->first, tensor, data_ref, entry.data_ptr, entry.nbytes});
-      ++it;
     }
   }
 
@@ -636,8 +723,17 @@ void Device::sync_dirty_tensors_for_stream(int stream_index) {
   }
 
   auto seq = manager_->sequence();
+  std::vector<std::shared_ptr<kp::Tensor>> local_sync_tensors;
+  local_sync_tensors.reserve(pending.size());
+  std::unordered_set<kp::Tensor*> seen_tensors;
+  seen_tensors.reserve(pending.size());
   for (const auto& item : pending) {
-    seq->record<kp::OpTensorSyncLocal>({item.tensor});
+    if (item.tensor && seen_tensors.insert(item.tensor.get()).second) {
+      local_sync_tensors.push_back(item.tensor);
+    }
+  }
+  if (!local_sync_tensors.empty()) {
+    seq->record<kp::OpTensorSyncLocal>(local_sync_tensors);
   }
   seq->eval();
 
@@ -658,6 +754,7 @@ void Device::sync_dirty_tensors_for_stream(int stream_index) {
       it->second.host_dirty = false;
       it->second.dirty_stream_index = -1;
       it->second.pinned_tensor.reset();
+      untrack_dirty_tensor_(stream_index, item.key);
     }
   }
 }
@@ -701,11 +798,23 @@ void Device::commit_command_buffer(int index) {
   
   // Evaluate sequence (submit to GPU) only when there is recorded work.
   if (stream.sequence && stream.buffer_ops > 0) {
-    stream.sequence->eval();
+    stream.sequence->evalAsync();
+    stream.inflight_sequences.push_back(stream.sequence);
+    await_inflight_sequences_(
+        stream, static_cast<size_t>(max_inflight_sequences_));
   }
   
   // Reset sequence for new operations
   stream.reset_sequence();
+}
+
+void Device::wait_for_stream(int index) {
+  // Submit currently recorded work first (if any), then wait for all in-flight
+  // submissions on this stream.
+  end_encoding(index);
+  commit_command_buffer(index);
+  DeviceStream& stream = get_stream_(index);
+  await_inflight_sequences_(stream, 0);
 }
 
 CommandEncoder& Device::get_command_encoder(int index) {
@@ -792,6 +901,34 @@ DeviceStream& Device::get_stream_(int index) {
     throw std::invalid_argument("Stream not found: " + std::to_string(index));
   }
   return *it->second;
+}
+
+void Device::await_inflight_sequences_(DeviceStream& stream, size_t keep_pending) {
+  while (stream.inflight_sequences.size() > keep_pending) {
+    auto seq = stream.inflight_sequences.front();
+    stream.inflight_sequences.pop_front();
+    if (seq) {
+      seq->evalAwait();
+    }
+  }
+}
+
+void Device::track_dirty_tensor_(int stream_index, std::uintptr_t key) {
+  auto& tracker = dirty_tensors_by_stream_[stream_index];
+  if (tracker.key_set.insert(key).second) {
+    tracker.keys.push_back(key);
+  }
+}
+
+void Device::untrack_dirty_tensor_(int stream_index, std::uintptr_t key) {
+  auto it = dirty_tensors_by_stream_.find(stream_index);
+  if (it == dirty_tensors_by_stream_.end()) {
+    return;
+  }
+  it->second.key_set.erase(key);
+  if (it->second.key_set.empty()) {
+    dirty_tensors_by_stream_.erase(it);
+  }
 }
 
 // ============================================================================

@@ -1,12 +1,16 @@
 // Copyright © 2026 MLX Vulkan Backend
 #include "mlx/backend/vulkan/kernel_registry.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
-#include <stdexcept>
-#include <sstream>
 #include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
 
 // 嵌入的 SPIR-V shader
 #include "shaders/add_spv.h"
@@ -37,6 +41,7 @@
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_x2_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_spv.h"
+#include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g16_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g24_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g32_spv.h"
@@ -61,6 +66,206 @@
 #include "shaders/sdpa_bf16_prefill_splitk_reduce_spv.h"
 
 namespace mlx::core::vulkan {
+
+namespace {
+
+bool algorithm_stats_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_ALGO_STATS");
+    if (!v || v[0] == '\0') {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
+bool algorithm_cache_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_ENABLE_ALGO_CACHE");
+    if (!v || v[0] == '\0') {
+      return false;
+    }
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
+        std::strcmp(v, "off") != 0;
+  }();
+  return enabled;
+}
+
+uint64_t algorithm_cache_zero_hit_disable_threshold() {
+  static const uint64_t threshold = []() {
+    const char* v = std::getenv("MLX_VK_ALGO_CACHE_ZERO_HIT_DISABLE_THRESHOLD");
+    if (!v || v[0] == '\0') {
+      return static_cast<uint64_t>(2048);
+    }
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(v, &end, 10);
+    if (end == v || *end != '\0') {
+      return static_cast<uint64_t>(2048);
+    }
+    return static_cast<uint64_t>(parsed);
+  }();
+  return threshold;
+}
+
+bool algorithm_cache_auto_disable_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_ENABLE_ALGO_CACHE_AUTO_DISABLE");
+    if (!v || v[0] == '\0') {
+      return true;
+    }
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
+        std::strcmp(v, "off") != 0;
+  }();
+  return enabled;
+}
+
+std::atomic<bool>& algorithm_cache_runtime_disabled() {
+  static std::atomic<bool> disabled{false};
+  return disabled;
+}
+
+std::atomic<uint64_t>& algorithm_cache_probe_requests() {
+  static std::atomic<uint64_t> requests{0};
+  return requests;
+}
+
+std::atomic<uint64_t>& algorithm_cache_probe_hits() {
+  static std::atomic<uint64_t> hits{0};
+  return hits;
+}
+
+bool algorithm_cache_runtime_enabled() {
+  if (!algorithm_cache_enabled()) {
+    return false;
+  }
+  if (!algorithm_cache_auto_disable_enabled()) {
+    return true;
+  }
+  return !algorithm_cache_runtime_disabled().load(std::memory_order_relaxed);
+}
+
+void observe_algorithm_cache_access(bool hit) {
+  if (!algorithm_cache_enabled() || !algorithm_cache_auto_disable_enabled()) {
+    return;
+  }
+  if (algorithm_cache_runtime_disabled().load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  auto& requests = algorithm_cache_probe_requests();
+  auto& hits = algorithm_cache_probe_hits();
+  const uint64_t req = requests.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (hit) {
+    hits.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  const uint64_t threshold = algorithm_cache_zero_hit_disable_threshold();
+  if (threshold == 0 || req < threshold) {
+    return;
+  }
+  if (hits.load(std::memory_order_relaxed) != 0) {
+    return;
+  }
+
+  bool expected = false;
+  if (algorithm_cache_runtime_disabled().compare_exchange_strong(
+          expected, true, std::memory_order_relaxed)) {
+    std::cerr << "[VulkanAlgoCache] auto-disabled after " << req
+              << " requests with zero cache hits\n";
+  }
+}
+
+struct AlgorithmStatsState {
+  std::mutex mtx;
+  uint64_t requests{0};
+  uint64_t cache_hits{0};
+  uint64_t cache_misses{0};
+  std::unordered_map<std::string, uint64_t> kernel_hit_counts;
+  std::unordered_map<std::string, uint64_t> kernel_miss_counts;
+};
+
+AlgorithmStatsState& algorithm_stats_state() {
+  static AlgorithmStatsState state;
+  return state;
+}
+
+std::vector<std::pair<std::string, uint64_t>> sort_algo_stats_counts(
+    const std::unordered_map<std::string, uint64_t>& counts) {
+  std::vector<std::pair<std::string, uint64_t>> ordered(
+      counts.begin(), counts.end());
+  std::sort(
+      ordered.begin(),
+      ordered.end(),
+      [](const auto& a, const auto& b) {
+        if (a.second != b.second) {
+          return a.second > b.second;
+        }
+        return a.first < b.first;
+      });
+  return ordered;
+}
+
+void record_algorithm_cache_access(const std::string& kernel_name, bool hit) {
+  if (!algorithm_stats_enabled()) {
+    return;
+  }
+  auto& state = algorithm_stats_state();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.requests++;
+  if (hit) {
+    state.cache_hits++;
+    state.kernel_hit_counts[kernel_name]++;
+  } else {
+    state.cache_misses++;
+    state.kernel_miss_counts[kernel_name]++;
+  }
+}
+
+void dump_algorithm_stats() {
+  if (!algorithm_stats_enabled()) {
+    return;
+  }
+
+  auto& state = algorithm_stats_state();
+  std::lock_guard<std::mutex> lock(state.mtx);
+  if (state.requests == 0) {
+    return;
+  }
+
+  const double hit_rate = static_cast<double>(state.cache_hits) /
+      static_cast<double>(state.requests);
+  std::cerr << "[VulkanAlgoStats] requests=" << state.requests
+            << " cache_hits=" << state.cache_hits
+            << " cache_misses=" << state.cache_misses
+            << " hit_rate=" << std::fixed << std::setprecision(4) << hit_rate
+            << " hit_kernels=" << state.kernel_hit_counts.size()
+            << " miss_kernels=" << state.kernel_miss_counts.size() << "\n";
+  for (const auto& [kernel, count] :
+       sort_algo_stats_counts(state.kernel_hit_counts)) {
+    std::cerr << "[VulkanAlgoStats][Hit] kernel=" << kernel
+              << " count=" << count << "\n";
+  }
+  for (const auto& [kernel, count] :
+       sort_algo_stats_counts(state.kernel_miss_counts)) {
+    std::cerr << "[VulkanAlgoStats][Miss] kernel=" << kernel
+              << " count=" << count << "\n";
+  }
+}
+
+struct AlgorithmStatsReporter {
+  ~AlgorithmStatsReporter() {
+    dump_algorithm_stats();
+  }
+};
+
+AlgorithmStatsReporter& algorithm_stats_reporter() {
+  static AlgorithmStatsReporter reporter;
+  return reporter;
+}
+
+} // namespace
 
 // 静态 kernel 名称定义
 const char* KernelRegistry::ADD_F32 = "add_f32";
@@ -102,6 +307,8 @@ const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_X2 =
     "qmm_affine_bf16_t4_g128_m1_reduce_subgroup_x2";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8 =
     "qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8";
+const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_X2 =
+    "qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G16 =
     "qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g16";
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G24 =
@@ -344,6 +551,14 @@ void KernelRegistry::register_builtin_shaders() {
       qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_spv_len);
   shaders_[QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8] =
       std::move(qmm_m1_reduce_subgroup_g8_spirv);
+  std::vector<uint32_t> qmm_m1_reduce_subgroup_g8_x2_spirv(
+      (qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2_spv_len + 3) / 4);
+  std::memcpy(
+      qmm_m1_reduce_subgroup_g8_x2_spirv.data(),
+      qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2_spv,
+      qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2_spv_len);
+  shaders_[QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_X2] =
+      std::move(qmm_m1_reduce_subgroup_g8_x2_spirv);
   std::vector<uint32_t> qmm_m1_reduce_subgroup_g16_spirv(
       (qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g16_spv_len + 3) / 4);
   std::memcpy(
@@ -522,6 +737,23 @@ std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
     const std::vector<std::shared_ptr<kp::Tensor>>& params,
     const kp::Workgroup& workgroup,
     const std::vector<uint32_t>& push_consts) {
+  if (algorithm_stats_enabled()) {
+    (void)algorithm_stats_state();
+    (void)algorithm_stats_reporter();
+  }
+  if (!algorithm_cache_runtime_enabled()) {
+    const auto& spirv = get_shader(kernel_name);
+    std::shared_ptr<kp::Algorithm> algo;
+    if (push_consts.empty()) {
+      algo = manager.algorithm(params, spirv, workgroup);
+    } else {
+      algo = manager.algorithm(
+          params, spirv, workgroup, std::vector<float>{}, push_consts);
+    }
+    record_algorithm_cache_access(kernel_name, false);
+    observe_algorithm_cache_access(false);
+    return algo;
+  }
   
   // 构建 cache key
   std::stringstream cache_key_ss;
@@ -543,6 +775,8 @@ std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
     auto it = algorithms_.find(cache_key);
     if (it != algorithms_.end()) {
       if (auto algo = it->second.lock()) {
+        record_algorithm_cache_access(kernel_name, true);
+        observe_algorithm_cache_access(true);
         return algo;
       }
       // 已过期，从缓存中移除
@@ -566,6 +800,8 @@ std::shared_ptr<kp::Algorithm> KernelRegistry::get_algorithm(
     std::lock_guard<std::mutex> lock(algorithms_mutex_);
     algorithms_[cache_key] = algo;
   }
+  record_algorithm_cache_access(kernel_name, false);
+  observe_algorithm_cache_access(false);
   
   return algo;
 }

@@ -1381,6 +1381,11 @@ inline std::atomic<bool>& native_qmm_m1_reduce_subgroup_g8_runtime_disabled() {
   return disabled;
 }
 
+inline std::atomic<bool>& native_qmm_m1_reduce_subgroup_g8_x2_runtime_disabled() {
+  static std::atomic<bool> disabled{false};
+  return disabled;
+}
+
 inline std::atomic<bool>& native_qmm_m1_reduce_subgroup_g16_runtime_disabled() {
   static std::atomic<bool> disabled{false};
   return disabled;
@@ -1417,6 +1422,14 @@ inline bool native_qmm_m1_reduce_subgroup_g8_enabled() {
       "MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G8");
   return enabled &&
       !native_qmm_m1_reduce_subgroup_g8_runtime_disabled().load(
+          std::memory_order_relaxed);
+}
+
+inline bool native_qmm_m1_reduce_subgroup_g8_x2_enabled() {
+  static const bool enabled = env_flag_default_false(
+      "MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G8_X2");
+  return enabled &&
+      !native_qmm_m1_reduce_subgroup_g8_x2_runtime_disabled().load(
           std::memory_order_relaxed);
 }
 
@@ -1471,6 +1484,16 @@ inline void disable_native_qmm_m1_reduce_subgroup_g8_runtime() {
           expected, true, std::memory_order_relaxed)) {
     std::cerr
         << "[VulkanQMM] disable m1_reduce_subgroup_g8 after dispatch failure\n";
+  }
+}
+
+inline void disable_native_qmm_m1_reduce_subgroup_g8_x2_runtime() {
+  auto& disabled = native_qmm_m1_reduce_subgroup_g8_x2_runtime_disabled();
+  bool expected = false;
+  if (disabled.compare_exchange_strong(
+          expected, true, std::memory_order_relaxed)) {
+    std::cerr << "[VulkanQMM] disable m1_reduce_subgroup_g8_x2 after dispatch "
+                 "failure\n";
   }
 }
 
@@ -2936,6 +2959,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       const bool use_m1_reduce_subgroup_g8_kernel =
           use_m1_reduce_subgroup_kernel &&
           native_qmm_m1_reduce_subgroup_g8_enabled() && (groups_per_col == 8u);
+      const bool use_m1_reduce_subgroup_g8_x2_kernel =
+          use_m1_reduce_subgroup_g8_kernel &&
+          native_qmm_m1_reduce_subgroup_g8_x2_enabled() && (out_words >= 2u);
       const bool use_m1_reduce_subgroup_g16_kernel =
           use_m1_reduce_subgroup_kernel &&
           native_qmm_m1_reduce_subgroup_g16_enabled() && (groups_per_col == 16u);
@@ -2987,6 +3013,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       if (use_m1_reduce_subgroup_g8_kernel) {
         qmm_kernel =
             vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8;
+      }
+      if (use_m1_reduce_subgroup_g8_x2_kernel) {
+        qmm_kernel =
+            vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_X2;
+        groups_x = groups_x_subgroup_x2;
       }
       if (use_m1_reduce_subgroup_g16_kernel) {
         qmm_kernel =
@@ -3067,6 +3098,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           dispatch_qmm(qmm_kernel_subgroup, groups_x_default);
           qmm_stats_record_native_dispatch_success(
               rows, k, n, groups_per_col, qmm_kernel_subgroup);
+          return;
+        }
+        if (use_m1_reduce_subgroup_g8_x2_kernel) {
+          disable_native_qmm_m1_reduce_subgroup_g8_x2_runtime();
+          qmm_kernel_for_stats =
+              vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8;
+          dispatch_qmm(qmm_kernel_for_stats, groups_x_default);
+          qmm_stats_record_native_dispatch_success(
+              rows, k, n, groups_per_col, qmm_kernel_for_stats);
           return;
         }
         if (use_m1_reduce_subgroup_g8_kernel) {

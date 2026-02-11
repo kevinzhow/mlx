@@ -4,6 +4,7 @@
 #pragma once
 
 #include <kompute/Kompute.hpp>
+#include <deque>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -118,6 +119,7 @@ struct DeviceStream {
 
   // Kompute sequence for command recording
   std::shared_ptr<kp::Sequence> sequence;
+  std::deque<std::shared_ptr<kp::Sequence>> inflight_sequences;
   
   // Command buffer state (equivalent to Metal's buffer tracking)
   int buffer_ops{0};
@@ -170,6 +172,7 @@ class MLX_API Device {
   std::shared_ptr<kp::Sequence> get_sequence(int index);
   bool command_buffer_needs_commit(int index);
   void commit_command_buffer(int index);
+  void wait_for_stream(int index);
   CommandEncoder& get_command_encoder(int index);
   void end_encoding(int index);
   
@@ -189,7 +192,55 @@ class MLX_API Device {
   bool supports_unified_memory() const;
 
  private:
+  struct TensorCacheEntry;
+  struct TensorStorageKey {
+    const void* data_ptr{nullptr};
+    const void* data_owner{nullptr};
+    Dtype dtype{float32};
+  };
+  struct TensorStorageKeyHash {
+    size_t operator()(const TensorStorageKey& key) const noexcept {
+      size_t h1 = std::hash<const void*>{}(key.data_ptr);
+      size_t h2 = std::hash<const void*>{}(key.data_owner);
+      size_t h3 =
+          std::hash<int>{}(static_cast<int>(key.dtype.val()));
+      return h1 ^ (h2 << 1) ^ (h3 << 2);
+    }
+  };
+  struct TensorStorageKeyEq {
+    bool operator()(
+        const TensorStorageKey& lhs,
+        const TensorStorageKey& rhs) const noexcept {
+      return lhs.data_ptr == rhs.data_ptr && lhs.data_owner == rhs.data_owner &&
+          lhs.dtype == rhs.dtype;
+    }
+  };
+  static TensorStorageKey make_tensor_storage_key_(
+      const void* data_ptr,
+      const std::shared_ptr<array::Data>& data_ref,
+      Dtype dtype);
+  bool tensor_entry_matches_request_(
+      const TensorCacheEntry& entry,
+      const TensorStorageKey& key,
+      size_t min_elem_count) const;
+  std::unordered_map<std::uintptr_t, TensorCacheEntry>::iterator
+  find_tensor_entry_locked_(
+      std::uintptr_t key,
+      const TensorStorageKey& storage_key,
+      size_t min_elem_count);
+  void add_tensor_index_locked_(
+      const TensorStorageKey& storage_key,
+      std::uintptr_t key);
+  void remove_tensor_index_locked_(
+      const TensorStorageKey& storage_key,
+      std::uintptr_t key);
+  void erase_tensor_entry_locked_(
+      std::unordered_map<std::uintptr_t, TensorCacheEntry>::iterator it);
+
   DeviceStream& get_stream_(int index);
+  void await_inflight_sequences_(DeviceStream& stream, size_t keep_pending);
+  void track_dirty_tensor_(int stream_index, std::uintptr_t key);
+  void untrack_dirty_tensor_(int stream_index, std::uintptr_t key);
   void create_sequence_(DeviceStream& stream);
   
   // Kompute manager
@@ -208,18 +259,31 @@ class MLX_API Device {
     std::shared_ptr<kp::Tensor> pinned_tensor;
     std::weak_ptr<array::Data> data_ref;
     const void* data_ptr{nullptr};
+    const void* data_owner{nullptr};
     size_t nbytes{0};
     size_t elem_count{0};
     Dtype dtype{float32};
     bool host_dirty{false};
     int dirty_stream_index{-1};
   };
+  struct DirtyTensorTracker {
+    std::vector<std::uintptr_t> keys;
+    std::unordered_set<std::uintptr_t> key_set;
+  };
   std::mutex tensor_cache_mutex_;
   std::unordered_map<std::uintptr_t, TensorCacheEntry> tensor_cache_;
+  std::unordered_map<
+      TensorStorageKey,
+      std::vector<std::uintptr_t>,
+      TensorStorageKeyHash,
+      TensorStorageKeyEq>
+      tensor_storage_index_;
+  std::unordered_map<int, DirtyTensorTracker> dirty_tensors_by_stream_;
   
   // Configuration
   int max_ops_per_buffer_ = 100;
   int max_mb_per_buffer_ = 50;
+  int max_inflight_sequences_ = 8;
   
   // Buffer manager reference
   bool initialized_buffer_manager_ = false;

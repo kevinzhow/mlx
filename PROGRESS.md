@@ -6,6 +6,9 @@
 - 对标 Metal backend 运行时契约，在 MLX 现有 GPU 路径内完成 Vulkan backend（Kompute v0.9.0）主线化。
 - 优先级保持不变：先稳定与正确，再扩原生覆盖，最后做架构级性能提升。
 - 开发流程约束：先做命中分析，再做优化；避免在低命中路径上投入主优化成本。
+- 主线升级声明（2026-02-11）：
+  - 后续性能目标以“架构升级驱动吞吐提升”为唯一主线，不再以门禁微调/小核试探作为主要提速手段。
+  - 120 tok/s 为远期目标，短期评估指标改为“每轮架构变更带来可复现的端到端阶跃提升”。
 
 ## 当前快照
 - 构建状态：`MLX_BUILD_VULKAN=ON` 下 `mlx` 与 `tests` 均可稳定构建链接。
@@ -13,9 +16,15 @@
 - 模型正确性：Qwen3-0.6B-MLX-4bit（EN/ZH，10 token）输出正常，无乱码/`!!!!!!!!!!` 回归。
 - 流程约束（新增）：Qwen3 `mlx_lm generate` 正确性/性能口径需串行执行；任意 C++/Vulkan/shader 变更后，Python 侧验证前必须先执行 `python3 setup.py build_ext --inplace`，避免旧扩展产物导致误判。
 - 近期吞吐（实卡 Vulkan，串行口径）：
-  - 10-token（EN）：约 `4.51 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1`，默认 ON）
-  - 40-token（EN）：约 `3.62~3.69 tok/s`（D-9.19 后；当前复测 `3.673 tok/s`）
-  - 80-token（EN）：约 `2.92~2.98 tok/s`（D-9.19 后）
+  - 10-token（EN）：约 `5.20~5.23 tok/s`（D-9.25 后）
+  - 40-token（EN）：约 `4.64 tok/s`（D-9.25 后）
+  - 80-token（EN）：约 `3.17~3.34 tok/s`（D-9.23 后）
+- 运行时新默认（D-9.21）：
+  - `MLX_VK_ENABLE_ALGO_CACHE=0`（默认 OFF）
+  - 原因：当前 decode 主线算法缓存命中率为 `0`，默认关闭可减少无效 key/map 开销。
+- 运行时新默认（D-9.22）：
+  - `MLX_VK_MAX_INFLIGHT_SEQUENCES=8`
+  - 语义：Vulkan 提交改为 `evalAsync`，并以 inflight 窗口做受控 `evalAwait`，对齐 Metal“提交异步、同步点显式”的行为模型。
 - decode 主线 fallback 占比（同口径 profile）：
   - 由 `18.40%` 降到 `13.50%`（D-9.2），再降到 `3.98%`（D-9.11），当前进一步降到 `0.62%`（D-9.13）
 - QMM decode `rows=1` 精确 `gpc` 命中（40-token 样本）：
@@ -528,42 +537,227 @@
 - 处置：
   - 已回退 `g16/g24` 查表实现，保留现有稳定版本与默认门禁（`G16/G24=OFF`）。
 
+### D-9.20：A1-Phase1 `gpc=8` 双-word tile（`g8_x2`）架构实验（已完成，默认 OFF）
+- 背景（Metal/Ollama 对照）：
+  - Metal/ollama 的 decode 热核都遵循“每次 launch 做更多有效工作”的原则，核心是复用激活读取、减少碎片化执行。
+  - 当前主桶仍是 `rows=1 && gpc=8`，因此 A1 第一阶段选择在该桶验证“一个 workgroup 计算两个 `out_word`”。
+- 方案与实现：
+  - 新增 shader：`qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2.comp`。
+  - 关键设计：一个 WG 同时计算 2 个 packed `out_word`（4 个 bf16 输出），共享同一批 `x` 读取；`scale/bias` 仍在组内预展开为 `dequant(q=0..15)` 查表。
+  - 新增 kernel 注册：`QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_X2`。
+  - 新增 gate：`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G8_X2`（默认 OFF）。
+  - 派发策略：仅在 `rows=1 && gpc=8 && out_words>=2` 命中；dispatch 失败时自动禁用该路径并降级回 `g8` 单-word 专核。
+  - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h`。
+- 验证：
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 ZH/EN 正确性通过，无乱码回归。
+- 吞吐 A/B（Qwen3 EN，实卡 Vulkan，串行）：
+  - 40-token：`3.649`（ON） vs `3.604 tok/s`（OFF），`+1.2%`
+  - 80-token：`2.978`（ON） vs `3.010 tok/s`（OFF），`-1.1%`
+  - 结论：无稳定正收益，保持默认 OFF（实验路径保留）。
+- 理论结论（A1 阶段性）：
+  - `x` 复用方向正确，但当前实现在寄存器/活跃线程占用上的代价抵消了收益。
+  - 下一步应优先进入“更低寄存器压力的 tile 方案 + 更少调度碎片”的架构重构，而不是继续做同构分支扩张。
+
+### E-9.20a：A1.2 `g8_x2` 寄存器生命周期重排实验（已完成，默认 OFF）
+- 背景（Metal/Ollama 对照）：
+  - Metal/ollama 在 decode 热核上都强调“提高每次 launch 有效工作量”的同时控制 occupancy，不接受仅靠局部循环展开造成的寄存器膨胀。
+  - D-9.20 的 `g8_x2` 初版已验证命中正确，但收益不稳定；本轮针对其寄存器压力做内核重排。
+- 改动：
+  - 重写 `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2.comp` 内层累加逻辑：
+    - 移除 `accumulate_unit` 大量局部临时变量路径。
+    - 改为 `unit x t` 双循环中按需解包 nibble，缩短变量 live-range，减少寄存器峰值。
+  - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h` 并重编。
+- 验证：
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 ZH 10-token 正确性通过（无乱码回归）。
+- A/B（Qwen3 EN，实卡 Vulkan，串行）：
+  - 40-token：`3.644`（ON） vs `3.639 tok/s`（OFF），近乎持平
+  - 80-token：`2.951`（ON） vs `3.010 tok/s`（OFF），约 `-2.0%`
+  - 命中确认：`qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8_x2` 命中计数与预期一致（`gpc=8` 主桶）。
+- 结论：
+  - 仅靠 `g8_x2` 内核级寄存器重排仍不足以形成端到端稳定收益，默认继续 OFF。
+  - 下一步转向 A1.3：先量化 decode token-step 的 CPU/dispatch 固定开销，再决定“提交模型升级/链路融合”的具体落点。
+
+### D-9.21：算法缓存命中观测 + 默认策略切换（已完成）
+- 背景（Metal/Ollama 对照）：
+  - Metal/Ollama 的高性能路径依赖可复用 pipeline/graph；若缓存层长期 0 命中，则该层应降级为“无缓存直通”避免固定开销。
+  - 本轮先补齐可观测性，再依据数据做默认策略切换。
+- 变更：
+  - `kernel_registry.cpp` 新增 `MLX_VK_ALGO_STATS=1` 统计：
+    - `requests/cache_hits/cache_misses`；
+    - 按 kernel 的 miss 分布。
+  - 新增算法缓存运行开关与策略：
+    - `MLX_VK_ENABLE_ALGO_CACHE`（默认改为 `0`，OFF）；
+    - `MLX_VK_ENABLE_ALGO_CACHE_AUTO_DISABLE`（默认 `1`）；
+    - `MLX_VK_ALGO_CACHE_ZERO_HIT_DISABLE_THRESHOLD`（默认 `2048`）。
+- 关键观测（Qwen3 EN，40/80 token）：
+  - 算法缓存请求量高（`20k~39k`），但 `cache_hits=0`。
+  - miss 主分布：`qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8`、`rmsnorm_bf16`、`rope_bf16_t1`、`add_bf16` 等 decode 高频核。
+- 结论：当前“按 tensor 身份缓存 algorithm”在该主线 workload 上基本无收益。
+- 吞吐 A/B（实卡 Vulkan，串行）：
+  - 40-token：
+    - cache ON：`3.678 tok/s`
+    - cache OFF：`3.871 tok/s`（约 `+5.2%`）
+  - 80-token：
+    - cache ON：`2.974 tok/s`
+    - cache OFF：`3.251 tok/s`（约 `+9.3%`）
+  - 默认切换后复测（不加额外 env）：
+    - 40-token：`3.839 tok/s`
+    - 80-token：`3.256 tok/s`
+- 验证：
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 EN/ZH 正确性通过，无乱码回归。
+
+### D-9.22：提交模型升级（`evalAsync + inflight`，已完成）
+- 背景（Metal/Ollama 对照）：
+  - Metal 路线中 command buffer 提交是异步的，host 侧只在显式同步点等待；Ollama Vulkan 路线也强调“减少每 token 的同步阻塞”。
+  - Vulkan 旧实现在 `commit_command_buffer()` 中使用 `sequence->eval()`（同步），与 Metal 提交语义不一致，且在小核链路下会放大固定等待成本。
+- 变更：
+  - `Device::commit_command_buffer` 从同步 `eval()` 改为 `evalAsync()`。
+  - 新增 `DeviceStream::inflight_sequences`，并新增受控等待：
+    - `Device::await_inflight_sequences_()`：仅当 inflight 超过窗口时等待最早批次。
+    - `Device::wait_for_stream()`：提交当前录制并等待该 stream 所有 inflight 完成（用于 `synchronize` 和 host copy 前）。
+  - `gpu::synchronize` 改为调用 `wait_for_stream()`，保证显式同步点语义清晰。
+  - 新增调参环境变量：
+    - `MLX_VK_MAX_INFLIGHT_SEQUENCES`（默认 `8`，范围 `1..64`）。
+- 验证：
+  - `cmake --build build_release_vulkan --target tests -j 4` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 ZH 10-token 正确性通过，无乱码回归。
+- 吞吐结果（Qwen3 EN，实卡 Vulkan，串行）：
+  - 默认（`MLX_VK_MAX_INFLIGHT_SEQUENCES=8`）：
+    - 40-token：`3.795 / 3.848 tok/s`
+    - 80-token：`3.177 / 3.218 tok/s`
+  - 对照（本轮快照）：
+    - `MLX_VK_MAX_INFLIGHT_SEQUENCES=1`：80-token `3.177 tok/s`
+    - `MLX_VK_MAX_INFLIGHT_SEQUENCES=8`：80-token `3.237 tok/s`（单次）
+- 结论：
+  - 架构契约层面已与 Metal 更一致（异步提交 + 显式同步），并建立了后续“更大提交窗口/融合调度”基础。
+  - 端到端吞吐目前仅边际波动，说明“提交同步”不是当前唯一主瓶颈；下一阶段仍需把主力放在“减少 launch 数 + QMM/SDPA 核形态升级”。
+
+### D-9.23：dirty tensor 同步索引化（已完成）
+- 背景（Metal/Ollama 对照）：
+  - Metal 路线在 host-visible 同步点上倾向于“增量/目标化同步”，避免每次同步遍历全局资源。
+  - Vulkan 现状中 `sync_dirty_tensors_for_stream` 每次 `synchronize` 都全量扫描 `tensor_cache_`，decode 多步场景会放大 CPU 固定成本。
+- 变更：
+  - 在 `Device` 中新增按 stream 的 dirty 索引：
+    - `dirty_tensors_by_stream_`（`stream_index -> {keys, key_set}`）。
+  - `mark_tensor_host_dirty` 命中条目后同步维护 dirty 索引（支持跨 stream 迁移时反注册旧 stream）。
+  - `sync_dirty_tensors_for_stream` 从“全量扫描 tensor_cache_”改为“仅遍历该 stream 的 dirty keys”。
+  - `invalidate_tensor` 与 `sync_array_to_host_if_needed` 完成后同步清理 dirty 索引，避免陈旧键累积。
+- 验证：
+  - `cmake --build build_release_vulkan --target tests -j 4` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过（串行）。
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 ZH 10-token 正确性通过，无乱码回归。
+- 吞吐结果（Qwen3 EN，实卡 Vulkan，串行）：
+  - 40-token：`3.878 tok/s`
+  - 80-token：`3.339 tok/s`
+- 结论：
+  - 该改动属于“架构级 CPU 固定开销削减”，对 decode 吞吐有可见正收益。
+  - 下一步应继续沿同方向推进：减少 `OpAlgoDispatch` 数量（同层合并/链路融合），而不是继续微调单核门禁。
+
+### D-9.24：tensor cache 二级索引化（按底层存储身份）（已完成）
+- 背景（Metal/Ollama 对照）：
+  - 两条路线都强调 decode 热链路要尽量减少 host 侧运行时管理开销（descriptor/buffer bookkeeping），否则会吞掉小 batch 生成吞吐。
+  - Vulkan 现状中 `get_tensor/mark_tensor_host_dirty/tensor_needs_sync_device/sync_array_to_host_if_needed` 在 alias/view 命中时依赖 `tensor_cache_` 全表扫描，decode 多步场景 CPU 固定成本偏高。
+- 变更：
+  - 在 `Device` 中新增按底层存储身份的二级索引：
+    - key：`(data_ptr, data_owner, dtype)`
+    - value：候选 tensor-cache keys 列表。
+  - 新增统一查找/清理助手：
+    - `find_tensor_entry_locked_`：先查直接 key，再走二级索引选最大可用 `elem_count` 候选，替代全表扫描。
+    - `erase_tensor_entry_locked_`：统一维护 `tensor_cache_`、`tensor_storage_index_`、dirty-tracker 三者一致性。
+  - `invalidate_tensor/mark_tensor_host_dirty/tensor_needs_sync_device/sync_array_to_host_if_needed` 全部切换到新查找路径。
+- 验证：
+  - `cmake --build build_release_vulkan --target mlx -j 8` 通过。
+  - `cmake --build build_release_vulkan --target tests -j 8` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 EN（实卡 Vulkan，串行）：
+    - 10-token：`5.232 / 5.121 tok/s`
+    - 40-token：`4.469 tok/s`
+- 结论：
+  - 本轮属于“运行时架构开销削减”而非门禁调参，端到端吞吐出现可复现阶跃提升（约 `+15%` 量级，相对 D-9.23 口径）。
+  - 下一步继续推进 A1.3b/A1.5：直接压缩 decode 热链路 `OpAlgoDispatch` 次数（同层合并/链路融合）。
+
+### D-9.25：tensor sync 批量化（减少碎片化 sync op）（已完成）
+- 背景（Metal/Ollama 对照）：
+  - 两条路线都强调 decode token-step 中减少碎片化 launch/sync；在小 batch 下，host 侧固定调度成本非常敏感。
+  - Vulkan 现状中 `record_tensor_sync_device/local` 对每个 tensor 都单独记录一条 op，导致额外 op 数量膨胀。
+- 变更：
+  - `CommandEncoder::record_tensor_sync_device`：
+    - 从“逐 tensor `OpTensorSyncDevice`”改为“去重后批量一次 `OpTensorSyncDevice`”。
+  - `CommandEncoder::record_tensor_sync_local`：
+    - 同样改为去重后批量一次 `OpTensorSyncLocal`。
+  - `Device::sync_dirty_tensors_for_stream`：
+    - host 回拷前的 `OpTensorSyncLocal` 由多条单 tensor 记录改为批量记录。
+- 验证：
+  - `cmake --build build_release_vulkan --target mlx -j 8` 通过。
+  - `cmake --build build_release_vulkan --target tests -j 8` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 EN（实卡 Vulkan，串行）：
+    - 10-token：`5.208 tok/s`
+    - 40-token：`4.644 tok/s`
+- 结论：
+  - 本轮继续验证“减少碎片调度”方向有效；相对 D-9.24 的 40-token `4.469 tok/s`，再提升约 `+3.9%`。
+  - 下一步继续围绕 A1.5：把 decode 热链路里的 dispatch 数量进一步压降（优先从高频 `QMM/RMSNorm/RoPE` 周边可融合段入手）。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
-- 仍是端到端主耗时大头；虽然 `M1+gpc8` 专核新增 `~2-3%` 收益，但距离“架构级跃迁”仍远，需继续向更强特化（更高向量化/更少访存）推进。
+- 仍是端到端主耗时大头；`g8_x2` A1-Phase1 与 A1.2 重排均未形成稳定收益，后续需转向更深层内核重构（数据布局 + 中间态组织）。
 
-2. `fast::RMSNorm / fast::ScaledDotProductAttention`
-- 在 RoPE 回退清理后，二者成为次级原生耗时来源，需继续做 kernel 级效率优化。
+2. 高频 decode 核的 dispatch/创建开销  
+- D-9.21 已证明旧 algorithm cache 对主线为 0 命中并已默认关闭。
+- D-9.22 已完成“提交异步化 + inflight 窗口”但收益有限；下一阶段需继续减少 `manager.algorithm`/`OpAlgoDispatch` 总次数（链路融合/dispatch 合并）。
 
-3. 高频小算子 fallback 尾部  
+3. `fast::RMSNorm / fast::ScaledDotProductAttention`
+- 在 RoPE 回退清理后，二者仍是次级原生耗时来源，需继续做 kernel 级效率优化。
+
+4. 高频小算子 fallback 尾部  
 - `Gather` 目前是 decode 口径下最主要的剩余 fallback 尾部（profile_each 样本 `126` 次）。
 - `BitwiseBinary` 与 `fast::Quantize` 的高频回退已通过 D-9.13 从源头压降。
 - `Gather` 已验证独立专核会回退，后续应优先寻找融合路径而非继续堆叠 tiny kernel。
 
-4. SDPA 长上下文效率  
+5. SDPA 长上下文效率  
 - 当前 decode-unlimited + split-k 已稳定，但 `k=65+` 的 stage1/reduce 仍有进一步优化空间。
 
 ## 下一步（精确执行入口）
-1. QMM decode 主核架构升级（对标 Metal/Ollama）  
-- 目标：从“微调归约”升级到“访存/解量化/归约一体化”内核，优先作用于 `rows=1` 主桶。
-- 方向：`uvec4`/向量化加载、scale/bias 访问复用、减少重复解包与无效算术、压缩指令路径。
-- 子目标：在 `gpc==8` 主桶之外，继续吃掉 `rows=1` 次桶（当前精确分布：`gpc=16/24` 各 `~1175` 次）并维持统一降级护栏。
-- 已验证：`gpc==16/24` 当前“同型复制专核”收益不足（D-9.17/D-9.18）；下一步优先做更深层向量化/访存重排，而不是继续按 `gpc` 机械分裂专核。
+1. 架构主线 A：QMM decode 核重构（最高优先级）  
+- 对标 Metal/Ollama：从“单 op 专核”升级为“tile + 预打包 + 最小中间写回”的主核路径。
+- 目标：显著降低每 token 的 QMM kernel 数量与每次 dispatch 固定开销，提升单核有效算术密度。
+- 实施要点：
+  - A1.2：已完成一轮 `g8_x2` 寄存器重排验证（E-9.20a），无稳定收益，保持实验路径 OFF。
+  - A1.3：已完成“提交模型升级（D-9.22）”第一阶段；下一步进入 A1.3b，聚焦真正减少 `OpAlgoDispatch` 次数（同层合并/链路融合），而非仅异步化提交。
+  - A1.4：已完成算法缓存命中可观测性与默认策略切换（D-9.21）。
+  - A1.5：对齐 Metal/Ollama 路线推进“少 dispatch 高负载”执行图，优先把 decode 热链路（QMM->RMSNorm->RoPE->SDPA）的 launch 数量压降到当前的一半量级。
 
-2. SDPA decode 次热点并行推进  
-- 对照 Metal/Ollama 的 decode attention 内核拆分策略，继续优化 `k=33~128` 区间的 stage1/reduce 配置与核形态。
+2. 架构主线 B：decode 链路融合/提交模型升级  
+- 对标 Metal command-buffer 与 Ollama 持续化 decode 路线，减少 token-step 内 kernel 启动碎片。
+- 目标：把“多小核串联”改造成“少核高负载”执行图，优先处理 QMM->RMSNorm->RoPE->SDPA 热链路。
 
-3. 清理 `Gather` 尾部并推进融合调度  
-- 继续沿 Metal/Ollama 的“减少 launch 数量 + 融合高频小算子”路线推进，下一站聚焦 `Gather`，并评估是否可并入上游/下游算子路径。
+3. 架构主线 C：SDPA decode 核形态升级（并行）  
+- 在保持正确性的前提下，推进 `k=33~128` 及更长上下文路径的核重构与中间结果压缩，避免 stage1/reduce 过碎调度。
 
-4. 维持命中优先与串行口径  
-- 每轮必须先跑 `MLX_VK_QMM_STATS=1` / `MLX_VK_SDPA_STATS=1` 确认命中，再做优化与 A/B。
+4. 评估与节奏约束（保持）  
+- 每轮先跑 `MLX_VK_QMM_STATS=1` / `MLX_VK_SDPA_STATS=1`，再做 EN/ZH `10/40/80` 串行 A/B。
+- 若改动仅带来边际波动（<~2%）且不稳定，视为“未达架构升级目标”，不进入默认路径。
 
-5. 门禁与评估口径保持一致  
-- 继续用 EN/ZH `10/40/80` 串行压测 + profile 对照，确保“命中提升 = 吞吐提升”。
-
-6. 研究流程约束  
-- 每轮方案分析必须对照 Metal 与 Ollama 技术路径，并将结论与目标回写本文件。
+5. 研究约束（保持）  
+- 每轮方案必须显式对照 Metal 与 Ollama 技术实现，并把结论与下一目标回写本文件。
 
 ## 标准验证命令（保留）
 - C++ 全量：
