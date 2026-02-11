@@ -15,6 +15,7 @@
 // 嵌入的 SPIR-V shader
 #include "shaders/add_spv.h"
 #include "shaders/add_bf16_spv.h"
+#include "shaders/add_rmsnorm_bf16_spv.h"
 #include "shaders/add_bf16_scalar_spv.h"
 #include "shaders/add_bf16_bcast_spv.h"
 #include "shaders/mul_bf16_spv.h"
@@ -271,6 +272,7 @@ AlgorithmStatsReporter& algorithm_stats_reporter() {
 const char* KernelRegistry::ADD_F32 = "add_f32";
 const char* KernelRegistry::ADD_F16 = "add_f16";
 const char* KernelRegistry::ADD_BF16 = "add_bf16";
+const char* KernelRegistry::ADD_RMSNORM_BF16 = "add_rmsnorm_bf16";
 const char* KernelRegistry::ADD_BF16_SCALAR = "add_bf16_scalar";
 const char* KernelRegistry::ADD_BF16_BCAST = "add_bf16_bcast";
 const char* KernelRegistry::MUL_F32 = "mul_f32";
@@ -374,6 +376,13 @@ void KernelRegistry::register_builtin_shaders() {
   std::vector<uint32_t> add_bf16_spirv((add_bf16_spv_len + 3) / 4);
   std::memcpy(add_bf16_spirv.data(), add_bf16_spv, add_bf16_spv_len);
   shaders_[ADD_BF16] = std::move(add_bf16_spirv);
+  std::vector<uint32_t> add_rmsnorm_bf16_spirv(
+      (add_rmsnorm_bf16_spv_len + 3) / 4);
+  std::memcpy(
+      add_rmsnorm_bf16_spirv.data(),
+      add_rmsnorm_bf16_spv,
+      add_rmsnorm_bf16_spv_len);
+  shaders_[ADD_RMSNORM_BF16] = std::move(add_rmsnorm_bf16_spirv);
   std::vector<uint32_t> add_bf16_scalar_spirv(
       (add_bf16_scalar_spv_len + 3) / 4);
   std::memcpy(

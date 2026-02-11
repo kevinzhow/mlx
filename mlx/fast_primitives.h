@@ -41,8 +41,11 @@ class RMSNorm : public Custom {
   RMSNorm(
       Stream stream,
       std::function<std::vector<array>(std::vector<array>)> fallback,
-      float eps)
-      : Custom(stream, std::move(fallback)), eps_(eps) {}
+      float eps,
+      bool fused_add = false)
+      : Custom(stream, std::move(fallback)),
+        eps_(eps),
+        fused_add_(fused_add) {}
 
   static bool use_fallback(Stream stream);
 
@@ -64,11 +67,12 @@ class RMSNorm : public Custom {
   DEFINE_INPUT_OUTPUT_SHAPE()
 
   auto state() const {
-    return std::make_pair(nullptr, eps_);
+    return std::make_tuple(nullptr, eps_, fused_add_);
   }
 
  private:
   float eps_;
+  bool fused_add_;
 };
 
 class RMSNormVJP : public Custom {

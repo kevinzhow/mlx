@@ -1,5 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <numeric>
 
 #include "mlx/fast.h"
@@ -9,6 +11,22 @@
 #include "mlx/transforms_impl.h"
 
 namespace mlx::core::fast {
+
+namespace {
+
+bool fused_add_rmsnorm_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_ENABLE_ADD_RMSNORM_NATIVE");
+    if (!v || v[0] == '\0') {
+      return true;
+    }
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
+        std::strcmp(v, "off") != 0;
+  }();
+  return enabled;
+}
+
+} // namespace
 
 std::vector<array> Custom::vjp(
     const std::vector<array>& primals,
@@ -89,7 +107,11 @@ array rms_norm(
   auto s = to_stream(s_);
   auto fallback =
       [has_weight, eps, out_type, s](const std::vector<array>& inputs) {
-        auto x = astype(inputs[0], float32, s);
+        const bool fused_add_inputs = inputs.size() == 3;
+        auto x_in = fused_add_inputs ? add(inputs[0], inputs[1], s) : inputs[0];
+        auto w_in = fused_add_inputs ? inputs[2] : inputs[1];
+
+        auto x = astype(x_in, float32, s);
         x = multiply(
             x,
             rsqrt(
@@ -101,7 +123,7 @@ array rms_norm(
         x = astype(x, out_type, s);
 
         if (has_weight) {
-          x = multiply(x, inputs[1], s);
+          x = multiply(x, w_in, s);
         }
 
         return std::vector<array>{x};
@@ -111,11 +133,26 @@ array rms_norm(
       (has_weight) ? astype(*weight, out_type, s) : array(1, out_type);
 
   if (!RMSNorm::use_fallback(s)) {
+    bool fused_add = false;
+    std::vector<array> primitive_inputs;
+    if (fused_add_rmsnorm_enabled() && x.has_primitive() &&
+        typeid(x.primitive()) == typeid(Add) &&
+        x.inputs().size() == 2) {
+      const auto& add_inputs = x.inputs();
+      primitive_inputs = {
+          astype(add_inputs[0], out_type, s),
+          astype(add_inputs[1], out_type, s),
+          passed_weight};
+      fused_add = true;
+    } else {
+      primitive_inputs = {astype(x, out_type, s), passed_weight};
+    }
+
     return array(
         x.shape(),
         out_type,
-        std::make_shared<RMSNorm>(s, fallback, eps),
-        {astype(x, out_type, s), passed_weight});
+        std::make_shared<RMSNorm>(s, fallback, eps, fused_add),
+        primitive_inputs);
   }
   return fallback({x, passed_weight})[0];
 }
@@ -125,15 +162,18 @@ std::vector<array> RMSNorm::vjp(
     const std::vector<array>& cotangents,
     const std::vector<int>& argnums,
     const std::vector<array>& outputs) {
-  assert(primals.size() == 2);
+  assert(primals.size() == 2 || primals.size() == 3);
   assert(outputs.size() == 1);
   assert(cotangents.size() == 1);
+  const bool fused_add = fused_add_ || primals.size() == 3;
+  assert(!fused_add || primals.size() == 3);
+  assert(fused_add || primals.size() == 2);
 
   auto s = stream();
-  auto fallback = [eps = eps_, s](const std::vector<array>& inputs) {
-    auto& x = inputs[0];
-    auto& w = inputs[1];
-    auto& g = inputs[2];
+  auto fallback = [eps = eps_, s, fused_add](const std::vector<array>& inputs) {
+    auto x = fused_add ? add(inputs[0], inputs[1], s) : inputs[0];
+    auto& w = fused_add ? inputs[2] : inputs[1];
+    auto& g = fused_add ? inputs[3] : inputs[2];
 
     std::vector<array> vjps;
 
@@ -148,7 +188,11 @@ std::vector<array> RMSNorm::vjp(
     auto gw = multiply(g, w, s);
     auto t = mean(multiply(gw, x, s), /* axis= */ -1, /* keepdims= */ true, s);
     t = multiply(multiply(x, t, s), n3, s);
-    vjps.push_back(subtract(multiply(gw, n, s), t, s));
+    auto dx = subtract(multiply(gw, n, s), t, s);
+    vjps.push_back(dx);
+    if (fused_add) {
+      vjps.push_back(dx);
+    }
 
     // df/dw
     std::vector<int> axes(g.ndim() - 1);
@@ -163,11 +207,24 @@ std::vector<array> RMSNorm::vjp(
     return vjps;
   };
 
+  std::vector<Shape> vjp_shapes;
+  std::vector<Dtype> vjp_dtypes;
+  std::vector<array> vjp_inputs;
+  if (fused_add) {
+    vjp_shapes = {primals[0].shape(), primals[1].shape(), primals[2].shape()};
+    vjp_dtypes = {primals[0].dtype(), primals[1].dtype(), primals[2].dtype()};
+    vjp_inputs = {primals[0], primals[1], primals[2], cotangents[0]};
+  } else {
+    vjp_shapes = {primals[0].shape(), primals[1].shape()};
+    vjp_dtypes = {primals[0].dtype(), primals[1].dtype()};
+    vjp_inputs = {primals[0], primals[1], cotangents[0]};
+  }
+
   auto vjps = array::make_arrays(
-      {primals[0].shape(), primals[1].shape()},
-      {primals[0].dtype(), primals[1].dtype()},
+      vjp_shapes,
+      vjp_dtypes,
       std::make_shared<RMSNormVJP>(s, fallback, eps_),
-      {primals[0], primals[1], cotangents[0]});
+      vjp_inputs);
 
   std::vector<array> returned_vjps;
   for (auto& arg : argnums) {
@@ -179,7 +236,7 @@ std::vector<array> RMSNorm::vjp(
 
 bool RMSNorm::is_equivalent(const Primitive& other) const {
   const RMSNorm& a_other = static_cast<const RMSNorm&>(other);
-  return eps_ == a_other.eps_;
+  return eps_ == a_other.eps_ && fused_add_ == a_other.fused_add_;
 }
 
 bool RMSNormVJP::is_equivalent(const Primitive& other) const {

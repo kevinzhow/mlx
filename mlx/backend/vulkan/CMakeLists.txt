@@ -91,6 +91,7 @@ endif()
 set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/binary_add.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_bf16.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_rmsnorm_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_bf16_scalar.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_bf16_bcast.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mul_bf16.comp

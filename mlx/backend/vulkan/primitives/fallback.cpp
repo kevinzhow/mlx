@@ -1557,6 +1557,12 @@ inline bool native_rmsnorm_enabled() {
   return enabled;
 }
 
+inline bool native_add_rmsnorm_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_ADD_RMSNORM_NATIVE");
+  return enabled;
+}
+
 inline bool native_rope_enabled() {
   static const bool enabled = env_flag_default_true("MLX_VK_ENABLE_ROPE_NATIVE");
   return enabled;
@@ -2342,6 +2348,64 @@ inline bool can_use_native_rmsnorm_bf16(
 
   axis_size = static_cast<uint32_t>(axis);
   n_rows = static_cast<uint32_t>(x.size() / static_cast<size_t>(axis));
+  return n_rows > 0;
+}
+
+inline bool can_use_native_add_rmsnorm_bf16(
+    const std::vector<mlx::core::array>& inputs,
+    const std::vector<mlx::core::array>& outputs,
+    uint32_t& n_rows,
+    uint32_t& axis_size,
+    uint32_t& w_stride) {
+  if (inputs.size() != 3 || outputs.size() != 1 || outputs[0].size() == 0) {
+    return false;
+  }
+  const auto& a = inputs[0];
+  const auto& b = inputs[1];
+  const auto& w = inputs[2];
+  const auto& out = outputs[0];
+
+  if (a.dtype() != mlx::core::bfloat16 || b.dtype() != mlx::core::bfloat16 ||
+      w.dtype() != mlx::core::bfloat16 || out.dtype() != mlx::core::bfloat16) {
+    return false;
+  }
+  if (!is_row_contiguous_materialized(a) || !is_row_contiguous_materialized(b) ||
+      !out.flags().row_contiguous || a.shape() != b.shape() ||
+      a.shape() != out.shape()) {
+    return false;
+  }
+  if (a.ndim() < 1) {
+    return false;
+  }
+
+  int64_t axis = a.shape(-1);
+  if (axis <= 0 || (axis % 2) != 0 ||
+      axis > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+    return false;
+  }
+  if (a.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+      a.size() != b.size() || a.size() != out.size() ||
+      (a.size() % static_cast<size_t>(axis)) != 0) {
+    return false;
+  }
+
+  if (w.ndim() == 0) {
+    if (!is_row_contiguous_materialized(w) || w.size() != 1) {
+      return false;
+    }
+    w_stride = 0u;
+  } else if (w.ndim() == 1) {
+    if (!is_row_contiguous_materialized(w) || w.shape(0) != axis ||
+        w.strides()[0] != 1) {
+      return false;
+    }
+    w_stride = 1u;
+  } else {
+    return false;
+  }
+
+  axis_size = static_cast<uint32_t>(axis);
+  n_rows = static_cast<uint32_t>(a.size() / static_cast<size_t>(axis));
   return n_rows > 0;
 }
 
@@ -3837,6 +3901,55 @@ void fast::RMSNorm::eval_gpu(
   uint32_t n_rows = 0;
   uint32_t axis_size = 0;
   uint32_t w_stride = 0;
+  if (native_add_rmsnorm_enabled() && can_use_native_add_rmsnorm_bf16(
+          inputs, outputs, n_rows, axis_size, w_stride)) {
+    try {
+      auto& out = outputs[0];
+      if (!out.data_shared_ptr()) {
+        out.set_data(allocator::malloc(out.nbytes()));
+      }
+
+      auto& device = vulkan::device(stream.device);
+      auto& encoder = device.get_command_encoder(stream.index);
+      encoder.begin_encoding();
+
+      auto a_tensor = device.get_tensor(inputs[0]);
+      auto b_tensor = device.get_tensor(inputs[1]);
+      auto w_tensor = device.get_tensor(inputs[2]);
+      auto out_tensor = device.get_tensor(out);
+
+      const std::vector<uint32_t> push_consts{
+          encode_push_constant_u32(n_rows),
+          encode_push_constant_u32(axis_size),
+          encode_push_constant_u32(w_stride),
+          encode_push_constant_f32(eps_)};
+
+      // Output tensor is write-only in this dispatch.
+      std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+      if (device.tensor_needs_sync_device(inputs[0])) {
+        sync_tensors.push_back(a_tensor);
+      }
+      if (device.tensor_needs_sync_device(inputs[1])) {
+        sync_tensors.push_back(b_tensor);
+      }
+      if (device.tensor_needs_sync_device(inputs[2])) {
+        sync_tensors.push_back(w_tensor);
+      }
+      if (!sync_tensors.empty()) {
+        encoder.record_tensor_sync_device(sync_tensors);
+      }
+      encoder.record_algo_dispatch(
+          vulkan::KernelRegistry::ADD_RMSNORM_BF16,
+          {a_tensor, b_tensor, w_tensor, out_tensor},
+          {n_rows, 1, 1},
+          push_consts);
+      device.mark_tensor_host_dirty(out, stream.index);
+      return;
+    } catch (const std::exception&) {
+      // Fall through to non-fused native/fallback paths.
+    }
+  }
+
   if (native_rmsnorm_enabled() && can_use_native_rmsnorm_bf16(
           inputs, outputs, n_rows, axis_size, w_stride)) {
     try {

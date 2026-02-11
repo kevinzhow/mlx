@@ -17,7 +17,7 @@
 - 流程约束（新增）：Qwen3 `mlx_lm generate` 正确性/性能口径需串行执行；任意 C++/Vulkan/shader 变更后，Python 侧验证前必须先执行 `python3 setup.py build_ext --inplace`，避免旧扩展产物导致误判。
 - 近期吞吐（实卡 Vulkan，串行口径）：
   - 10-token（EN）：约 `5.20~5.23 tok/s`（D-9.25 后）
-  - 40-token（EN）：约 `4.64 tok/s`（D-9.25 后）
+  - 40-token（EN）：约 `4.64~4.73 tok/s`（D-9.26 profiling refresh）
   - 80-token（EN）：约 `3.17~3.34 tok/s`（D-9.23 后）
 - 运行时新默认（D-9.21）：
   - `MLX_VK_ENABLE_ALGO_CACHE=0`（默认 OFF）
@@ -716,6 +716,66 @@
   - 本轮继续验证“减少碎片调度”方向有效；相对 D-9.24 的 40-token `4.469 tok/s`，再提升约 `+3.9%`。
   - 下一步继续围绕 A1.5：把 decode 热链路里的 dispatch 数量进一步压降（优先从高频 `QMM/RMSNorm/RoPE` 周边可融合段入手）。
 
+### D-9.26：decode kernel dispatch 分布复测（已完成）
+- 背景：
+  - 按 A1.5 路线，继续优化前先刷新当前主线的真实 dispatch 分布，避免盲目改低贡献路径。
+- 观测（Qwen3 EN 40-token，实卡 Vulkan，`MLX_VK_ALGO_STATS=1`）：
+  - 吞吐：`4.725 tok/s`
+  - `VulkanAlgoStats`：
+    - `requests=20227`，`cache_hits=0`，`miss_kernels=14`
+    - Top miss kernels：
+      - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8`: `5781`
+      - `rmsnorm_bf16`: `4743`
+      - `rope_bf16_t1`: `2351`
+      - `add_bf16`: `2350`
+      - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup`: `2296`
+- 结论：
+  - 当前瓶颈仍是“高频小链路重复调度 + QMM/RMSNorm 主核高频调用”，而不是单一 fallback 问题。
+  - 下一步执行入口保持 A1.5：优先寻找可稳定落地的链路融合点（先从 `add_bf16 + rmsnorm_bf16` 邻接段可融合性评估与实现切入）。
+
+### D-9.27：RMSNorm 链路观测钩子回退（已完成）
+- 背景：
+  - 为验证 `add_bf16 + rmsnorm_bf16` 融合价值，尝试在 `fast::RMSNorm::eval_gpu` 内增加输入 primitive 统计钩子。
+- 结果：
+  - 该 intrusive 钩子在 Qwen3 40-token 流程中触发运行时崩溃（segmentation fault）。
+  - 已完整回退该钩子，重新 `build_ext` 验证后，Qwen3 生成恢复稳定。
+- 结论：
+  - 后续不再在 primitive 热路径引入生命周期敏感统计逻辑。
+  - 链路观测改为“非侵入式”方式：`MLX_VK_ALGO_STATS` + 现有 profile/日志口径联合分析。
+
+### D-9.28：`add + RMSNorm` 图融合与原生核闭环（已完成）
+- 背景（Metal/Ollama 对照）：
+  - Metal/Ollama 都强调先减少 decode 热链路中的小核串联，再看单核效率；本轮先做低风险链路融合验证。
+  - 目标：把 `add_bf16 -> rmsnorm_bf16` 的一段邻接链路收敛为单次 dispatch，验证“减少 launch 数量”是否带来端到端收益。
+- 实现：
+  - fast 图侧：
+    - `rms_norm(add(a, b), w)` 自动生成 fused `RMSNorm` primitive（3 输入：`a/b/w`）。
+    - `RMSNorm::vjp` 支持 fused-add 形态（`da=dx`, `db=dx`, `dw` 按原公式）。
+  - Vulkan 侧：
+    - 新增 kernel：`add_rmsnorm_bf16`。
+    - 新增 gate：`MLX_VK_ENABLE_ADD_RMSNORM_NATIVE`（默认 ON）。
+    - 新增命中判定与 dispatch：`fast::RMSNorm::eval_gpu` 对 3 输入路径优先走 native。
+  - shader 闭环（严格执行）：
+    - 已完成 `.comp -> .spv -> *_spv.h`：
+      - `mlx/backend/vulkan/shaders/add_rmsnorm_bf16.comp`
+      - `mlx/backend/vulkan/shaders/add_rmsnorm_bf16.spv`
+      - `mlx/backend/vulkan/shaders/add_rmsnorm_bf16_spv.h`
+  - 工程接线：
+    - `kernel_registry` + `CMakeLists.txt` 已注册新核。
+    - 修正 gate 语义：当 `MLX_VK_ENABLE_ADD_RMSNORM_NATIVE=0` 时 fast 图侧不构建 fused primitive，确保 A/B 对照回到旧路径。
+- 验证：
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 正确性（实卡 Vulkan）：
+    - ZH 10-token 正常，无乱码。
+  - 命中（EN 10-token, `MLX_VK_ALGO_STATS=1`）：
+    - `add_rmsnorm_bf16: 670`（确认命中）
+    - `rmsnorm_bf16: 683`（开启融合） vs `1353`（关闭融合）
+- 结果与结论：
+  - 端到端吞吐未出现稳定提升（EN 40-token：ON `4.665 tok/s` vs OFF `4.719 tok/s`，近似持平）。
+  - 说明本轮“减少一段小核 dispatch”方向在当前阶段杠杆不足；主瓶颈仍是 QMM 主耗时与更高层执行图碎片。
+  - 下一步回到架构主线：优先推进 QMM 主核与更大粒度 decode 子图融合（而非继续堆小融合核）。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`g8_x2` A1-Phase1 与 A1.2 重排均未形成稳定收益，后续需转向更深层内核重构（数据布局 + 中间态组织）。
@@ -723,6 +783,7 @@
 2. 高频 decode 核的 dispatch/创建开销  
 - D-9.21 已证明旧 algorithm cache 对主线为 0 命中并已默认关闭。
 - D-9.22 已完成“提交异步化 + inflight 窗口”但收益有限；下一阶段需继续减少 `manager.algorithm`/`OpAlgoDispatch` 总次数（链路融合/dispatch 合并）。
+- D-9.28 已验证 `add+rmsnorm` 小粒度融合本身不足以带来稳定吞吐提升，后续需转向更大粒度热链路重构。
 
 3. `fast::RMSNorm / fast::ScaledDotProductAttention`
 - 在 RoPE 回退清理后，二者仍是次级原生耗时来源，需继续做 kernel 级效率优化。
@@ -744,6 +805,7 @@
   - A1.3：已完成“提交模型升级（D-9.22）”第一阶段；下一步进入 A1.3b，聚焦真正减少 `OpAlgoDispatch` 次数（同层合并/链路融合），而非仅异步化提交。
   - A1.4：已完成算法缓存命中可观测性与默认策略切换（D-9.21）。
   - A1.5：对齐 Metal/Ollama 路线推进“少 dispatch 高负载”执行图，优先把 decode 热链路（QMM->RMSNorm->RoPE->SDPA）的 launch 数量压降到当前的一半量级。
+  - A1.6（下一入口）：从“小融合核”切到“QMM 主核末端融合（epilogue）”评估，实现 `QMM + residual add + norm` 的单核化原型，对齐 Metal/Ollama 在主核内完成更多后处理的路线。
 
 2. 架构主线 B：decode 链路融合/提交模型升级  
 - 对标 Metal command-buffer 与 Ollama 持续化 decode 路线，减少 token-step 内 kernel 启动碎片。
