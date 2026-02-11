@@ -1039,6 +1039,9 @@ void QuantizedMatmulAdd::eval_cpu(
   std::vector<array> qmm_inputs{
       inputs[0], inputs[1], inputs[2], inputs[3]};
   array qmm_out(out.shape(), out.dtype(), nullptr, {});
+  // Keep the intermediate alive across async CPU encoder dispatches.
+  auto& encoder = cpu::get_command_encoder(stream());
+  encoder.add_temporary(qmm_out);
   QuantizedMatmul qmm(stream(), group_size_, bits_, mode_, transpose_);
   qmm.eval_cpu(qmm_inputs, qmm_out);
   Add add(stream());

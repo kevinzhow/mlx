@@ -19,9 +19,13 @@
   - 10-token（EN）：约 `5.20~5.24 tok/s`（D-9.30 后）
   - 40-token（EN）：约 `4.87~4.93 tok/s`（D-9.30 后）
   - 80-token（EN）：约 `4.80 tok/s`（D-9.30 样本）
-- QMM+Add 融合命中现状（D-9.31）：
-  - 图构建阶段已可观测到 `Add` 的 QMM 操作数（`qmm_operand_seen=168`，1-token 样本）。
-  - 但当前默认稳定门禁下 `fused_created=0`，拒绝主因是 `groups_per_col != 8`（`reject_groups_unsupported=168`）。
+- QMM+Add 融合命中现状（D-9.32）：
+  - 图侧 + Vulkan 侧已放开到 decode 主桶 `groups_per_col in {8,16,24}`（旧 `..._G8` gate 仍兼容）。
+  - `MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE=1` + `MLX_VK_QMM_ADD_FUSE_STATS=1`（EN 10-token）：
+    - `qmm_operand_seen=672`
+    - `fused_created=672`
+    - `reject_groups_unsupported=0`
+  - 端到端吞吐暂未形成阶跃：EN 10-token `gate off 5.492 tok/s` vs `gate on 5.502 tok/s`（近似持平）。
 - 运行时新默认（D-9.21）：
   - `MLX_VK_ENABLE_ALGO_CACHE=0`（默认 OFF）
   - 原因：当前 decode 主线算法缓存命中率为 `0`，默认关闭可减少无效 key/map 开销。
@@ -850,6 +854,45 @@
   - 现阶段收益尚未释放：当前 workload 下 g8 不命中，主命中在 g16/g24 等桶。
   - 下一步优先修复通用 fused kernel 的正确性，再放开 `groups_per_col` 覆盖。
 
+### D-9.32：QMM+Add decode `g8/g16/g24` 放开 + 崩溃修复（已完成）
+- 背景（Metal/Ollama 对照）：
+  - 先做命中修复，再评估吞吐收益；避免继续优化未命中路径。
+  - D-9.31 的主阻塞是 `groups_per_col` 仅支持 `g8`，导致真实 workload 下几乎不命中。
+- 本轮实现：
+  - 图侧融合 gate 扩展：
+    - `ops.cpp` 将 `QuantizedMatmulAdd` 创建条件从 `g8` 扩展到 `g8/g16/g24`。
+    - 新增 gate：`MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE`（兼容旧 `MLX_VK_ENABLE_QMM_ADD_FUSE_G8`）。
+  - Vulkan fused kernel 扩展：
+    - 新增 shader：
+      - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g16_add.comp`
+      - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g24_add.comp`
+    - `kernel_registry` 与 `CMakeLists` 完整接线（含 `*_spv.h` 注册）。
+    - `QuantizedMatmulAdd::eval_gpu` 按 `groups_per_col` 动态派发 `g8/g16/g24` add kernel。
+  - 关键稳定性修复（根因修复）：
+    - 初版放开后出现 `free(): corrupted unsorted chunks`。
+    - 根因定位：`QuantizedMatmulAdd::eval_cpu` 的中间张量 `qmm_out` 未被 encoder 持有，在异步 CPU dispatch 下生命周期提前结束导致 UAF/堆破坏。
+    - 修复：在 `QuantizedMatmulAdd::eval_cpu` 中对 `qmm_out` 执行 `encoder.add_temporary(qmm_out)`，确保跨 dispatch 生命周期安全。
+  - shader 闭环：
+    - 本轮严格执行 `.comp -> .spv -> *_spv.h`（`g16_add/g24_add`）并重编验证。
+- 验证与结果：
+  - 构建/回归：
+    - `cmake --build build_release_vulkan --target mlx/tests -j` 通过。
+    - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+    - `python3 setup.py build_ext --inplace` 通过。
+    - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3（实卡 Vulkan，串行）：
+    - 1-token（gate on）稳定，无崩溃。
+    - EN 10-token：
+      - gate off：`5.492 tok/s`
+      - gate on：`5.502 tok/s`
+    - 命中统计（gate on + stats）：
+      - `qmm_operand_seen=672`
+      - `fused_created=672`
+      - `reject_groups_unsupported=0`
+- 结论：
+  - “命中问题”已解决且稳定性问题已修复。
+  - 但当前 fused kernel 仍未带来明显端到端吞吐跃迁，下一步需转向“融合后内核效率”本身（而非继续扩门禁）。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`g8_x2` A1-Phase1 与 A1.2 重排均未形成稳定收益，后续需转向更深层内核重构（数据布局 + 中间态组织）。
@@ -858,6 +901,7 @@
 - D-9.21 已证明旧 algorithm cache 对主线为 0 命中并已默认关闭。
 - D-9.22 已完成“提交异步化 + inflight 窗口”但收益有限；下一阶段需继续减少 `manager.algorithm`/`OpAlgoDispatch` 总次数（链路融合/dispatch 合并）。
 - D-9.28 已验证 `add+rmsnorm` 小粒度融合本身不足以带来稳定吞吐提升，后续需转向更大粒度热链路重构。
+- D-9.32 已将 `QMM+Add` 命中从 0 提升到主线命中（`fused_created=672/672`），但吞吐仍近似持平；说明下一阶段瓶颈从“是否命中”转为“融合核效率/launch 总量”。
 
 3. `fast::RMSNorm / fast::ScaledDotProductAttention`
 - D-9.30 已完成 RMSNorm 并行归约升级，串行实现瓶颈已缓解；下一步重心转向 SDPA 长上下文与 QMM 主核。
@@ -879,7 +923,9 @@
   - A1.3：已完成“提交模型升级（D-9.22）”第一阶段；下一步进入 A1.3b，聚焦真正减少 `OpAlgoDispatch` 次数（同层合并/链路融合），而非仅异步化提交。
   - A1.4：已完成算法缓存命中可观测性与默认策略切换（D-9.21）。
   - A1.5：对齐 Metal/Ollama 路线推进“少 dispatch 高负载”执行图，优先把 decode 热链路（QMM->RMSNorm->RoPE->SDPA）的 launch 数量压降到当前的一半量级。
-  - A1.6（下一入口）：从“小融合核”切到“QMM 主核末端融合（epilogue）”评估，实现 `QMM + residual add + norm` 的单核化原型，对齐 Metal/Ollama 在主核内完成更多后处理的路线。
+  - A1.6（下一入口）：在 D-9.32 命中已打通基础上，进入“融合核效率重构”：
+    - 优先重写 `g16/g24` fused add kernel（对齐 g8 的去冗余范式：dequant 预展开/减少重复算术/低 barrier）。
+    - 继续向 `QMM + residual add + norm` 主核 epilogue 融合推进，减少 decode 热链路 launch 数量。
 
 2. 架构主线 B：decode 链路融合/提交模型升级  
 - 对标 Metal command-buffer 与 Ollama 持续化 decode 路线，减少 token-step 内 kernel 启动碎片。

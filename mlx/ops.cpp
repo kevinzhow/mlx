@@ -61,18 +61,36 @@ Dtype at_least_float(const Dtype& d) {
   return issubdtype(d, inexact) ? d : promote_types(d, float32);
 }
 
-bool qmm_add_fuse_g8_enabled() {
+bool qmm_add_fuse_decode_enabled() {
   static const bool enabled = []() {
-    const char* v = std::getenv("MLX_VK_ENABLE_QMM_ADD_FUSE_G8");
-    if (!v || v[0] == '\0') {
-      return false;
+    auto parse_flag = [](const char* v) -> int {
+      if (!v || v[0] == '\0') {
+        return -1;
+      }
+      if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+          std::strcmp(v, "off") == 0) {
+        return 0;
+      }
+      if (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+          std::strcmp(v, "on") == 0) {
+        return 1;
+      }
+      return 0;
+    };
+
+    // Prefer the new generic gate; keep old g8-only gate as compatibility
+    // alias until callers migrate.
+    const int generic_gate =
+        parse_flag(std::getenv("MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE"));
+    if (generic_gate != -1) {
+      return generic_gate == 1;
     }
-    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
-        std::strcmp(v, "off") == 0) {
-      return false;
+    const int legacy_gate =
+        parse_flag(std::getenv("MLX_VK_ENABLE_QMM_ADD_FUSE_G8"));
+    if (legacy_gate != -1) {
+      return legacy_gate == 1;
     }
-    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "on") == 0;
+    return false;
   }();
   return enabled;
 }
@@ -163,7 +181,7 @@ bool can_use_qmm_add_fused_primitive(
     const array& residual,
     Dtype out_type) {
   auto& stats = qmm_add_fuse_create_stats();
-  if (!qmm_add_fuse_g8_enabled()) {
+  if (!qmm_add_fuse_decode_enabled()) {
     return false;
   }
   if (out_type != bfloat16) {
@@ -215,7 +233,7 @@ bool can_use_qmm_add_fused_primitive(
     return false;
   }
   const int64_t groups_per_col = k / group_size;
-  if (groups_per_col != 8) {
+  if (groups_per_col != 8 && groups_per_col != 16 && groups_per_col != 24) {
     if (qmm_add_fuse_stats_enabled()) {
       stats.reject_groups_unsupported.fetch_add(
           1, std::memory_order_relaxed);
@@ -2775,7 +2793,7 @@ array add(const array& a, const array& b, StreamOrDevice s /* = {} */) {
   if (qmm_add_fuse_stats_enabled()) {
     qmm_add_fuse_create_stats_reporter();
     fuse_stats.add_calls.fetch_add(1, std::memory_order_relaxed);
-    if (!qmm_add_fuse_g8_enabled()) {
+    if (!qmm_add_fuse_decode_enabled()) {
       fuse_stats.gate_off.fetch_add(1, std::memory_order_relaxed);
     }
     const bool has_qmm_operand =

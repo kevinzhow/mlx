@@ -1551,9 +1551,17 @@ inline bool native_qmm_m8_enabled() {
   return enabled;
 }
 
-inline bool native_qmm_add_fuse_g8_enabled() {
-  static const bool enabled =
-      env_flag_default_false("MLX_VK_ENABLE_QMM_ADD_FUSE_G8");
+inline bool native_qmm_add_fuse_decode_enabled() {
+  static const bool enabled = []() {
+    const char* decode_gate = std::getenv("MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE");
+    if (decode_gate && decode_gate[0] != '\0') {
+      return std::strcmp(decode_gate, "0") != 0 &&
+          std::strcmp(decode_gate, "false") != 0 &&
+          std::strcmp(decode_gate, "off") != 0;
+    }
+    // Keep legacy gate as compatibility alias.
+    return env_flag_default_false("MLX_VK_ENABLE_QMM_ADD_FUSE_G8");
+  }();
   return enabled;
 }
 
@@ -2302,7 +2310,7 @@ inline bool can_use_native_affine_bf16_quantized_matmul(
   return true;
 }
 
-inline bool can_use_native_qmm_add_fuse_g8(
+inline bool can_use_native_qmm_add_fuse_decode(
     const std::vector<mlx::core::array>& inputs,
     const mlx::core::array& out,
     int group_size,
@@ -2330,7 +2338,7 @@ inline bool can_use_native_qmm_add_fuse_g8(
     return false;
   }
   const int64_t groups_per_col = k / group_size;
-  if (groups_per_col != 8) {
+  if (groups_per_col != 8 && groups_per_col != 16 && groups_per_col != 24) {
     return false;
   }
   const int64_t rows = static_cast<int64_t>(
@@ -2338,7 +2346,7 @@ inline bool can_use_native_qmm_add_fuse_g8(
   return rows == 1;
 }
 
-inline bool dispatch_native_qmm_add_fuse_g8(
+inline bool dispatch_native_qmm_add_fuse_decode(
     mlx::core::Stream stream,
     const std::vector<mlx::core::array>& inputs,
     mlx::core::array& out,
@@ -2395,6 +2403,19 @@ inline bool dispatch_native_qmm_add_fuse_g8(
     const uint32_t groups_per_col = static_cast<uint32_t>(
         k / static_cast<uint32_t>(group_size));
     const uint32_t w_words_per_col = static_cast<uint32_t>(inputs[1].shape(-1));
+    const char* kernel_name = nullptr;
+    if (groups_per_col == 8u) {
+      kernel_name = mlx::core::vulkan::KernelRegistry::
+          QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_ADD;
+    } else if (groups_per_col == 16u) {
+      kernel_name = mlx::core::vulkan::KernelRegistry::
+          QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G16_ADD;
+    } else if (groups_per_col == 24u) {
+      kernel_name = mlx::core::vulkan::KernelRegistry::
+          QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G24_ADD;
+    } else {
+      return false;
+    }
 
     const std::vector<uint32_t> push_consts{
         encode_push_constant_u32(out_elems),
@@ -2404,8 +2425,7 @@ inline bool dispatch_native_qmm_add_fuse_g8(
         encode_push_constant_u32(w_words_per_col)};
 
     encoder.record_algo_dispatch(
-        mlx::core::vulkan::KernelRegistry::
-            QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8_ADD,
+        kernel_name,
         {x_tensor,
          w_cached.tensor,
          scales_cached.tensor,
@@ -3358,11 +3378,12 @@ void QuantizedMatmulAdd::eval_gpu(
   vulkan::OpProfileScope profile("QuantizedMatmulAdd");
   auto stream = out.primitive().stream();
 
-  if (native_qmm_add_fuse_g8_enabled() &&
-      can_use_native_qmm_add_fuse_g8(
+  if (native_qmm_add_fuse_decode_enabled() &&
+      can_use_native_qmm_add_fuse_decode(
           inputs, out, group_size_, bits_, transpose_, mode_)) {
     prepare_inputs_for_cpu_fallback(inputs, stream);
-    if (dispatch_native_qmm_add_fuse_g8(stream, inputs, out, group_size_)) {
+    if (dispatch_native_qmm_add_fuse_decode(
+            stream, inputs, out, group_size_)) {
       return;
     }
   }
