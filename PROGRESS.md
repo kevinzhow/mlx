@@ -43,6 +43,10 @@
     - 40-token：`x2 on 4.966 tok/s` vs `x2 off 4.999 tok/s`
     - 80-token：`x2 on 4.854 tok/s` vs `x2 off 4.850 tok/s`
     - 结论：收益不稳定且接近噪声，`x2` 维持实验开关默认 OFF。
+  - D-9.37 `shape_reject` 形状桶（EN 10-token，`MLX_VK_QMM_ADD_FUSE_STATS=1`）：
+    - `rows=12,n=1024,k=2048,gpc=16`: `27`
+    - `rows=12,n=1024,k=3072,gpc=24`: `27`
+    - 结论：`shape_reject` 全部来自 prefill `rows=12`，decode `rows=1` 路径已全量命中。
 - 运行时新默认（D-9.21）：
   - `MLX_VK_ENABLE_ALGO_CACHE=0`（默认 OFF）
   - 原因：当前 decode 主线算法缓存命中率为 `0`，默认关闭可减少无效 key/map 开销。
@@ -1026,6 +1030,22 @@
   - 该路径未形成稳定 >2% 提升，不满足“架构升级阶跃”标准。
   - 保留 x2 作为实验开关，主线默认关闭，下一步继续推进更高杠杆的 `QMM + residual add + norm` 融合与 dispatch 压降。
 
+### D-9.37：QMM+Add `shape_reject` 形状桶细化（已完成）
+- 背景（Metal/Ollama 对照）：
+  - 进入更大粒度融合前，需要先确认 reject 是 decode 热路径问题还是 prefill 非热点问题，避免误投优化资源。
+- 本轮实现：
+  - 在 `VulkanQMMAddFuseStats` 中新增 `ShapeRejectBucket` 分布：
+    - 记录键：`rows/n/k/gpc`
+    - 仅在 `shape_reject` 时计数
+- 验证（实卡 Vulkan，串行，EN 10-token，`MLX_VK_QMM_ADD_FUSE_STATS=1`）：
+  - `shape_reject_bucket_keys=2`
+  - `rows=12,n=1024,k=2048,gpc=16`: `27`
+  - `rows=12,n=1024,k=3072,gpc=24`: `27`
+  - 同轮输出正确，生成吞吐 `5.353 tok/s`。
+- 结论：
+  - 当前 `shape_reject` 完全来自 prefill `rows=12`，并非 decode `rows=1` 主热路径缺口。
+  - 下一步主线应继续聚焦 decode 链路的“更大粒度融合/launch 压降”，而不是优先扩展 prefill 的 QMM+Add 形状支持。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`g8_x2` A1-Phase1 与 A1.2 重排均未形成稳定收益，后续需转向更深层内核重构（数据布局 + 中间态组织）。
@@ -1037,6 +1057,7 @@
 - D-9.34 已将 QMM+Add decode 融合切入默认路径（40-token 约 `+3.9%`），但距目标仍远；下一阶段瓶颈依旧是“launch 总量 + 主核 epilogue 融合深度”。
 - D-9.35 统计显示当前 fused fallback 主因已收敛到 `shape_reject`（10-token 样本 54 次），下一阶段应优先覆盖该高频形态而不是继续加门禁。
 - D-9.36 显示 `g16/g24 x2` 双-word tile 未形成稳定阶跃（<2%），主线应继续聚焦更大粒度融合而非继续堆 x2 变体。
+- D-9.37 进一步确认 `shape_reject` 来自 prefill `rows=12`，decode 主线并未漏命中；后续优化优先级仍应放在 decode 架构融合。
 
 3. `fast::RMSNorm / fast::ScaledDotProductAttention`
 - D-9.30 已完成 RMSNorm 并行归约升级，串行实现瓶颈已缓解；下一步重心转向 SDPA 长上下文与 QMM 主核。

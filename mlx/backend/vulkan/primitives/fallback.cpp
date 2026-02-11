@@ -1362,6 +1362,7 @@ struct QmmAddFuseRuntimeStatsState {
   std::unordered_map<std::string, uint64_t> native_kernel_counts;
   std::unordered_map<std::string, uint64_t> native_gpc_counts;
   std::unordered_map<std::string, uint64_t> fallback_reason_counts;
+  std::unordered_map<std::string, uint64_t> shape_reject_bucket_counts;
 };
 
 inline QmmAddFuseRuntimeStatsState& qmm_add_fuse_runtime_stats_state() {
@@ -1416,6 +1417,38 @@ inline void qmm_add_fuse_stats_record_fallback(const char* reason) {
   state.fallback_reason_counts[key]++;
 }
 
+inline void qmm_add_fuse_stats_record_shape_reject_bucket(
+    const std::vector<mlx::core::array>& inputs,
+    const mlx::core::array& out,
+    int group_size) {
+  if (!qmm_add_fuse_stats_enabled()) {
+    return;
+  }
+  auto& state = qmm_add_fuse_runtime_stats_state();
+  (void)qmm_add_fuse_runtime_stats_reporter();
+
+  std::string bucket = "unknown";
+  if (inputs.size() >= 5) {
+    const int64_t k = inputs[0].shape(-1);
+    const int64_t n = out.shape(-1);
+    int64_t rows = -1;
+    if (k > 0) {
+      rows = static_cast<int64_t>(inputs[0].size() / static_cast<size_t>(k));
+    }
+    int64_t gpc = -1;
+    if (group_size > 0 && k > 0 && (k % group_size) == 0) {
+      gpc = k / group_size;
+    }
+    bucket = "rows=" + std::to_string(rows) + ",n=" + std::to_string(n) +
+        ",k=" + std::to_string(k) + ",gpc=" + std::to_string(gpc);
+  } else {
+    bucket = "arity=" + std::to_string(inputs.size());
+  }
+
+  std::lock_guard<std::mutex> lock(state.mtx);
+  state.shape_reject_bucket_counts[bucket]++;
+}
+
 inline void qmm_add_fuse_runtime_stats_dump() {
   if (!qmm_add_fuse_stats_enabled()) {
     return;
@@ -1434,6 +1467,8 @@ inline void qmm_add_fuse_runtime_stats_dump() {
             << " native_kernel_keys=" << state.native_kernel_counts.size()
             << " native_gpc_keys=" << state.native_gpc_counts.size()
             << " fallback_reason_keys=" << state.fallback_reason_counts.size()
+            << " shape_reject_bucket_keys="
+            << state.shape_reject_bucket_counts.size()
             << "\n";
   for (const auto& [key, count] : sort_stats_counts(state.native_kernel_counts)) {
     std::cerr << "[VulkanQMMAddFuseStats][NativeKernel] kernel=" << key
@@ -1446,6 +1481,11 @@ inline void qmm_add_fuse_runtime_stats_dump() {
   for (const auto& [key, count] :
        sort_stats_counts(state.fallback_reason_counts)) {
     std::cerr << "[VulkanQMMAddFuseStats][FallbackReason] reason=" << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.shape_reject_bucket_counts)) {
+    std::cerr << "[VulkanQMMAddFuseStats][ShapeRejectBucket] " << key
               << " count=" << count << "\n";
   }
 }
@@ -3565,6 +3605,7 @@ void QuantizedMatmulAdd::eval_gpu(
       inputs, out, group_size_, bits_, transpose_, mode_);
   if (gate_on && !can_use) {
     qmm_add_fuse_stats_record_fallback("shape_reject");
+    qmm_add_fuse_stats_record_shape_reject_bucket(inputs, out, group_size_);
   }
 
   if (can_use) {
