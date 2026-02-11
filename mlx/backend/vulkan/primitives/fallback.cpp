@@ -1735,6 +1735,12 @@ inline bool native_qmm_add_fuse_decode_enabled() {
   return enabled;
 }
 
+inline bool native_qmm_add_fuse_prefill_m16_enabled() {
+  static const bool enabled =
+      env_flag_default_true("MLX_VK_ENABLE_QMM_ADD_FUSE_PREFILL_M16");
+  return enabled;
+}
+
 inline bool native_qmm_add_fuse_decode_g16_x2_enabled() {
   static const bool enabled =
       env_flag_default_false("MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE_G16_X2");
@@ -2528,6 +2534,42 @@ inline bool can_use_native_qmm_add_fuse_decode(
   return rows == 1;
 }
 
+inline bool can_use_native_qmm_add_fuse_prefill_m16(
+    const std::vector<mlx::core::array>& inputs,
+    const mlx::core::array& out,
+    int group_size,
+    int bits,
+    bool transpose,
+    mlx::core::QuantizationMode mode) {
+  if (inputs.size() != 5) {
+    return false;
+  }
+  const std::vector<mlx::core::array> qmm_inputs{
+      inputs[0], inputs[1], inputs[2], inputs[3]};
+  if (!can_use_native_affine_bf16_quantized_matmul(
+          qmm_inputs, out, group_size, bits, transpose, mode)) {
+    return false;
+  }
+  const auto& residual = inputs[4];
+  if (residual.dtype() != mlx::core::bfloat16 ||
+      !is_row_contiguous_materialized(residual) ||
+      residual.shape() != out.shape() || residual.size() != out.size() ||
+      (residual.size() % 2) != 0) {
+    return false;
+  }
+  const int64_t k = inputs[0].shape(-1);
+  if (k <= 0 || group_size <= 0) {
+    return false;
+  }
+  const int64_t groups_per_col = k / group_size;
+  if (groups_per_col != 16 && groups_per_col != 24) {
+    return false;
+  }
+  const int64_t rows = static_cast<int64_t>(
+      inputs[0].size() / static_cast<size_t>(k));
+  return rows > 1 && rows <= 16;
+}
+
 inline bool dispatch_native_qmm_add_fuse_decode(
     mlx::core::Stream stream,
     const std::vector<mlx::core::array>& inputs,
@@ -2655,6 +2697,106 @@ inline bool dispatch_native_qmm_add_fuse_decode(
     return true;
   } catch (const std::exception&) {
     qmm_add_fuse_stats_record_native_fail(groups_per_col, kernel_name);
+    return false;
+  }
+}
+
+inline bool dispatch_native_qmm_add_fuse_prefill_m16(
+    mlx::core::Stream stream,
+    const std::vector<mlx::core::array>& inputs,
+    mlx::core::array& out,
+    int group_size) {
+  uint32_t groups_per_col = 0u;
+  constexpr const char* kQmmAddPrefillKernel =
+      "qmm_affine_bf16_t4_g128_m16_then_add_bf16";
+  try {
+    if (!out.data_shared_ptr()) {
+      out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+    }
+
+    auto& device = mlx::core::vulkan::device(stream.device);
+    auto& encoder = device.get_command_encoder(stream.index);
+    encoder.begin_encoding();
+
+    auto x_tensor = device.get_tensor(inputs[0]);
+    auto w_cached = get_qmm_const_tensor(inputs[1], device);
+    auto scales_cached = get_qmm_const_tensor(inputs[2], device);
+    auto biases_cached = get_qmm_const_tensor(inputs[3], device);
+    auto residual_tensor = device.get_tensor(inputs[4]);
+    auto out_tensor = device.get_tensor(out);
+
+    mlx::core::array qmm_tmp(
+        mlx::core::allocator::malloc(out.nbytes()), out.shape(), out.dtype());
+    device.add_temporary(qmm_tmp, stream.index);
+    auto qmm_tmp_tensor = device.get_tensor(qmm_tmp);
+
+    std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+    if (device.tensor_needs_sync_device(inputs[0])) {
+      sync_tensors.push_back(x_tensor);
+    }
+    if (w_cached.needs_sync) {
+      sync_tensors.push_back(w_cached.tensor);
+    }
+    if (scales_cached.needs_sync) {
+      sync_tensors.push_back(scales_cached.tensor);
+    }
+    if (biases_cached.needs_sync) {
+      sync_tensors.push_back(biases_cached.tensor);
+    }
+    if (device.tensor_needs_sync_device(inputs[4])) {
+      sync_tensors.push_back(residual_tensor);
+    }
+    if (!sync_tensors.empty()) {
+      encoder.record_tensor_sync_device(sync_tensors);
+    }
+    if (w_cached.cacheable && w_cached.needs_sync) {
+      mark_qmm_const_tensor_uploaded(w_cached.key);
+    }
+    if (scales_cached.cacheable && scales_cached.needs_sync) {
+      mark_qmm_const_tensor_uploaded(scales_cached.key);
+    }
+    if (biases_cached.cacheable && biases_cached.needs_sync) {
+      mark_qmm_const_tensor_uploaded(biases_cached.key);
+    }
+
+    const uint32_t out_elems = static_cast<uint32_t>(out.size());
+    const uint32_t out_words = (out_elems + 1u) / 2u;
+    const uint32_t n = static_cast<uint32_t>(out.shape(-1));
+    const uint32_t k = static_cast<uint32_t>(inputs[0].shape(-1));
+    groups_per_col = static_cast<uint32_t>(
+        k / static_cast<uint32_t>(group_size));
+    const uint32_t w_words_per_col = static_cast<uint32_t>(inputs[1].shape(-1));
+    const uint32_t qmm_groups_x = std::max<uint32_t>(1u, (out_words + 63u) / 64u);
+    const uint32_t add_groups_x = std::max<uint32_t>(1u, (out_words + 255u) / 256u);
+
+    const std::vector<uint32_t> qmm_push_consts{
+        encode_push_constant_u32(out_elems),
+        encode_push_constant_u32(n),
+        encode_push_constant_u32(k),
+        encode_push_constant_u32(groups_per_col),
+        encode_push_constant_u32(w_words_per_col)};
+    encoder.record_algo_dispatch(
+        mlx::core::vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M16,
+        {x_tensor,
+         w_cached.tensor,
+         scales_cached.tensor,
+         biases_cached.tensor,
+         qmm_tmp_tensor},
+        {qmm_groups_x, 1, 1},
+        qmm_push_consts);
+
+    const std::vector<uint32_t> add_push_consts{encode_push_constant_u32(out_elems)};
+    encoder.record_algo_dispatch(
+        mlx::core::vulkan::KernelRegistry::ADD_BF16,
+        {qmm_tmp_tensor, residual_tensor, out_tensor},
+        {add_groups_x, 1, 1},
+        add_push_consts);
+
+    qmm_add_fuse_stats_record_native_success(groups_per_col, kQmmAddPrefillKernel);
+    device.mark_tensor_host_dirty(out, stream.index);
+    return true;
+  } catch (const std::exception&) {
+    qmm_add_fuse_stats_record_native_fail(groups_per_col, kQmmAddPrefillKernel);
     return false;
   }
 }
@@ -3601,20 +3743,33 @@ void QuantizedMatmulAdd::eval_gpu(
     qmm_add_fuse_stats_record_fallback("gate_off");
   }
 
-  const bool can_use = gate_on && can_use_native_qmm_add_fuse_decode(
+  const bool can_use_decode = gate_on && can_use_native_qmm_add_fuse_decode(
       inputs, out, group_size_, bits_, transpose_, mode_);
-  if (gate_on && !can_use) {
+  const bool can_use_prefill_m16 =
+      gate_on && native_qmm_add_fuse_prefill_m16_enabled() &&
+      can_use_native_qmm_add_fuse_prefill_m16(
+          inputs, out, group_size_, bits_, transpose_, mode_);
+  if (gate_on && !can_use_decode && !can_use_prefill_m16) {
     qmm_add_fuse_stats_record_fallback("shape_reject");
     qmm_add_fuse_stats_record_shape_reject_bucket(inputs, out, group_size_);
   }
 
-  if (can_use) {
+  if (can_use_decode) {
     prepare_inputs_for_cpu_fallback(inputs, stream);
     if (dispatch_native_qmm_add_fuse_decode(
             stream, inputs, out, group_size_)) {
       return;
     }
     qmm_add_fuse_stats_record_fallback("dispatch_fail");
+  }
+
+  if (can_use_prefill_m16) {
+    prepare_inputs_for_cpu_fallback(inputs, stream);
+    if (dispatch_native_qmm_add_fuse_prefill_m16(
+            stream, inputs, out, group_size_)) {
+      return;
+    }
+    qmm_add_fuse_stats_record_fallback("dispatch_fail_prefill_m16");
   }
 
   profile.mark_fallback();

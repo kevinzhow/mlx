@@ -16,9 +16,9 @@
 - 模型正确性：Qwen3-0.6B-MLX-4bit（EN/ZH，10 token）输出正常，无乱码/`!!!!!!!!!!` 回归。
 - 流程约束（新增）：Qwen3 `mlx_lm generate` 正确性/性能口径需串行执行；任意 C++/Vulkan/shader 变更后，Python 侧验证前必须先执行 `python3 setup.py build_ext --inplace`，避免旧扩展产物导致误判。
 - 近期吞吐（实卡 Vulkan，串行口径）：
-  - 10-token（EN）：约 `5.20~5.24 tok/s`（D-9.30 后）
-  - 40-token（EN）：约 `4.87~4.93 tok/s`（D-9.30 后）
-  - 80-token（EN）：约 `4.80 tok/s`（D-9.30 样本）
+  - 10-token（EN）：约 `5.35~5.50 tok/s`（D-9.38 后）
+  - 40-token（EN）：约 `5.00~5.02 tok/s`（D-9.38 后）
+  - 80-token（EN）：约 `4.85 tok/s`（D-9.36 样本）
 - QMM+Add 融合命中现状（D-9.34）：
   - 图侧 + Vulkan 侧已放开到 decode 主桶 `groups_per_col in {8,16,24}`（旧 `..._G8` gate 仍兼容）。
   - `MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE=1` + `MLX_VK_QMM_ADD_FUSE_STATS=1`（EN 10-token）：
@@ -47,6 +47,19 @@
     - `rows=12,n=1024,k=2048,gpc=16`: `27`
     - `rows=12,n=1024,k=3072,gpc=24`: `27`
     - 结论：`shape_reject` 全部来自 prefill `rows=12`，decode `rows=1` 路径已全量命中。
+  - D-9.38 prefill `rows=12` 路径 native 化后（EN 10-token，串行）：
+    - `MLX_VK_ENABLE_QMM_ADD_FUSE_PREFILL_M16=1`：
+      - Prompt: `16.982 tok/s`
+      - Generation: `5.502 tok/s`
+      - `final_fallbacks=0`
+    - `MLX_VK_ENABLE_QMM_ADD_FUSE_PREFILL_M16=0`：
+      - Prompt: `7.504 tok/s`
+      - Generation: `5.279 tok/s`
+      - `shape_reject=54`
+    - 结论：prefill CPU fallback 已移除，首段时延大幅下降。
+  - D-9.38 EN 40-token 对照（串行）：
+    - ON：Prompt `16.977 tok/s`，Generation `5.017 tok/s`
+    - OFF：Prompt `7.314 tok/s`，Generation `4.988 tok/s`
 - 运行时新默认（D-9.21）：
   - `MLX_VK_ENABLE_ALGO_CACHE=0`（默认 OFF）
   - 原因：当前 decode 主线算法缓存命中率为 `0`，默认关闭可减少无效 key/map 开销。
@@ -1045,6 +1058,31 @@
 - 结论：
   - 当前 `shape_reject` 完全来自 prefill `rows=12`，并非 decode `rows=1` 主热路径缺口。
   - 下一步主线应继续聚焦 decode 链路的“更大粒度融合/launch 压降”，而不是优先扩展 prefill 的 QMM+Add 形状支持。
+
+### D-9.38：QMM+Add prefill `rows<=16` Vulkan 串联路径（已完成）
+- 背景（Metal/Ollama 对照）：
+  - 在 decode 路径已全量命中的前提下，prefill 的 CPU fallback 会显著拉高首段时延。
+  - 本轮采用“先消灭 CPU 回退，再谈更深融合”的策略：用现有稳定核拼接为 Vulkan-native 路径。
+- 本轮实现：
+  - 新增 gate：`MLX_VK_ENABLE_QMM_ADD_FUSE_PREFILL_M16`（默认 ON）。
+  - `QuantizedMatmulAdd::eval_gpu` 新增 prefill 分支（`rows in (1,16] && gpc in {16,24}`）：
+    - dispatch `QMM_AFFINE_BF16_T4_G128_M16` 到临时张量
+    - 紧接 dispatch `ADD_BF16` 与 residual 融合写回 `out`
+  - 通过 `device.add_temporary(..., stream.index)` 持有中间张量生命周期，避免异步提交下 UAF 风险。
+  - `VulkanQMMAddFuseStats` 新增该路径命中键：
+    - `qmm_affine_bf16_t4_g128_m16_then_add_bf16`
+- 验证：
+  - `cmake --build build_release_vulkan --target mlx -j 8` 通过。
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3（实卡 Vulkan，串行）：
+    - EN 10-token（gate ON）：Prompt `16.982 tok/s`，Generation `5.502 tok/s`，`final_fallbacks=0`
+    - EN 10-token（gate OFF）：Prompt `7.504 tok/s`，Generation `5.279 tok/s`，`shape_reject=54`
+    - ZH 10-token：输出正常，无乱码。
+- 结论：
+  - prefill `rows=12` 回退已被 native 路径覆盖，首段时延出现显著改善。
+  - 生成阶段吞吐仅小幅变化，下一步仍应回到 decode 主线的更大粒度融合（`QMM + residual add + norm`）。
 
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
