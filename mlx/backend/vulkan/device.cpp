@@ -5,9 +5,14 @@
 #include "mlx/backend/vulkan/kernel_registry.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
+#include <mutex>
+#include <sstream>
+#include <unordered_map>
 #include <vulkan/vulkan.h>
 
 namespace mlx::core::vulkan {
@@ -104,6 +109,189 @@ inline int parse_env_int_clamped(
     return max_value;
   }
   return static_cast<int>(parsed);
+}
+
+inline size_t parse_env_size_t_clamped(
+    const char* name,
+    size_t default_value,
+    size_t min_value,
+    size_t max_value) {
+  const char* value = std::getenv(name);
+  if (!value || value[0] == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0') {
+    return default_value;
+  }
+  size_t out = static_cast<size_t>(parsed);
+  if (out < min_value) {
+    return min_value;
+  }
+  if (out > max_value) {
+    return max_value;
+  }
+  return out;
+}
+
+inline bool plan_trace_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_PLAN_TRACE");
+    if (!v || v[0] == '\0') {
+      return false;
+    }
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
+        std::strcmp(v, "off") != 0;
+  }();
+  return enabled;
+}
+
+inline bool tensor_stats_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_TENSOR_STATS");
+    if (!v || v[0] == '\0') {
+      return false;
+    }
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
+        std::strcmp(v, "off") != 0;
+  }();
+  return enabled;
+}
+
+struct PlanTraceState {
+  std::mutex mtx;
+  uint64_t commits{0};
+  std::unordered_map<std::string, uint64_t> signature_counts;
+};
+
+inline PlanTraceState& plan_trace_state() {
+  static PlanTraceState state;
+  return state;
+}
+
+inline std::string build_dispatch_signature(
+    const std::vector<std::string>& trace) {
+  uint64_t hash = 1469598103934665603ull; // FNV-1a seed
+  for (const auto& item : trace) {
+    const uint64_t item_hash = std::hash<std::string>{}(item);
+    hash ^= item_hash;
+    hash *= 1099511628211ull; // FNV-1a prime
+  }
+  std::ostringstream os;
+  os << "len=" << trace.size() << " hash=0x" << std::hex << hash;
+  return os.str();
+}
+
+inline void record_plan_trace(const std::vector<std::string>& trace) {
+  if (!plan_trace_enabled() || trace.empty()) {
+    return;
+  }
+
+  auto& state = plan_trace_state();
+  const std::string signature = build_dispatch_signature(trace);
+  uint64_t commit_index = 0;
+  uint64_t signature_count = 0;
+  size_t unique_signatures = 0;
+  {
+    std::lock_guard<std::mutex> lock(state.mtx);
+    commit_index = ++state.commits;
+    signature_count = ++state.signature_counts[signature];
+    unique_signatures = state.signature_counts.size();
+  }
+
+  if (signature_count <= 2u || (commit_index % 100u) == 0u) {
+    std::ostringstream head;
+    const size_t preview_n = std::min<size_t>(5, trace.size());
+    for (size_t i = 0; i < preview_n; ++i) {
+      if (i != 0) {
+        head << " -> ";
+      }
+      head << trace[i];
+    }
+    std::cerr << "[VulkanPlanTrace] commit=" << commit_index
+              << " " << signature
+              << " sig_count=" << signature_count
+              << " unique_sigs=" << unique_signatures
+              << " head=\"" << head.str() << "\"\n";
+  }
+}
+
+struct TensorStatsState {
+  std::atomic<uint64_t> requests{0};
+  std::atomic<uint64_t> id_hits{0};
+  std::atomic<uint64_t> storage_hits{0};
+  std::atomic<uint64_t> weak_expired{0};
+  std::atomic<uint64_t> creates{0};
+};
+
+inline TensorStatsState& tensor_stats_state() {
+  static TensorStatsState state;
+  return state;
+}
+
+inline void record_tensor_request() {
+  if (tensor_stats_enabled()) {
+    tensor_stats_state().requests.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+inline void record_tensor_id_hit() {
+  if (tensor_stats_enabled()) {
+    tensor_stats_state().id_hits.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+inline void record_tensor_storage_hit() {
+  if (tensor_stats_enabled()) {
+    tensor_stats_state().storage_hits.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+inline void record_tensor_weak_expired() {
+  if (tensor_stats_enabled()) {
+    tensor_stats_state().weak_expired.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+inline void record_tensor_create() {
+  if (tensor_stats_enabled()) {
+    tensor_stats_state().creates.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+struct TensorStatsReporter {
+  ~TensorStatsReporter() {
+    if (!tensor_stats_enabled()) {
+      return;
+    }
+    const auto& stats = tensor_stats_state();
+    const uint64_t requests = stats.requests.load(std::memory_order_relaxed);
+    if (requests == 0) {
+      return;
+    }
+    const uint64_t id_hits = stats.id_hits.load(std::memory_order_relaxed);
+    const uint64_t storage_hits =
+        stats.storage_hits.load(std::memory_order_relaxed);
+    const uint64_t weak_expired =
+        stats.weak_expired.load(std::memory_order_relaxed);
+    const uint64_t creates = stats.creates.load(std::memory_order_relaxed);
+    const uint64_t hits = id_hits + storage_hits;
+    const double hit_rate =
+        static_cast<double>(hits) / static_cast<double>(requests);
+    std::cerr << "[VulkanTensorStats] requests=" << requests
+              << " hits=" << hits
+              << " hit_rate=" << hit_rate
+              << " id_hits=" << id_hits
+              << " storage_hits=" << storage_hits
+              << " weak_expired=" << weak_expired
+              << " creates=" << creates << "\n";
+  }
+};
+
+inline TensorStatsReporter& tensor_stats_reporter() {
+  static TensorStatsReporter reporter;
+  return reporter;
 }
 
 } // namespace
@@ -250,6 +438,12 @@ void CommandEncoder::record_algo_dispatch(
   
   // Record algorithm execution
   stream_.sequence->record<kp::OpAlgoDispatch>(algo);
+  if (plan_trace_enabled()) {
+    std::ostringstream sig;
+    sig << kernel_name << "(" << workgroup[0] << "," << workgroup[1] << ","
+        << workgroup[2] << ";pcw=" << push_consts.size() << ")";
+    dispatch_trace_.push_back(sig.str());
+  }
   
   // Update tracking
   buffer_ops_++;
@@ -353,6 +547,8 @@ Device::Device() {
       "MLX_VK_MAX_MB_PER_BUFFER", max_mb_per_buffer_, 1, 4096);
   max_inflight_sequences_ = parse_env_int_clamped(
       "MLX_VK_MAX_INFLIGHT_SEQUENCES", max_inflight_sequences_, 1, 64);
+  max_retained_tensors_ = parse_env_size_t_clamped(
+      "MLX_VK_MAX_RETAINED_TENSORS", max_retained_tensors_, 0, 262144);
 
   // Create Kompute manager with default GPU
   manager_ = std::make_shared<kp::Manager>();
@@ -367,6 +563,7 @@ Device::~Device() {
   stream_map_.clear();
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
+    retained_tensor_lru_.clear();
     tensor_cache_.clear();
     tensor_storage_index_.clear();
     dirty_tensors_by_stream_.clear();
@@ -434,6 +631,7 @@ void Device::erase_tensor_entry_locked_(
   if (it == tensor_cache_.end()) {
     return;
   }
+  release_retained_tensor_locked_(it->first, it->second);
   const auto storage_key =
       TensorStorageKey{it->second.data_ptr, it->second.data_owner, it->second.dtype};
   if (it->second.host_dirty && it->second.dirty_stream_index >= 0) {
@@ -443,11 +641,63 @@ void Device::erase_tensor_entry_locked_(
   tensor_cache_.erase(it);
 }
 
+void Device::touch_retained_tensor_locked_(
+    std::uintptr_t key,
+    TensorCacheEntry& entry) {
+  if (max_retained_tensors_ == 0) {
+    release_retained_tensor_locked_(key, entry);
+    return;
+  }
+  if (!entry.retained_tensor) {
+    if (auto tensor = entry.tensor.lock()) {
+      entry.retained_tensor = std::move(tensor);
+    } else {
+      release_retained_tensor_locked_(key, entry);
+      return;
+    }
+  }
+  if (entry.retained_lru_linked) {
+    retained_tensor_lru_.erase(entry.retained_lru_it);
+  }
+  retained_tensor_lru_.push_front(key);
+  entry.retained_lru_it = retained_tensor_lru_.begin();
+  entry.retained_lru_linked = true;
+  trim_retained_tensors_locked_();
+}
+
+void Device::release_retained_tensor_locked_(
+    std::uintptr_t key,
+    TensorCacheEntry& entry) {
+  (void)key;
+  if (entry.retained_lru_linked) {
+    retained_tensor_lru_.erase(entry.retained_lru_it);
+    entry.retained_lru_linked = false;
+  }
+  entry.retained_tensor.reset();
+}
+
+void Device::trim_retained_tensors_locked_() {
+  while (retained_tensor_lru_.size() > max_retained_tensors_) {
+    const std::uintptr_t victim_key = retained_tensor_lru_.back();
+    retained_tensor_lru_.pop_back();
+    auto it = tensor_cache_.find(victim_key);
+    if (it == tensor_cache_.end()) {
+      continue;
+    }
+    it->second.retained_lru_linked = false;
+    it->second.retained_tensor.reset();
+  }
+}
+
 std::unordered_map<std::uintptr_t, Device::TensorCacheEntry>::iterator
 Device::find_tensor_entry_locked_(
     std::uintptr_t key,
     const TensorStorageKey& storage_key,
-    size_t min_elem_count) {
+    size_t min_elem_count,
+    bool* matched_via_storage) {
+  if (matched_via_storage) {
+    *matched_via_storage = false;
+  }
   auto it = tensor_cache_.find(key);
   if (it != tensor_cache_.end()) {
     if (tensor_entry_matches_request_(it->second, storage_key, min_elem_count)) {
@@ -491,10 +741,17 @@ Device::find_tensor_entry_locked_(
   if (!has_best) {
     return tensor_cache_.end();
   }
+  if (matched_via_storage) {
+    *matched_via_storage = true;
+  }
   return tensor_cache_.find(best_key);
 }
 
 std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
+  if (tensor_stats_enabled()) {
+    (void)tensor_stats_reporter();
+    record_tensor_request();
+  }
   const auto key = arr.id();
   const auto data_ptr = arr.data<void>();
   const auto nbytes = arr.nbytes();
@@ -505,11 +762,20 @@ std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
 
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-    auto it = find_tensor_entry_locked_(key, storage_key, elem_count);
+    bool matched_via_storage = false;
+    auto it = find_tensor_entry_locked_(
+        key, storage_key, elem_count, &matched_via_storage);
     if (it != tensor_cache_.end()) {
       if (auto tensor = it->second.tensor.lock()) {
+        touch_retained_tensor_locked_(it->first, it->second);
+        if (matched_via_storage) {
+          record_tensor_storage_hit();
+        } else {
+          record_tensor_id_hit();
+        }
         return tensor;
       }
+      record_tensor_weak_expired();
       erase_tensor_entry_locked_(it);
     }
   }
@@ -525,20 +791,39 @@ std::shared_ptr<kp::Tensor> Device::get_tensor(const array& arr) {
       static_cast<uint32_t>(elem_count),
       static_cast<uint32_t>(arr.itemsize()),
       to_kompute_dtype(dtype));
+  record_tensor_create();
 
   {
     std::lock_guard<std::mutex> lock(tensor_cache_mutex_);
-    tensor_cache_[key] = TensorCacheEntry{
-        tensor,
-        nullptr,
-        data_ref,
-        data_ptr,
-        data_ref.get(),
-        nbytes,
-        elem_count,
-        dtype,
-        false,
-        -1};
+    auto [it, inserted] = tensor_cache_.emplace(key, TensorCacheEntry{});
+    auto& entry = it->second;
+    if (!inserted) {
+      const auto old_storage_key =
+          TensorStorageKey{entry.data_ptr, entry.data_owner, entry.dtype};
+      if (entry.data_ptr != storage_key.data_ptr ||
+          entry.data_owner != storage_key.data_owner ||
+          entry.dtype != storage_key.dtype) {
+        remove_tensor_index_locked_(old_storage_key, key);
+      }
+      release_retained_tensor_locked_(key, entry);
+    }
+    entry.tensor = tensor;
+    entry.pinned_tensor.reset();
+    entry.data_ref = data_ref;
+    entry.data_ptr = data_ptr;
+    entry.data_owner = data_ref.get();
+    entry.nbytes = nbytes;
+    entry.elem_count = elem_count;
+    entry.dtype = dtype;
+    entry.host_dirty = false;
+    entry.dirty_stream_index = -1;
+    entry.retained_lru_linked = false;
+    if (max_retained_tensors_ > 0) {
+      entry.retained_tensor = tensor;
+      touch_retained_tensor_locked_(it->first, entry);
+    } else {
+      entry.retained_tensor.reset();
+    }
     add_tensor_index_locked_(storage_key, key);
   }
 
@@ -793,6 +1078,7 @@ void Device::commit_command_buffer(int index) {
   // End encoding if active
   if (stream.encoder) {
     stream.encoder->end_encoding();
+    record_plan_trace(stream.encoder->dispatch_trace());
     stream.encoder.reset();
   }
   
@@ -831,7 +1117,6 @@ void Device::end_encoding(int index) {
   DeviceStream& stream = get_stream_(index);
   if (stream.encoder) {
     stream.encoder->end_encoding();
-    stream.encoder.reset();
   }
 }
 

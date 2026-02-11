@@ -1165,6 +1165,57 @@
   - 即便改为强引用 LRU，当前 decode 链路仍是“零命中”，根因不是引用生命周期，而是“tensor identity 高速变化导致 key 不复用”。
   - 这进一步确认主线应转向：**decode 持久化执行计划 / 稳定中间张量身份 / launch 数压降**，而不是继续在现有 key 模型上调 cache 策略。
 
+### D-9.42：Algorithm cache key 去 push-value 化实验（已完成，已回退）
+- 背景（对标 Metal/Ollama）：
+  - 目标是验证“同一 tensor 绑定下仅 push constants 数值变化”是否阻碍复用；若成立，可通过 `OpAlgoDispatch` 的动态 push 覆盖提升命中。
+- 本轮实验实现（临时分支）：
+  - cache key 从“push constants 全值”改为仅包含 push constants 长度（`pc_words`）。
+  - `record_algo_dispatch` 改为每次通过 `OpAlgoDispatch(..., push_consts)` 传入本次 push 值。
+- 实测（Qwen3 EN 40-token，实卡 Vulkan，串行）：
+  - `MLX_VK_ENABLE_ALGO_CACHE=1 MLX_VK_ENABLE_ALGO_CACHE_AUTO_DISABLE=0 MLX_VK_ALGO_STATS=1`：
+    - `requests=17931, cache_hits=0, cache_misses=17931`
+    - Generation：`1.175 tok/s`（显著回退）
+  - cache OFF 口径未见命中改善收益（Generation 约 `4.97 tok/s`）。
+- 结论：
+  - 当前主线瓶颈不是 push-value 维度，而是 tensor identity 本身不可复用；
+  - 该改动已回退，避免在默认路径引入额外 host 开销与行为风险；
+- 后续不再继续细调 algorithm cache key，转入 decode 持久化执行计划与 launch 压降主线。
+
+### D-9.43：decode 执行计划签名追踪（已完成）
+- 背景（对标 Metal/Ollama）：
+  - Metal/Ollama 的 decode 高吞吐路线都依赖“稳定重复执行图 + 低 host 编排开销”。
+  - 在进入持久化 decode plan 实装前，先验证当前 Vulkan token-step 是否已具备稳定重复签名。
+- 本轮实现：
+  - 新增 `MLX_VK_PLAN_TRACE=1`：
+    - 在 `CommandEncoder` 记录 dispatch 序列签名（kernel/workgroup/push-word-count）。
+    - 在 `commit_command_buffer` 汇总签名 hash、长度、重复次数并打印前缀序列。
+  - 修正生命周期问题：`end_encoding()` 不再提前 reset encoder，确保 commit 阶段可读取完整 trace。
+- 观测（Qwen3 EN 10-token）：
+  - 命中“少量固定签名高频重复”（`unique_sigs` 维持低位，主签名重复计数快速增长）。
+  - 说明 decode step 的执行图稳定，可进入“持久化执行计划”实装阶段。
+- 结论：
+  - 该追踪结果直接支持 A1.5/A1.6：下一步不是继续微调单核，而是把高频签名提升为可复用 decode plan。
+
+### D-9.44：Tensor identity 可观测性 + 强保活实验（已完成，实验默认关闭）
+- 背景（对标 Metal/Ollama）：
+  - 既然 algorithm cache 0 命中，需要先确认是否存在 Tensor 对象生命周期抖动导致的 host 重建成本。
+- 本轮实现：
+  - 新增 `MLX_VK_TENSOR_STATS=1`：
+    - 统计 `requests/id_hits/storage_hits/weak_expired/creates`，进程退出打印。
+  - 新增强保活实验开关：
+    - `MLX_VK_MAX_RETAINED_TENSORS`（默认 `0`，即关闭）
+    - 非零时启用 Tensor 强引用 LRU（实验路径）。
+- 观测（Qwen3 EN 40-token，实卡 Vulkan，串行）：
+  - 默认（`MLX_VK_MAX_RETAINED_TENSORS=0`）：
+    - `Generation: 5.093 tok/s`
+    - `TensorStats`: `requests=48902, hits=18969 (38.8%), weak_expired=7035, creates=29933`
+  - 强保活实验（`MLX_VK_MAX_RETAINED_TENSORS=8192`）：
+    - `Generation: ~1.44 tok/s`（显著回退）
+    - `TensorStats`: 命中率上升到 `~53%`，但吞吐严重下降。
+- 结论：
+  - “全局 Tensor 强保活”会引入新的主线回退，不进入默认路径。
+  - 但统计结果确认：Tensor 创建/失活开销确实高，后续需要“局部、结构化”的稳定 identity 策略（面向 decode plan 固定中间态），而不是全局保活。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`g8_x2` A1-Phase1 与 A1.2 重排均未形成稳定收益，后续需转向更深层内核重构（数据布局 + 中间态组织）。
@@ -1172,6 +1223,8 @@
 2. 高频 decode 核的 dispatch/创建开销  
 - D-9.21 已证明旧 algorithm cache 对主线为 0 命中并已默认关闭。
 - D-9.22 已完成“提交异步化 + inflight 窗口”但收益有限；下一阶段需继续减少 `manager.algorithm`/`OpAlgoDispatch` 总次数（链路融合/dispatch 合并）。
+- D-9.42 进一步确认“push-value 去 key 化”也无法抬升命中，且在 cache ON 下可引入显著回退；algorithm cache 微调路线终止。
+- D-9.44 进一步确认 Tensor 侧存在高创建/高失活现象（40-token 样本 `creates=29933`，`weak_expired=7035`），但“全局强保活”会显著回退；后续需转向 decode-plan 局部稳定化策略。
 - D-9.28 已验证 `add+rmsnorm` 小粒度融合本身不足以带来稳定吞吐提升，后续需转向更大粒度热链路重构。
 - D-9.34 已将 QMM+Add decode 融合切入默认路径（40-token 约 `+3.9%`），但距目标仍远；下一阶段瓶颈依旧是“launch 总量 + 主核 epilogue 融合深度”。
 - D-9.35 统计显示当前 fused fallback 主因已收敛到 `shape_reject`（10-token 样本 54 次），下一阶段应优先覆盖该高频形态而不是继续加门禁。
@@ -1205,6 +1258,11 @@
 2. 架构主线 B：decode 链路融合/提交模型升级  
 - 对标 Metal command-buffer 与 Ollama 持续化 decode 路线，减少 token-step 内 kernel 启动碎片。
 - 目标：把“多小核串联”改造成“少核高负载”执行图，优先处理 QMM->RMSNorm->RoPE->SDPA 热链路。
+- B1（新增明确入口）：
+  - 基于 D-9.43 主签名，先实现“单签名 decode-plan 缓存”最小闭环：
+    - 仅覆盖 `rows=1` decode 主桶；
+    - 预创建并复用固定 dispatch 列表与参数槽位；
+    - 先压低 host 侧每 token 的 `record_algo_dispatch` 编排成本，再扩展到多签名。
 
 3. 架构主线 C：SDPA decode 核形态升级（并行）  
 - 在保持正确性的前提下，推进 `k=33~128` 及更长上下文路径的核重构与中间结果压缩，避免 stage1/reduce 过碎调度。

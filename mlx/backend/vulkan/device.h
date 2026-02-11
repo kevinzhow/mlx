@@ -5,6 +5,7 @@
 
 #include <kompute/Kompute.hpp>
 #include <deque>
+#include <list>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -64,6 +65,9 @@ struct MLX_API CommandEncoder {
   std::unordered_set<const void*>& inputs() { return all_inputs_; }
   std::unordered_set<const void*>& outputs() { return all_outputs_; }
   int buffer_ops() const { return buffer_ops_; }
+  const std::vector<std::string>& dispatch_trace() const {
+    return dispatch_trace_;
+  }
 
   // Begin/End encoding
   void begin_encoding();
@@ -80,6 +84,7 @@ struct MLX_API CommandEncoder {
   std::unordered_set<std::shared_ptr<kp::Tensor>> next_outputs_;
   std::unordered_set<const void*> all_inputs_;
   std::unordered_set<const void*> all_outputs_;
+  std::vector<std::string> dispatch_trace_;
   
   // Track if encoding has begun
   bool encoding_begun_{false};
@@ -227,7 +232,8 @@ class MLX_API Device {
   find_tensor_entry_locked_(
       std::uintptr_t key,
       const TensorStorageKey& storage_key,
-      size_t min_elem_count);
+      size_t min_elem_count,
+      bool* matched_via_storage = nullptr);
   void add_tensor_index_locked_(
       const TensorStorageKey& storage_key,
       std::uintptr_t key);
@@ -236,6 +242,13 @@ class MLX_API Device {
       std::uintptr_t key);
   void erase_tensor_entry_locked_(
       std::unordered_map<std::uintptr_t, TensorCacheEntry>::iterator it);
+  void touch_retained_tensor_locked_(
+      std::uintptr_t key,
+      TensorCacheEntry& entry);
+  void release_retained_tensor_locked_(
+      std::uintptr_t key,
+      TensorCacheEntry& entry);
+  void trim_retained_tensors_locked_();
 
   DeviceStream& get_stream_(int index);
   void await_inflight_sequences_(DeviceStream& stream, size_t keep_pending);
@@ -256,6 +269,9 @@ class MLX_API Device {
 
   struct TensorCacheEntry {
     std::weak_ptr<kp::Tensor> tensor;
+    std::shared_ptr<kp::Tensor> retained_tensor;
+    std::list<std::uintptr_t>::iterator retained_lru_it;
+    bool retained_lru_linked{false};
     std::shared_ptr<kp::Tensor> pinned_tensor;
     std::weak_ptr<array::Data> data_ref;
     const void* data_ptr{nullptr};
@@ -278,12 +294,14 @@ class MLX_API Device {
       TensorStorageKeyHash,
       TensorStorageKeyEq>
       tensor_storage_index_;
+  std::list<std::uintptr_t> retained_tensor_lru_;
   std::unordered_map<int, DirtyTensorTracker> dirty_tensors_by_stream_;
   
   // Configuration
   int max_ops_per_buffer_ = 100;
   int max_mb_per_buffer_ = 50;
   int max_inflight_sequences_ = 8;
+  size_t max_retained_tensors_ = 0;
   
   // Buffer manager reference
   bool initialized_buffer_manager_ = false;
