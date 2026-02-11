@@ -1753,16 +1753,62 @@ inline bool native_qmm_add_fuse_decode_g24_x2_enabled() {
   return enabled;
 }
 
+inline std::atomic<bool>& native_rmsnorm_subgroup_runtime_disabled() {
+  static std::atomic<bool> disabled{false};
+  return disabled;
+}
+
+inline std::atomic<bool>& native_add_rmsnorm_subgroup_runtime_disabled() {
+  static std::atomic<bool> disabled{false};
+  return disabled;
+}
+
 inline bool native_rmsnorm_enabled() {
   static const bool enabled =
       env_flag_default_true("MLX_VK_ENABLE_RMSNORM_NATIVE");
   return enabled;
 }
 
+inline bool native_rmsnorm_subgroup_enabled() {
+  static const bool enabled =
+      env_flag_default_false("MLX_VK_ENABLE_RMSNORM_SUBGROUP");
+  return enabled &&
+      !native_rmsnorm_subgroup_runtime_disabled().load(
+          std::memory_order_relaxed);
+}
+
 inline bool native_add_rmsnorm_enabled() {
   static const bool enabled =
       env_flag_default_false("MLX_VK_ENABLE_ADD_RMSNORM_NATIVE");
   return enabled;
+}
+
+inline bool native_add_rmsnorm_subgroup_enabled() {
+  static const bool enabled =
+      env_flag_default_false("MLX_VK_ENABLE_ADD_RMSNORM_SUBGROUP");
+  return enabled &&
+      !native_add_rmsnorm_subgroup_runtime_disabled().load(
+          std::memory_order_relaxed);
+}
+
+inline void disable_native_rmsnorm_subgroup_runtime() {
+  auto& disabled = native_rmsnorm_subgroup_runtime_disabled();
+  bool expected = false;
+  if (disabled.compare_exchange_strong(
+          expected, true, std::memory_order_relaxed)) {
+    std::cerr << "[VulkanRMSNorm] disable subgroup path after dispatch "
+                 "failure\n";
+  }
+}
+
+inline void disable_native_add_rmsnorm_subgroup_runtime() {
+  auto& disabled = native_add_rmsnorm_subgroup_runtime_disabled();
+  bool expected = false;
+  if (disabled.compare_exchange_strong(
+          expected, true, std::memory_order_relaxed)) {
+    std::cerr << "[VulkanRMSNorm] disable add_subgroup path after dispatch "
+                 "failure\n";
+  }
 }
 
 inline bool native_rope_enabled() {
@@ -4452,95 +4498,123 @@ void fast::RMSNorm::eval_gpu(
   uint32_t w_stride = 0;
   if (native_add_rmsnorm_enabled() && can_use_native_add_rmsnorm_bf16(
           inputs, outputs, n_rows, axis_size, w_stride)) {
-    try {
-      auto& out = outputs[0];
-      if (!out.data_shared_ptr()) {
-        out.set_data(allocator::malloc(out.nbytes()));
-      }
+    auto try_dispatch_kernel = [&](const char* kernel_name) -> bool {
+      try {
+        auto& out = outputs[0];
+        if (!out.data_shared_ptr()) {
+          out.set_data(allocator::malloc(out.nbytes()));
+        }
 
-      auto& device = vulkan::device(stream.device);
-      auto& encoder = device.get_command_encoder(stream.index);
-      encoder.begin_encoding();
+        auto& device = vulkan::device(stream.device);
+        auto& encoder = device.get_command_encoder(stream.index);
+        encoder.begin_encoding();
 
-      auto a_tensor = device.get_tensor(inputs[0]);
-      auto b_tensor = device.get_tensor(inputs[1]);
-      auto w_tensor = device.get_tensor(inputs[2]);
-      auto out_tensor = device.get_tensor(out);
+        auto a_tensor = device.get_tensor(inputs[0]);
+        auto b_tensor = device.get_tensor(inputs[1]);
+        auto w_tensor = device.get_tensor(inputs[2]);
+        auto out_tensor = device.get_tensor(out);
 
-      const std::vector<uint32_t> push_consts{
-          encode_push_constant_u32(n_rows),
-          encode_push_constant_u32(axis_size),
-          encode_push_constant_u32(w_stride),
-          encode_push_constant_f32(eps_)};
+        const std::vector<uint32_t> push_consts{
+            encode_push_constant_u32(n_rows),
+            encode_push_constant_u32(axis_size),
+            encode_push_constant_u32(w_stride),
+            encode_push_constant_f32(eps_)};
 
-      // Output tensor is write-only in this dispatch.
-      std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
-      if (device.tensor_needs_sync_device(inputs[0])) {
-        sync_tensors.push_back(a_tensor);
+        // Output tensor is write-only in this dispatch.
+        std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+        if (device.tensor_needs_sync_device(inputs[0])) {
+          sync_tensors.push_back(a_tensor);
+        }
+        if (device.tensor_needs_sync_device(inputs[1])) {
+          sync_tensors.push_back(b_tensor);
+        }
+        if (device.tensor_needs_sync_device(inputs[2])) {
+          sync_tensors.push_back(w_tensor);
+        }
+        if (!sync_tensors.empty()) {
+          encoder.record_tensor_sync_device(sync_tensors);
+        }
+        encoder.record_algo_dispatch(
+            kernel_name,
+            {a_tensor, b_tensor, w_tensor, out_tensor},
+            {n_rows, 1, 1},
+            push_consts);
+        device.mark_tensor_host_dirty(out, stream.index);
+        return true;
+      } catch (const std::exception&) {
+        return false;
       }
-      if (device.tensor_needs_sync_device(inputs[1])) {
-        sync_tensors.push_back(b_tensor);
-      }
-      if (device.tensor_needs_sync_device(inputs[2])) {
-        sync_tensors.push_back(w_tensor);
-      }
-      if (!sync_tensors.empty()) {
-        encoder.record_tensor_sync_device(sync_tensors);
-      }
-      encoder.record_algo_dispatch(
-          vulkan::KernelRegistry::ADD_RMSNORM_BF16,
-          {a_tensor, b_tensor, w_tensor, out_tensor},
-          {n_rows, 1, 1},
-          push_consts);
-      device.mark_tensor_host_dirty(out, stream.index);
+    };
+
+    const bool try_subgroup = native_add_rmsnorm_subgroup_enabled();
+    if (try_subgroup && try_dispatch_kernel(
+                             vulkan::KernelRegistry::ADD_RMSNORM_BF16_SUBGROUP)) {
       return;
-    } catch (const std::exception&) {
-      // Fall through to non-fused native/fallback paths.
+    }
+    if (try_subgroup) {
+      disable_native_add_rmsnorm_subgroup_runtime();
+    }
+    if (try_dispatch_kernel(vulkan::KernelRegistry::ADD_RMSNORM_BF16)) {
+      return;
     }
   }
 
   if (native_rmsnorm_enabled() && can_use_native_rmsnorm_bf16(
           inputs, outputs, n_rows, axis_size, w_stride)) {
-    try {
-      auto& out = outputs[0];
-      if (!out.data_shared_ptr()) {
-        out.set_data(allocator::malloc(out.nbytes()));
-      }
+    auto try_dispatch_kernel = [&](const char* kernel_name) -> bool {
+      try {
+        auto& out = outputs[0];
+        if (!out.data_shared_ptr()) {
+          out.set_data(allocator::malloc(out.nbytes()));
+        }
 
-      auto& device = vulkan::device(stream.device);
-      auto& encoder = device.get_command_encoder(stream.index);
-      encoder.begin_encoding();
+        auto& device = vulkan::device(stream.device);
+        auto& encoder = device.get_command_encoder(stream.index);
+        encoder.begin_encoding();
 
-      auto x_tensor = device.get_tensor(inputs[0]);
-      auto w_tensor = device.get_tensor(inputs[1]);
-      auto out_tensor = device.get_tensor(out);
+        auto x_tensor = device.get_tensor(inputs[0]);
+        auto w_tensor = device.get_tensor(inputs[1]);
+        auto out_tensor = device.get_tensor(out);
 
-      const std::vector<uint32_t> push_consts{
-          encode_push_constant_u32(n_rows),
-          encode_push_constant_u32(axis_size),
-          encode_push_constant_u32(w_stride),
-          encode_push_constant_f32(eps_)};
+        const std::vector<uint32_t> push_consts{
+            encode_push_constant_u32(n_rows),
+            encode_push_constant_u32(axis_size),
+            encode_push_constant_u32(w_stride),
+            encode_push_constant_f32(eps_)};
 
-      // Output tensor is write-only in this dispatch.
-      std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
-      if (device.tensor_needs_sync_device(inputs[0])) {
-        sync_tensors.push_back(x_tensor);
+        // Output tensor is write-only in this dispatch.
+        std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+        if (device.tensor_needs_sync_device(inputs[0])) {
+          sync_tensors.push_back(x_tensor);
+        }
+        if (device.tensor_needs_sync_device(inputs[1])) {
+          sync_tensors.push_back(w_tensor);
+        }
+        if (!sync_tensors.empty()) {
+          encoder.record_tensor_sync_device(sync_tensors);
+        }
+        encoder.record_algo_dispatch(
+            kernel_name,
+            {x_tensor, w_tensor, out_tensor},
+            {n_rows, 1, 1},
+            push_consts);
+        device.mark_tensor_host_dirty(out, stream.index);
+        return true;
+      } catch (const std::exception&) {
+        return false;
       }
-      if (device.tensor_needs_sync_device(inputs[1])) {
-        sync_tensors.push_back(w_tensor);
-      }
-      if (!sync_tensors.empty()) {
-        encoder.record_tensor_sync_device(sync_tensors);
-      }
-      encoder.record_algo_dispatch(
-          vulkan::KernelRegistry::RMSNORM_BF16,
-          {x_tensor, w_tensor, out_tensor},
-          {n_rows, 1, 1},
-          push_consts);
-      device.mark_tensor_host_dirty(out, stream.index);
+    };
+
+    const bool try_subgroup = native_rmsnorm_subgroup_enabled();
+    if (try_subgroup &&
+        try_dispatch_kernel(vulkan::KernelRegistry::RMSNORM_BF16_SUBGROUP)) {
       return;
-    } catch (const std::exception&) {
-      // Fall through to fallback path.
+    }
+    if (try_subgroup) {
+      disable_native_rmsnorm_subgroup_runtime();
+    }
+    if (try_dispatch_kernel(vulkan::KernelRegistry::RMSNORM_BF16)) {
+      return;
     }
   }
 

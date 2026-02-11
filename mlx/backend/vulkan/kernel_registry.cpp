@@ -16,6 +16,7 @@
 #include "shaders/add_spv.h"
 #include "shaders/add_bf16_spv.h"
 #include "shaders/add_rmsnorm_bf16_spv.h"
+#include "shaders/add_rmsnorm_bf16_subgroup_spv.h"
 #include "shaders/add_bf16_scalar_spv.h"
 #include "shaders/add_bf16_bcast_spv.h"
 #include "shaders/mul_bf16_spv.h"
@@ -57,6 +58,7 @@
 #include "shaders/qmm_affine_bf16_t4_g128_m4_spv.h"
 #include "shaders/qmm_affine_bf16_t4_g128_m8_spv.h"
 #include "shaders/rmsnorm_bf16_spv.h"
+#include "shaders/rmsnorm_bf16_subgroup_spv.h"
 #include "shaders/rope_bf16_t1_spv.h"
 #include "shaders/rope_bf16_freqs_spv.h"
 #include "shaders/sdpa_bf16_decode_q1_spv.h"
@@ -279,6 +281,8 @@ const char* KernelRegistry::ADD_F32 = "add_f32";
 const char* KernelRegistry::ADD_F16 = "add_f16";
 const char* KernelRegistry::ADD_BF16 = "add_bf16";
 const char* KernelRegistry::ADD_RMSNORM_BF16 = "add_rmsnorm_bf16";
+const char* KernelRegistry::ADD_RMSNORM_BF16_SUBGROUP =
+    "add_rmsnorm_bf16_subgroup";
 const char* KernelRegistry::ADD_BF16_SCALAR = "add_bf16_scalar";
 const char* KernelRegistry::ADD_BF16_BCAST = "add_bf16_bcast";
 const char* KernelRegistry::MUL_F32 = "mul_f32";
@@ -346,6 +350,8 @@ const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M4 =
 const char* KernelRegistry::QMM_AFFINE_BF16_T4_G128_M8 =
     "qmm_affine_bf16_t4_g128_m8";
 const char* KernelRegistry::RMSNORM_BF16 = "rmsnorm_bf16";
+const char* KernelRegistry::RMSNORM_BF16_SUBGROUP =
+    "rmsnorm_bf16_subgroup";
 const char* KernelRegistry::ROPE_BF16_T1 = "rope_bf16_t1";
 const char* KernelRegistry::ROPE_BF16_FREQS = "rope_bf16_freqs";
 const char* KernelRegistry::SDPA_BF16_DECODE_Q1 = "sdpa_bf16_decode_q1";
@@ -403,6 +409,14 @@ void KernelRegistry::register_builtin_shaders() {
       add_rmsnorm_bf16_spv,
       add_rmsnorm_bf16_spv_len);
   shaders_[ADD_RMSNORM_BF16] = std::move(add_rmsnorm_bf16_spirv);
+  std::vector<uint32_t> add_rmsnorm_bf16_subgroup_spirv(
+      (add_rmsnorm_bf16_subgroup_spv_len + 3) / 4);
+  std::memcpy(
+      add_rmsnorm_bf16_subgroup_spirv.data(),
+      add_rmsnorm_bf16_subgroup_spv,
+      add_rmsnorm_bf16_subgroup_spv_len);
+  shaders_[ADD_RMSNORM_BF16_SUBGROUP] =
+      std::move(add_rmsnorm_bf16_subgroup_spirv);
   std::vector<uint32_t> add_bf16_scalar_spirv(
       (add_bf16_scalar_spv_len + 3) / 4);
   std::memcpy(
@@ -696,6 +710,13 @@ void KernelRegistry::register_builtin_shaders() {
   std::vector<uint32_t> rmsnorm_spirv((rmsnorm_bf16_spv_len + 3) / 4);
   std::memcpy(rmsnorm_spirv.data(), rmsnorm_bf16_spv, rmsnorm_bf16_spv_len);
   shaders_[RMSNORM_BF16] = std::move(rmsnorm_spirv);
+  std::vector<uint32_t> rmsnorm_subgroup_spirv(
+      (rmsnorm_bf16_subgroup_spv_len + 3) / 4);
+  std::memcpy(
+      rmsnorm_subgroup_spirv.data(),
+      rmsnorm_bf16_subgroup_spv,
+      rmsnorm_bf16_subgroup_spv_len);
+  shaders_[RMSNORM_BF16_SUBGROUP] = std::move(rmsnorm_subgroup_spirv);
 
   std::vector<uint32_t> rope_spirv((rope_bf16_t1_spv_len + 3) / 4);
   std::memcpy(rope_spirv.data(), rope_bf16_t1_spv, rope_bf16_t1_spv_len);

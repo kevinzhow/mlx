@@ -1,0 +1,107 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuffer {
+  uint words[];
+} x_buffer;
+
+layout(set = 0, binding = 1) readonly buffer WBuffer {
+  uint words[];
+} w_buffer;
+
+layout(set = 0, binding = 2) writeonly buffer OutBuffer {
+  uint words[];
+} out_buffer;
+
+layout(push_constant) uniform PushConstants {
+  uint n_rows;
+  uint axis_size;
+  uint w_stride;
+  float eps;
+} params;
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float load_bf16(uint packed, uint elem_idx) {
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float load_x_elem(uint elem_idx) {
+  return load_bf16(x_buffer.words[elem_idx >> 1u], elem_idx);
+}
+
+float load_w_elem(uint elem_idx) {
+  return load_bf16(w_buffer.words[elem_idx >> 1u], elem_idx);
+}
+
+shared float subgroup_sums[128];
+shared float shared_inv;
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+  if (row >= params.n_rows) {
+    return;
+  }
+
+  uint row_elem_base = row * params.axis_size;
+  uint row_word_base = row_elem_base >> 1u;
+  uint axis_words = params.axis_size >> 1u;
+
+  float sumsq = 0.0f;
+  for (uint wi = lane; wi < axis_words; wi += gl_WorkGroupSize.x) {
+    uint x_word = x_buffer.words[row_word_base + wi];
+    float x0 = load_bf16(x_word, 0u);
+    float x1 = load_bf16(x_word, 1u);
+    sumsq += x0 * x0 + x1 * x1;
+  }
+
+  float subgroup_sum = subgroupAdd(sumsq);
+  if (gl_SubgroupInvocationID == 0u) {
+    subgroup_sums[gl_SubgroupID] = subgroup_sum;
+  }
+  barrier();
+
+  if (gl_SubgroupID == 0u) {
+    float seed = (lane < gl_NumSubgroups) ? subgroup_sums[lane] : 0.0;
+    float total = subgroupAdd(seed);
+    if (gl_SubgroupInvocationID == 0u) {
+      shared_inv = inversesqrt((total / float(params.axis_size)) + params.eps);
+    }
+  }
+  barrier();
+
+  float inv = shared_inv;
+
+  for (uint wi = lane; wi < axis_words; wi += gl_WorkGroupSize.x) {
+    uint elem0 = row_elem_base + wi * 2u;
+    uint elem1 = elem0 + 1u;
+
+    float x0 = load_x_elem(elem0);
+    float x1 = load_x_elem(elem1);
+
+    uint widx0 = (params.w_stride == 0u) ? 0u : wi * 2u;
+    uint widx1 = (params.w_stride == 0u) ? 0u : (wi * 2u + 1u);
+
+    float w0 = load_w_elem(widx0);
+    float w1 = load_w_elem(widx1);
+
+    uint out_word = (f32_to_bf16(x0 * inv * w0) & 0xFFFFu) |
+        ((f32_to_bf16(x1 * inv * w1) & 0xFFFFu) << 16u);
+    out_buffer.words[row_word_base + wi] = out_word;
+  }
+}

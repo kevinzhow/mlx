@@ -127,7 +127,9 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_QMM_NATIVE_M4=1` (default ON, small-batch `rows==4` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M8=1` (default ON, small-batch `rows==8` 专核路径)
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=1` (default ON)
+  - `MLX_VK_ENABLE_RMSNORM_SUBGROUP=0` (default OFF, `rmsnorm_bf16_subgroup` 实验路径；当前未观察到稳定>2%收益)
   - `MLX_VK_ENABLE_ADD_RMSNORM_NATIVE=0` (default OFF, `add + RMSNorm` 融合实验路径；当前默认关闭以避免不稳定收益)
+  - `MLX_VK_ENABLE_ADD_RMSNORM_SUBGROUP=0` (default OFF, `add_rmsnorm_bf16_subgroup` 实验路径；仅在显式开启 `ADD_RMSNORM_NATIVE` 时生效)
   - `MLX_VK_ENABLE_ROPE_NATIVE=1` (default ON)
   - `MLX_VK_ENABLE_ROPE_HS_TRANSPOSED=1` (default ON, 允许 RoPE 读取 head/seq 转置输入布局)
   - `MLX_VK_ENABLE_SDPA_NATIVE=1` (default ON, still narrow gate in code)
@@ -204,7 +206,9 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_QMM_NATIVE_M4=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M8=0|1`
   - `MLX_VK_ENABLE_RMSNORM_NATIVE=0|1`
+  - `MLX_VK_ENABLE_RMSNORM_SUBGROUP=0|1`
   - `MLX_VK_ENABLE_ADD_RMSNORM_NATIVE=0|1`
+  - `MLX_VK_ENABLE_ADD_RMSNORM_SUBGROUP=0|1`
   - `MLX_VK_ENABLE_ROPE_NATIVE=0|1`
   - `MLX_VK_ENABLE_ROPE_HS_TRANSPOSED=0|1`
   - `MLX_VK_ENABLE_SDPA_NATIVE=0|1`

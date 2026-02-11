@@ -52,6 +52,7 @@ class KernelRegistry {
   static const char* ADD_F16;
   static const char* ADD_BF16;
   static const char* ADD_RMSNORM_BF16;
+  static const char* ADD_RMSNORM_BF16_SUBGROUP;
   static const char* ADD_BF16_SCALAR;
   static const char* ADD_BF16_BCAST;
   static const char* MUL_F32;
@@ -95,6 +96,7 @@ class KernelRegistry {
   static const char* QMM_AFFINE_BF16_T4_G128_M4;
   static const char* QMM_AFFINE_BF16_T4_G128_M8;
   static const char* RMSNORM_BF16;
+  static const char* RMSNORM_BF16_SUBGROUP;
   static const char* ROPE_BF16_T1;
   static const char* ROPE_BF16_FREQS;
   static const char* SDPA_BF16_DECODE_Q1;

@@ -1084,6 +1084,35 @@
   - prefill `rows=12` 回退已被 native 路径覆盖，首段时延出现显著改善。
   - 生成阶段吞吐仅小幅变化，下一步仍应回到 decode 主线的更大粒度融合（`QMM + residual add + norm`）。
 
+### D-9.39：RMSNorm subgroup 路径闭环验证（已完成，默认 OFF）
+- 背景（Metal/Ollama 对照）：
+  - Metal 与 Ollama 的 decode 热核都普遍利用 wave/subgroup 归约减少 workgroup 级 barrier 开销。
+  - 当前 `rmsnorm_bf16` 为 decode 高频核之一，因此先做低风险 subgroup 实验闭环验证。
+- 本轮实现：
+  - 新增 shader：
+    - `rmsnorm_bf16_subgroup.comp`
+    - `add_rmsnorm_bf16_subgroup.comp`
+  - 完成注册与接线：
+    - `KernelRegistry` 新增 `RMSNORM_BF16_SUBGROUP` 与 `ADD_RMSNORM_BF16_SUBGROUP`
+    - `CMakeLists` 增加 subgroup shader 列表并按 Vulkan 1.1 编译
+    - `fast::RMSNorm::eval_gpu` 增加 subgroup 优先尝试 + 失败自动降级（进程内禁用 subgroup）
+  - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h`（两套 shader 同轮完成）。
+  - 新增实验门禁（默认 OFF）：
+    - `MLX_VK_ENABLE_RMSNORM_SUBGROUP`
+    - `MLX_VK_ENABLE_ADD_RMSNORM_SUBGROUP`
+- 验证：
+  - `cmake --build build_release_vulkan --target mlx -j 8` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 ZH 10-token：输出正常，无乱码（Generation `5.480 tok/s`）。
+- 吞吐 A/B（Qwen3 EN，实卡 Vulkan，串行）：
+  - 40-token：OFF `5.036 tok/s` vs ON `5.048 tok/s`（约 `+0.2%`）
+  - 80-token：OFF `4.892 tok/s` vs ON `4.933 tok/s`（约 `+0.8%`）
+- 结论：
+  - subgroup 路径方向与 Metal/Ollama 启发一致，但当前实现仅边际波动，未达到“稳定 >2% 阶跃”标准。
+  - 按主线策略保持默认 OFF，仅保留为后续更大架构改造时的可复用组件。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`g8_x2` A1-Phase1 与 A1.2 重排均未形成稳定收益，后续需转向更深层内核重构（数据布局 + 中间态组织）。

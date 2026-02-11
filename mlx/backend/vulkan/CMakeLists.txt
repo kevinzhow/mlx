@@ -92,6 +92,7 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/binary_add.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_rmsnorm_bf16.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_rmsnorm_bf16_subgroup.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_bf16_scalar.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_bf16_bcast.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mul_bf16.comp
@@ -133,6 +134,7 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m4.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m8.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rmsnorm_bf16.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rmsnorm_bf16_subgroup.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope_bf16_t1.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope_bf16_freqs.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_q1.comp
@@ -166,6 +168,8 @@ set(SUBGROUP_SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g24_add_x2.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g32.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_splitk_reduce_subgroup.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/add_rmsnorm_bf16_subgroup.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rmsnorm_bf16_subgroup.comp
 )
 
 # Compile shaders to SPIR-V
