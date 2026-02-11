@@ -1255,11 +1255,24 @@ inline std::atomic<bool>& native_qmm_m1_reduce_subgroup_runtime_disabled() {
   return disabled;
 }
 
+inline std::atomic<bool>& native_qmm_m1_reduce_subgroup_x2_runtime_disabled() {
+  static std::atomic<bool> disabled{false};
+  return disabled;
+}
+
 inline bool native_qmm_m1_reduce_subgroup_enabled() {
   static const bool enabled = env_flag_default_true(
       "MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP");
   return enabled &&
       !native_qmm_m1_reduce_subgroup_runtime_disabled().load(
+          std::memory_order_relaxed);
+}
+
+inline bool native_qmm_m1_reduce_subgroup_x2_enabled() {
+  static const bool enabled = env_flag_default_false(
+      "MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_X2");
+  return enabled &&
+      !native_qmm_m1_reduce_subgroup_x2_runtime_disabled().load(
           std::memory_order_relaxed);
 }
 
@@ -1270,6 +1283,16 @@ inline void disable_native_qmm_m1_reduce_subgroup_runtime() {
           expected, true, std::memory_order_relaxed)) {
     std::cerr
         << "[VulkanQMM] disable m1_reduce_subgroup after dispatch failure\n";
+  }
+}
+
+inline void disable_native_qmm_m1_reduce_subgroup_x2_runtime() {
+  auto& disabled = native_qmm_m1_reduce_subgroup_x2_runtime_disabled();
+  bool expected = false;
+  if (disabled.compare_exchange_strong(
+          expected, true, std::memory_order_relaxed)) {
+    std::cerr
+        << "[VulkanQMM] disable m1_reduce_subgroup_x2 after dispatch failure\n";
   }
 }
 
@@ -2688,16 +2711,21 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       const bool use_m1_reduce_subgroup_kernel =
           use_m1_reduce_kernel && native_qmm_m1_reduce_subgroup_enabled() &&
           (groups_per_col <= 256u);
+      const bool use_m1_reduce_subgroup_x2_kernel =
+          use_m1_reduce_subgroup_kernel &&
+          native_qmm_m1_reduce_subgroup_x2_enabled() && (out_words >= 2u);
       const bool use_m16_kernel =
           native_qmm_m16_enabled() && (rows > 8u) && (rows <= 16u);
       const bool use_m2_kernel = native_qmm_m2_enabled() && (rows == 2u);
       const bool use_m4_kernel = native_qmm_m4_enabled() && (rows == 4u);
       const bool use_m8_kernel = native_qmm_m8_enabled() && (rows == 8u);
       const uint32_t wg_size_x = use_m1_kernel ? 128u : 64u;
-      const uint32_t groups_x =
+      const uint32_t groups_x_default =
           use_m1_reduce_kernel
           ? std::max<uint32_t>(1, out_words)
           : std::max<uint32_t>(1, (out_words + wg_size_x - 1u) / wg_size_x);
+      const uint32_t groups_x_subgroup_x2 =
+          std::max<uint32_t>(1u, (out_words + 1u) / 2u);
       const char* qmm_kernel_base = vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128;
       if (use_m1_reduce_kernel) {
         qmm_kernel_base = vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE;
@@ -2712,10 +2740,18 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       } else if (use_m8_kernel) {
         qmm_kernel_base = vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M8;
       }
-      const char* qmm_kernel_fallback = qmm_kernel_base;
-      const char* qmm_kernel = use_m1_reduce_subgroup_kernel
-          ? vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP
-          : qmm_kernel_base;
+      const char* qmm_kernel_subgroup =
+          vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP;
+      const char* qmm_kernel = qmm_kernel_base;
+      uint32_t groups_x = groups_x_default;
+      if (use_m1_reduce_subgroup_kernel) {
+        qmm_kernel = qmm_kernel_subgroup;
+      }
+      if (use_m1_reduce_subgroup_x2_kernel) {
+        qmm_kernel =
+            vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_X2;
+        groups_x = groups_x_subgroup_x2;
+      }
       qmm_kernel_for_stats = qmm_kernel;
 
       const std::vector<uint32_t> push_consts{
@@ -2757,25 +2793,32 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           scales_cached.tensor,
           biases_cached.tensor,
           out_tensor};
-      auto dispatch_qmm = [&](const char* kernel_name) {
+      auto dispatch_qmm = [&](const char* kernel_name, uint32_t dispatch_groups_x) {
         encoder.record_algo_dispatch(
             kernel_name,
             dispatch_tensors,
-            {groups_x, 1, 1},
+            {dispatch_groups_x, 1, 1},
             push_consts);
         device.mark_tensor_host_dirty(out, stream.index);
       };
 
       try {
-        dispatch_qmm(qmm_kernel);
+        dispatch_qmm(qmm_kernel, groups_x);
         qmm_stats_record_native_dispatch_success(rows, qmm_kernel);
         return;
       } catch (const std::exception&) {
+        if (use_m1_reduce_subgroup_x2_kernel) {
+          disable_native_qmm_m1_reduce_subgroup_x2_runtime();
+          qmm_kernel_for_stats = qmm_kernel_subgroup;
+          dispatch_qmm(qmm_kernel_subgroup, groups_x_default);
+          qmm_stats_record_native_dispatch_success(rows, qmm_kernel_subgroup);
+          return;
+        }
         if (use_m1_reduce_subgroup_kernel) {
           disable_native_qmm_m1_reduce_subgroup_runtime();
-          qmm_kernel_for_stats = qmm_kernel_fallback;
-          dispatch_qmm(qmm_kernel_fallback);
-          qmm_stats_record_native_dispatch_success(rows, qmm_kernel_fallback);
+          qmm_kernel_for_stats = qmm_kernel_base;
+          dispatch_qmm(qmm_kernel_base, groups_x_default);
+          qmm_stats_record_native_dispatch_success(rows, qmm_kernel_base);
           return;
         }
         throw;

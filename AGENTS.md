@@ -110,6 +110,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_QMM_NATIVE_M1=1` (default ON, decode `rows==1` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=1` (default ON, decode `rows==1` 并行归约路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1` (default ON, decode `rows==1` subgroup 归约路径；若 dispatch 失败会在进程内自动降级关闭)
+  - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_X2=0` (default OFF, decode `rows==1` 双-word/工作组实验路径；当前默认关闭以避免回退)
   - `MLX_VK_ENABLE_QMM_NATIVE_M16=1` (default ON, prefill `9<=rows<=16` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M2=1` (default ON, small-batch `rows==2` 专核路径)
   - `MLX_VK_ENABLE_QMM_NATIVE_M4=1` (default ON, small-batch `rows==4` 专核路径)
@@ -168,6 +169,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_QMM_NATIVE_M1=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=0|1`
+  - `MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_X2=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M16=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M2=0|1`
   - `MLX_VK_ENABLE_QMM_NATIVE_M4=0|1`

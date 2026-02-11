@@ -357,6 +357,33 @@
   - 与 D-9.12 一致，独立 tiny gather kernel 受 dispatch 固定开销影响，端到端回退明显。
   - 保留实验路径与诊断能力，默认关闭；后续方向改为“融合/减少 launch”，不做默认独立 gather 专核。
 
+### D-9.15：QMM `M1` 双-word/工作组子组核实验（已完成，默认 OFF）
+- 背景（Metal/Ollama 对照）：
+  - Metal/ollama 的高性能路径都强调“提高每次 dispatch 的有效工作量”，避免 decode 小 batch 下的重复访存。
+  - 针对当前 QMM 主命中 `rows=1`，本轮验证“一个 workgroup 同时计算两个 `out_word`”是否能通过复用 `x` 读取带来收益。
+- 变更：
+  - 新增 shader：`qmm_affine_bf16_t4_g128_m1_reduce_subgroup_x2.comp`（subgroup kernel，一组计算 2 个 packed 输出 word）。
+  - 新增 kernel 注册：`QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_X2`。
+  - `QuantizedMatmul::eval_gpu` 增加分派与降级：
+    - gate：`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_X2`。
+    - 若 x2 kernel dispatch 异常，进程内自动关闭 x2 并回退到 `M1_REDUCE_SUBGROUP`。
+  - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h`。
+- 命中与结果（Qwen3 EN，实卡 Vulkan，串行）：
+  - 命中确认（10-token, `MLX_VK_QMM_STATS=1`）：
+    - `qmm_affine_bf16_t4_g128_m1_reduce_subgroup_x2`: `2167`
+    - `qmm_affine_bf16_t4_g128_m16`: `191`
+  - A/B（x2 ON vs OFF）：
+    - 40-token：`3.583 vs 3.659 tok/s`（最近口径 `-2.1%`，无稳定正收益）
+    - 80-token：`2.920 vs 2.916 tok/s`（基本持平）
+- 结论：
+  - x2 路径命中正常，但吞吐收益不稳定且存在回退窗口。
+  - 按“无稳定收益不默认开启”的规则，当前设为默认 OFF（实验门禁保留，用于后续继续迭代）。
+- 验证：
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 EN 10-token 正确性通过，无乱码回归。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`M1_REDUCE_SUBGROUP` 仅带来 `~1%` 级增益，说明需要更深层内核重构（访存与解量化融合策略）。
