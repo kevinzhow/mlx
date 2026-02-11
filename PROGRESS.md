@@ -14,10 +14,10 @@
 - 流程约束（新增）：Qwen3 `mlx_lm generate` 正确性/性能口径需串行执行；任意 C++/Vulkan/shader 变更后，Python 侧验证前必须先执行 `python3 setup.py build_ext --inplace`，避免旧扩展产物导致误判。
 - 近期吞吐（实卡 Vulkan，串行口径）：
   - 10-token（EN）：约 `4.51 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1`，默认 ON）
-  - 40-token（EN）：约 `3.54 tok/s`（同口径）
-  - 80-token（EN）：约 `2.86 tok/s`（同口径）
+  - 40-token（EN）：约 `3.58 tok/s`（同口径）
+  - 80-token（EN）：约 `2.89 tok/s`（同口径）
 - decode 主线 fallback 占比（同口径 profile）：
-  - 由 `18.40%` 降到 `13.50%`（D-9.2），再降到 `3.98%`（D-9.11）
+  - 由 `18.40%` 降到 `13.50%`（D-9.2），再降到 `3.98%`（D-9.11），当前进一步降到 `0.62%`（D-9.13）
 - RoPE 回退状态（Qwen3 EN 40-token 样本）：
   - `MLX_VK_ENABLE_ROPE_HS_TRANSPOSED=1` 时 `VulkanRoPEReject` 由 `55` 次降到 `0`。
 
@@ -298,6 +298,40 @@
   - 与 Metal/Ollama 启发一致：这类路径更适合“融合到上游/下游大核或减少 launch 次数”，而不是独立微核堆叠。
   - 因此保留实验路径，但默认关闭，避免主线回退。
 
+### D-9.13：`fast::Quantize` dequantize 主形态 native 化（已完成）
+- 背景（Metal/Ollama 对照）：
+  - Metal 在 `fast::Quantize` 上直接使用 dequantize kernel，而不是退回 CPU；Ollama 路线也将解码量化解包尽量留在 GPU 主链路。
+  - 在 D-9.12 定位后确认：`BitwiseBinary` 大量 fallback 源于 `fast::Quantize` 的 fallback 子图，因此优先把该源头 native 化。
+- 命中定位（`MLX_VK_DEBUG_FAST_QUANTIZE_FALLBACK=1`）：
+  - 主形态固定为：
+    - `dequantize=1`
+    - `bits=4`
+    - `group_size=128`
+    - `mode=Affine`
+    - `inputs=[uint32 packed_w, bf16 scales, bf16 biases]`
+    - `outputs=[bf16 out]`
+  - 典型 shape：`w=[1,12,128]` / `out=[1,12,1024]` 与 `w=[1,1,128]` / `out=[1,1,1024]`。
+- 变更：
+  - 新增 shader：`affine_dequantize_bf16_g128_b4.comp`（仅覆盖上述高频形态）。
+  - 新增 kernel 注册：`AFFINE_DEQUANTIZE_BF16_G128_B4`。
+  - `fast::Quantize::eval_gpu` 增加 native 派发：
+    - gate：`MLX_VK_ENABLE_FAST_QUANTIZE_DEQ_AFFINE_B4`（默认 ON）。
+    - 不命中或 dispatch 异常时保持原 fallback，语义不变。
+  - 完成 shader 闭环：`.comp -> .spv -> *_spv.h`。
+- 命中与收益（Qwen3 EN，实卡 Vulkan，串行）：
+  - profile_each（40-token）：
+    - `fast::Quantize fallback: 42 -> 0`
+    - `BitwiseBinary fallback: 672 -> 0`（源头消除）
+    - 总 fallback 比例：`3.98% -> 0.62%`
+    - 剩余主要 fallback：`Gather=126`
+  - 吞吐 A/B（ON vs `MLX_VK_ENABLE_FAST_QUANTIZE_DEQ_AFFINE_B4=0`）：
+    - 40-token：`3.583 vs 3.526 tok/s`（`+1.6%`）
+    - 80-token：`2.890 vs 2.882 tok/s`（`+0.3%`）
+- 验证：
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 EN/ZH 10-token 正确性通过，无乱码回归。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`M1_REDUCE_SUBGROUP` 仅带来 `~1%` 级增益，说明需要更深层内核重构（访存与解量化融合策略）。
@@ -306,8 +340,8 @@
 - 在 RoPE 回退清理后，二者成为次级原生耗时来源，需继续做 kernel 级效率优化。
 
 3. 高频小算子 fallback 尾部  
-- `BitwiseBinary`、`Gather`、`fast::Quantize` 仍是 decode 口径下的主要 fallback 尾部。
-- 其中 `BitwiseBinary` 已验证“独立 tiny kernel”会回退，后续应优先走融合或 launch 减量路径。
+- `Gather` 目前是 decode 口径下最主要的剩余 fallback 尾部（profile_each 样本 `126` 次）。
+- `BitwiseBinary` 与 `fast::Quantize` 的高频回退已通过 D-9.13 从源头压降。
 
 4. SDPA 长上下文效率  
 - 当前 decode-unlimited + split-k 已稳定，但 `k=65+` 的 stage1/reduce 仍有进一步优化空间。
@@ -320,8 +354,8 @@
 2. SDPA decode 次热点并行推进  
 - 对照 Metal/Ollama 的 decode attention 内核拆分策略，继续优化 `k=33~128` 区间的 stage1/reduce 配置与核形态。
 
-3. 清理 `fast::Quantize / Gather` 尾部并规划 Bitwise 融合  
-- 继续沿 Metal/Ollama 的“减少 launch 数量 + 融合高频小算子”路线推进，优先处理 `fast::Quantize` 与 `Gather`，Bitwise 暂不做默认独立专核。
+3. 清理 `Gather` 尾部并推进融合调度  
+- 继续沿 Metal/Ollama 的“减少 launch 数量 + 融合高频小算子”路线推进，下一站聚焦 `Gather`，并评估是否可并入上游/下游算子路径。
 
 4. 维持命中优先与串行口径  
 - 每轮必须先跑 `MLX_VK_QMM_STATS=1` / `MLX_VK_SDPA_STATS=1` 确认命中，再做优化与 A/B。

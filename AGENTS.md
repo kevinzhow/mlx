@@ -129,6 +129,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_ADD_BF16=1` (default ON, 包含 bf16 equal-shape / scalar / broadcast-view 路径)
   - `MLX_VK_ENABLE_MUL_BF16=1` (default ON, 包含 bf16 equal-shape / scalar / broadcast-view 路径)
   - `MLX_VK_ENABLE_BITWISE_SHIFT_U32=0` (default OFF, `LeftShift/RightShift` uint32 scalar-broadcast 实验路径；当前默认关闭以避免回退)
+  - `MLX_VK_ENABLE_FAST_QUANTIZE_DEQ_AFFINE_B4=1` (default ON，`fast::Quantize` dequantize+affine+bits4+group128 原生路径)
 - Current decode SDPA defaults (without env override):
   - `MLX_VK_SDPA_MAX_K_LEN_DECODE=0` (`0` 表示 unlimited)
   - `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE=32`
@@ -155,6 +156,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
 - `MLX_VK_DEBUG_ARGREDUCE_REJECT=1`
 - `MLX_VK_DEBUG_BINARY_FALLBACK=1`（打印 Add/Multiply fallback 的 dtype/shape/stride 签名，每种仅一次）
 - `MLX_VK_DEBUG_BITWISE_FALLBACK=1`（打印 BitwiseBinary fallback 的 op/dtype/shape/stride 签名，每种仅一次）
+- `MLX_VK_DEBUG_FAST_QUANTIZE_FALLBACK=1`（打印 `fast::Quantize` fallback 的 mode/bits/group_size 与输入输出签名，每种仅一次）
 - `MLX_VK_DEBUG_COMPILED_DETAIL=1`（打印 `Compiled` 子图 name/lib 与输入输出 layout，默认每种子图仅打印一次）
 - `MLX_VK_PROFILE_COMPILED_DETAIL=1`（将 profile 中 `Compiled` 拆分为 `Compiled::<subgraph>`，默认 OFF）
 - `MLX_VK_SDPA_STATS=1` (进程退出时打印 SDPA 命中/回退分布与 `k_len_cap` 占比)
@@ -183,6 +185,7 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_ENABLE_ADD_BF16=0|1`
   - `MLX_VK_ENABLE_MUL_BF16=0|1`
   - `MLX_VK_ENABLE_BITWISE_SHIFT_U32=0|1`
+  - `MLX_VK_ENABLE_FAST_QUANTIZE_DEQ_AFFINE_B4=0|1`
 - Split-k tuning knobs:
   - Global (existing): `MLX_VK_SDPA_SPLITK_MIN_K_LEN`, `MLX_VK_SDPA_SPLITK_TARGET_CHUNK`, `MLX_VK_SDPA_SPLITK_MAX_PARTS`, `MLX_VK_SDPA_SPLIT_K`
   - Decode overrides (`q_len==1`): `MLX_VK_SDPA_SPLITK_MIN_K_LEN_DECODE`, `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE`, `MLX_VK_SDPA_SPLITK_MAX_PARTS_DECODE`

@@ -1,0 +1,83 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufferW {
+  uint words[];
+} buffer_w;
+
+layout(set = 0, binding = 1) readonly buffer BufferScales {
+  uint words[];
+} buffer_scales;
+
+layout(set = 0, binding = 2) readonly buffer BufferBiases {
+  uint words[];
+} buffer_biases;
+
+layout(set = 0, binding = 3) writeonly buffer BufferOut {
+  uint words[];
+} buffer_out;
+
+layout(push_constant) uniform PushConstants {
+  uint packed_size;
+} params;
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float load_bf16_from_packed_word(uint packed, uint bf16_index) {
+  uint bf16_bits = ((bf16_index & 1u) == 0u) ? (packed & 0xFFFFu)
+                                              : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+float load_scale_or_bias(uint idx, bool is_scale) {
+  uint packed = is_scale ? buffer_scales.words[idx >> 1u]
+                         : buffer_biases.words[idx >> 1u];
+  return load_bf16_from_packed_word(packed, idx);
+}
+
+void main() {
+  uint packed_idx = gl_GlobalInvocationID.x;
+  if (packed_idx >= params.packed_size) {
+    return;
+  }
+
+  // For bits=4 and group_size=128, each packed uint expands to 8 elements,
+  // and each scale/bias entry covers 16 packed uints.
+  uint group_idx = packed_idx >> 4u;
+  float scale = load_scale_or_bias(group_idx, true);
+  float bias = load_scale_or_bias(group_idx, false);
+
+  uint val = buffer_w.words[packed_idx];
+  float d0 = float((val >> 0u) & 0xFu);
+  float d1 = float((val >> 4u) & 0xFu);
+  float d2 = float((val >> 8u) & 0xFu);
+  float d3 = float((val >> 12u) & 0xFu);
+  float d4 = float((val >> 16u) & 0xFu);
+  float d5 = float((val >> 20u) & 0xFu);
+  float d6 = float((val >> 24u) & 0xFu);
+  float d7 = float((val >> 28u) & 0xFu);
+
+  uint out_base = packed_idx << 2u;
+  buffer_out.words[out_base + 0u] =
+      (f32_to_bf16(scale * d0 + bias) & 0xFFFFu) |
+      ((f32_to_bf16(scale * d1 + bias) & 0xFFFFu) << 16u);
+  buffer_out.words[out_base + 1u] =
+      (f32_to_bf16(scale * d2 + bias) & 0xFFFFu) |
+      ((f32_to_bf16(scale * d3 + bias) & 0xFFFFu) << 16u);
+  buffer_out.words[out_base + 2u] =
+      (f32_to_bf16(scale * d4 + bias) & 0xFFFFu) |
+      ((f32_to_bf16(scale * d5 + bias) & 0xFFFFu) << 16u);
+  buffer_out.words[out_base + 3u] =
+      (f32_to_bf16(scale * d6 + bias) & 0xFFFFu) |
+      ((f32_to_bf16(scale * d7 + bias) & 0xFFFFu) << 16u);
+}

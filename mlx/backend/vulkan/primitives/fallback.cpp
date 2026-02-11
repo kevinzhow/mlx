@@ -180,6 +180,18 @@ inline bool logsumexp_debug_reject_enabled() {
   return enabled;
 }
 
+inline bool fast_quantize_debug_fallback_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_DEBUG_FAST_QUANTIZE_FALLBACK");
+    if (!v) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
 inline bool bitwise_debug_fallback_enabled() {
   static const bool enabled = []() {
     const char* v = std::getenv("MLX_VK_DEBUG_BITWISE_FALLBACK");
@@ -315,6 +327,110 @@ inline bool dispatch_native_bitwise_shift_u32(
       a_tensor, b_tensor, out_tensor};
   encoder.record_algo_dispatch(
       kernel_name, dispatch_tensors, {groups_x, 1, 1}, push_consts);
+  device.mark_tensor_host_dirty(out, stream.index);
+  return true;
+}
+
+inline bool native_fast_quantize_deq_affine_b4_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_ENABLE_FAST_QUANTIZE_DEQ_AFFINE_B4");
+    if (!v) {
+      return true;
+    }
+    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+        std::strcmp(v, "off") == 0) {
+      return false;
+    }
+    return true;
+  }();
+  return enabled;
+}
+
+inline bool can_use_native_fast_quantize_deq_affine_b4(
+    const std::vector<mlx::core::array>& inputs,
+    const std::vector<mlx::core::array>& outputs,
+    int bits,
+    int group_size,
+    mlx::core::QuantizationMode mode,
+    bool dequantize) {
+  if (!(dequantize && bits == 4 && group_size == 128 &&
+        mode == mlx::core::QuantizationMode::Affine && inputs.size() == 3 &&
+        outputs.size() == 1)) {
+    return false;
+  }
+
+  const auto& w = inputs[0];
+  const auto& scales = inputs[1];
+  const auto& biases = inputs[2];
+  const auto& out = outputs[0];
+
+  if (!(w.dtype() == mlx::core::uint32 && scales.dtype() == mlx::core::bfloat16 &&
+        biases.dtype() == mlx::core::bfloat16 &&
+        out.dtype() == mlx::core::bfloat16 && is_row_contiguous_materialized(w) &&
+        is_row_contiguous_materialized(scales) &&
+        is_row_contiguous_materialized(biases) && out.flags().row_contiguous &&
+        w.size() > 0 && scales.size() > 0 && scales.size() == biases.size())) {
+    return false;
+  }
+
+  const uint64_t w_size = static_cast<uint64_t>(w.size());
+  const uint64_t out_size = static_cast<uint64_t>(out.size());
+  const uint64_t scales_size = static_cast<uint64_t>(scales.size());
+  if (out_size != w_size * 8u) {
+    return false;
+  }
+  if (scales_size * 128u != out_size) {
+    return false;
+  }
+  return out_size <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+}
+
+inline bool dispatch_native_fast_quantize_deq_affine_b4(
+    const std::vector<mlx::core::array>& inputs,
+    std::vector<mlx::core::array>& outputs) {
+  auto& out = outputs[0];
+  auto stream = out.primitive().stream();
+
+  if (!out.data_shared_ptr()) {
+    out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+  }
+
+  auto& device = mlx::core::vulkan::device(stream.device);
+  auto& encoder = device.get_command_encoder(stream.index);
+  encoder.begin_encoding();
+
+  auto w_tensor = device.get_tensor(inputs[0]);
+  auto scales_tensor = device.get_tensor(inputs[1]);
+  auto biases_tensor = device.get_tensor(inputs[2]);
+  auto out_tensor = device.get_tensor(out);
+  if (!w_tensor || !scales_tensor || !biases_tensor || !out_tensor) {
+    return false;
+  }
+
+  std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+  if (device.tensor_needs_sync_device(inputs[0])) {
+    sync_tensors.push_back(w_tensor);
+  }
+  if (device.tensor_needs_sync_device(inputs[1])) {
+    sync_tensors.push_back(scales_tensor);
+  }
+  if (device.tensor_needs_sync_device(inputs[2])) {
+    sync_tensors.push_back(biases_tensor);
+  }
+  if (!sync_tensors.empty()) {
+    encoder.record_tensor_sync_device(sync_tensors);
+  }
+
+  const uint32_t packed_size = static_cast<uint32_t>(inputs[0].size());
+  const uint32_t groups_x = std::max<uint32_t>(1, (packed_size + 127u) / 128u);
+  const std::vector<uint32_t> push_consts{packed_size};
+  const std::vector<std::shared_ptr<kp::Tensor>> dispatch_tensors{
+      w_tensor, scales_tensor, biases_tensor, out_tensor};
+  encoder.record_algo_dispatch(
+      mlx::core::vulkan::KernelRegistry::AFFINE_DEQUANTIZE_BF16_G128_B4,
+      dispatch_tensors,
+      {groups_x, 1, 1},
+      push_consts);
   device.mark_tensor_host_dirty(out, stream.index);
   return true;
 }
@@ -3813,6 +3929,56 @@ void fast::Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   vulkan::OpProfileScope profile("fast::Quantize");
+  auto stream = outputs.empty() ? mlx::core::default_stream(mlx::core::default_device())
+                                : outputs.front().primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+
+  if (native_fast_quantize_deq_affine_b4_enabled() &&
+      can_use_native_fast_quantize_deq_affine_b4(
+          inputs, outputs, bits_, group_size_, mode_, dequantize_)) {
+    try {
+      if (dispatch_native_fast_quantize_deq_affine_b4(inputs, outputs)) {
+        return;
+      }
+    } catch (const std::exception&) {
+      // Fall through to CPU fallback.
+    }
+  }
+
+  if (fast_quantize_debug_fallback_enabled()) {
+    static std::mutex debug_mtx;
+    static std::unordered_set<std::string> seen;
+    std::ostringstream sig;
+    sig << "dequantize=" << (dequantize_ ? 1 : 0)
+        << "|bits=" << bits_
+        << "|group_size=" << group_size_
+        << "|mode=" << static_cast<int>(mode_)
+        << "|inputs=" << inputs.size()
+        << "|outputs=" << outputs.size();
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      sig << "|in" << i << ".dtype=" << inputs[i].dtype()
+          << "|in" << i << ".shape=" << shape_string(inputs[i])
+          << "|in" << i << ".strides=" << strides_string(inputs[i])
+          << "|in" << i << ".size=" << inputs[i].size()
+          << "|in" << i << ".data_size=" << inputs[i].data_size()
+          << "|in" << i << ".row="
+          << (inputs[i].flags().row_contiguous ? 1 : 0);
+    }
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      sig << "|out" << i << ".dtype=" << outputs[i].dtype()
+          << "|out" << i << ".shape=" << shape_string(outputs[i])
+          << "|out" << i << ".strides=" << strides_string(outputs[i])
+          << "|out" << i << ".size=" << outputs[i].size()
+          << "|out" << i << ".data_size=" << outputs[i].data_size()
+          << "|out" << i << ".row="
+          << (outputs[i].flags().row_contiguous ? 1 : 0);
+    }
+    const std::string key = sig.str();
+    std::lock_guard<std::mutex> lock(debug_mtx);
+    if (seen.insert(key).second) {
+      std::cerr << "[VulkanFastQuantizeFallback] " << key << "\n";
+    }
+  }
   profile.mark_fallback();
   materialize_and_share_fast_outputs(fallback_(inputs), outputs);
 }

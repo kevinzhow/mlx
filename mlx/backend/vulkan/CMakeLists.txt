@@ -98,6 +98,7 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mul_bf16_bcast.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lshift_u32_scalar.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rshift_u32_scalar.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/affine_dequantize_bf16_g128_b4.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/silu_mul_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sub_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sub_bf16_scalar.comp
