@@ -99,6 +99,7 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lshift_u32_scalar.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rshift_u32_scalar.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/affine_dequantize_bf16_g128_b4.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gather_rows_words_i32_idx.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/silu_mul_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sub_bf16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sub_bf16_scalar.comp

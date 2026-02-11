@@ -192,6 +192,51 @@ inline bool fast_quantize_debug_fallback_enabled() {
   return enabled;
 }
 
+inline bool gather_debug_fallback_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_DEBUG_GATHER_FALLBACK");
+    if (!v) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
+inline void log_gather_fallback_once(
+    const std::vector<mlx::core::array>& inputs,
+    const mlx::core::array& out) {
+  if (!gather_debug_fallback_enabled()) {
+    return;
+  }
+  static std::mutex mtx;
+  static std::unordered_set<std::string> seen;
+  std::ostringstream sig;
+  sig << "inputs=" << inputs.size();
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    sig << "|in" << i << ".dtype=" << inputs[i].dtype()
+        << "|in" << i << ".shape=" << shape_string(inputs[i])
+        << "|in" << i << ".strides=" << strides_string(inputs[i])
+        << "|in" << i << ".size=" << inputs[i].size()
+        << "|in" << i << ".data_size=" << inputs[i].data_size()
+        << "|in" << i << ".row="
+        << (inputs[i].flags().row_contiguous ? 1 : 0);
+  }
+  sig << "|out.dtype=" << out.dtype()
+      << "|out.shape=" << shape_string(out)
+      << "|out.strides=" << strides_string(out)
+      << "|out.size=" << out.size()
+      << "|out.data_size=" << out.data_size()
+      << "|out.row=" << (out.flags().row_contiguous ? 1 : 0);
+  const std::string key = sig.str();
+  std::lock_guard<std::mutex> lock(mtx);
+  if (!seen.insert(key).second) {
+    return;
+  }
+  std::cerr << "[VulkanGatherFallback] " << key << "\n";
+}
+
 inline bool bitwise_debug_fallback_enabled() {
   static const bool enabled = []() {
     const char* v = std::getenv("MLX_VK_DEBUG_BITWISE_FALLBACK");
@@ -428,6 +473,130 @@ inline bool dispatch_native_fast_quantize_deq_affine_b4(
       w_tensor, scales_tensor, biases_tensor, out_tensor};
   encoder.record_algo_dispatch(
       mlx::core::vulkan::KernelRegistry::AFFINE_DEQUANTIZE_BF16_G128_B4,
+      dispatch_tensors,
+      {groups_x, 1, 1},
+      push_consts);
+  device.mark_tensor_host_dirty(out, stream.index);
+  return true;
+}
+
+struct GatherRowsWordsConfig {
+  uint32_t src_rows{0};
+  uint32_t src_row_words{0};
+  uint32_t out_words{0};
+};
+
+inline bool native_gather_rows_words_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_VK_ENABLE_GATHER_ROWS_WORDS");
+    if (!v) {
+      return false;
+    }
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "on") == 0;
+  }();
+  return enabled;
+}
+
+inline bool can_use_native_gather_rows_words(
+    const std::vector<mlx::core::array>& inputs,
+    const mlx::core::array& out,
+    GatherRowsWordsConfig* config) {
+  if (inputs.size() != 2 || config == nullptr) {
+    return false;
+  }
+  const auto& src = inputs[0];
+  const auto& indices = inputs[1];
+  if (!(src.ndim() == 2 && src.flags().row_contiguous &&
+        src.data_size() == src.size() && indices.flags().row_contiguous &&
+        indices.data_size() == indices.size() && out.flags().row_contiguous &&
+        out.ndim() >= 2 && out.shape(-2) == 1 &&
+        out.shape(-1) == src.shape(-1) &&
+        (indices.dtype() == mlx::core::int32 ||
+         indices.dtype() == mlx::core::uint32) &&
+        (src.dtype() == mlx::core::bfloat16 || src.dtype() == mlx::core::uint32) &&
+        out.dtype() == src.dtype())) {
+    return false;
+  }
+
+  const uint64_t src_rows = static_cast<uint64_t>(src.shape(0));
+  const uint64_t src_cols = static_cast<uint64_t>(src.shape(1));
+  const uint64_t idx_count = static_cast<uint64_t>(indices.size());
+  if (src_rows == 0 || src_cols == 0 || idx_count == 0) {
+    return false;
+  }
+
+  uint64_t src_row_words = 0;
+  uint64_t out_words = 0;
+  if (src.dtype() == mlx::core::uint32) {
+    src_row_words = src_cols;
+    out_words = static_cast<uint64_t>(out.size());
+  } else {
+    if ((src_cols & 1u) != 0u) {
+      return false;
+    }
+    src_row_words = src_cols / 2u;
+    if ((static_cast<uint64_t>(out.size()) & 1u) != 0u) {
+      return false;
+    }
+    out_words = static_cast<uint64_t>(out.size()) / 2u;
+  }
+
+  if (out_words != idx_count * src_row_words) {
+    return false;
+  }
+
+  const uint64_t kU32Max = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+  if (src_rows > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) ||
+      src_row_words > kU32Max || out_words > kU32Max) {
+    return false;
+  }
+
+  config->src_rows = static_cast<uint32_t>(src_rows);
+  config->src_row_words = static_cast<uint32_t>(src_row_words);
+  config->out_words = static_cast<uint32_t>(out_words);
+  return true;
+}
+
+inline bool dispatch_native_gather_rows_words(
+    const std::vector<mlx::core::array>& inputs,
+    mlx::core::array& out,
+    const GatherRowsWordsConfig& config) {
+  auto stream = out.primitive().stream();
+
+  if (!out.data_shared_ptr()) {
+    out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+  }
+
+  auto& device = mlx::core::vulkan::device(stream.device);
+  auto& encoder = device.get_command_encoder(stream.index);
+  encoder.begin_encoding();
+
+  auto src_tensor = device.get_tensor(inputs[0]);
+  auto idx_tensor = device.get_tensor(inputs[1]);
+  auto out_tensor = device.get_tensor(out);
+  if (!src_tensor || !idx_tensor || !out_tensor) {
+    return false;
+  }
+
+  std::vector<std::shared_ptr<kp::Tensor>> sync_tensors;
+  if (device.tensor_needs_sync_device(inputs[0])) {
+    sync_tensors.push_back(src_tensor);
+  }
+  if (device.tensor_needs_sync_device(inputs[1])) {
+    sync_tensors.push_back(idx_tensor);
+  }
+  if (!sync_tensors.empty()) {
+    encoder.record_tensor_sync_device(sync_tensors);
+  }
+
+  const uint32_t groups_x = std::max<uint32_t>(1, (config.out_words + 255u) / 256u);
+  const std::vector<uint32_t> push_consts{
+      config.out_words, config.src_rows, config.src_row_words};
+  const std::vector<std::shared_ptr<kp::Tensor>> dispatch_tensors{
+      src_tensor, idx_tensor, out_tensor};
+  encoder.record_algo_dispatch(
+      mlx::core::vulkan::KernelRegistry::GATHER_ROWS_WORDS_I32_IDX,
       dispatch_tensors,
       {groups_x, 1, 1},
       push_consts);
@@ -2653,6 +2822,28 @@ void BitwiseBinary::eval_gpu(const std::vector<array>& inputs, array& out) {
   run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);
 }
 
+void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::OpProfileScope profile("Gather");
+  auto stream = out.primitive().stream();
+  prepare_inputs_for_cpu_fallback(inputs, stream);
+
+  GatherRowsWordsConfig config;
+  if (native_gather_rows_words_enabled() &&
+      can_use_native_gather_rows_words(inputs, out, &config)) {
+    try {
+      if (dispatch_native_gather_rows_words(inputs, out, config)) {
+        return;
+      }
+    } catch (const std::exception&) {
+      // Fall through to CPU fallback.
+    }
+  }
+
+  log_gather_fallback_once(inputs, out);
+  profile.mark_fallback();
+  run_cpu_fallback_single(inputs, out, [&]() { eval_cpu(inputs, out); }, &profile);
+}
+
 VULKAN_CPU_FALLBACK(Abs)
 VULKAN_CPU_FALLBACK(AddMM)
 VULKAN_CPU_FALLBACK(Arange)
@@ -2680,7 +2871,6 @@ VULKAN_CPU_FALLBACK(Exp)
 VULKAN_CPU_FALLBACK(Expm1)
 VULKAN_CPU_FALLBACK(FFT)
 VULKAN_CPU_FALLBACK(Floor)
-VULKAN_CPU_FALLBACK(Gather)
 VULKAN_CPU_FALLBACK(GatherAxis)
 VULKAN_CPU_FALLBACK(GatherMM)
 VULKAN_CPU_FALLBACK(GatherQMM)

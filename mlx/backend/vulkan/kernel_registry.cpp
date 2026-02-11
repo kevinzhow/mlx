@@ -19,6 +19,7 @@
 #include "shaders/lshift_u32_scalar_spv.h"
 #include "shaders/rshift_u32_scalar_spv.h"
 #include "shaders/affine_dequantize_bf16_g128_b4_spv.h"
+#include "shaders/gather_rows_words_i32_idx_spv.h"
 #include "shaders/silu_mul_bf16_spv.h"
 #include "shaders/sub_bf16_spv.h"
 #include "shaders/sub_bf16_scalar_spv.h"
@@ -70,6 +71,8 @@ const char* KernelRegistry::LSHIFT_U32_SCALAR = "lshift_u32_scalar";
 const char* KernelRegistry::RSHIFT_U32_SCALAR = "rshift_u32_scalar";
 const char* KernelRegistry::AFFINE_DEQUANTIZE_BF16_G128_B4 =
     "affine_dequantize_bf16_g128_b4";
+const char* KernelRegistry::GATHER_ROWS_WORDS_I32_IDX =
+    "gather_rows_words_i32_idx";
 const char* KernelRegistry::SILU_MUL_BF16 = "silu_mul_bf16";
 const char* KernelRegistry::SUB_F32 = "sub_f32";
 const char* KernelRegistry::SUB_F32_SCALAR = "sub_f32_scalar";
@@ -201,6 +204,14 @@ void KernelRegistry::register_builtin_shaders() {
       affine_dequantize_bf16_g128_b4_spv_len);
   shaders_[AFFINE_DEQUANTIZE_BF16_G128_B4] =
       std::move(affine_dequantize_bf16_g128_b4_spirv);
+  std::vector<uint32_t> gather_rows_words_i32_idx_spirv(
+      (gather_rows_words_i32_idx_spv_len + 3) / 4);
+  std::memcpy(
+      gather_rows_words_i32_idx_spirv.data(),
+      gather_rows_words_i32_idx_spv,
+      gather_rows_words_i32_idx_spv_len);
+  shaders_[GATHER_ROWS_WORDS_I32_IDX] =
+      std::move(gather_rows_words_i32_idx_spirv);
 
   std::vector<uint32_t> silu_mul_bf16_spirv((silu_mul_bf16_spv_len + 3) / 4);
   std::memcpy(

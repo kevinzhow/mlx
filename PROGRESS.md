@@ -332,6 +332,31 @@
   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
   - Qwen3 EN/ZH 10-token 正确性通过，无乱码回归。
 
+### D-9.14：`Gather` 行拷贝实验路径验证（已完成，默认 OFF）
+- 背景（Metal/Ollama 对照）：
+  - 在 D-9.13 后 `Gather` 成为剩余高频 fallback，先做最小可行“行拷贝”native 验证是否值得继续。
+  - 参考 Metal/Ollama 的经验：若算子粒度过小且 launch 过多，独立 kernel 可能回退。
+- 命中定位（`MLX_VK_DEBUG_GATHER_FALLBACK=1`）：
+  - 主形态为 2D 行连续源张量按索引行采样：
+    - `src`：`[151936, 8]` bf16 或 `[151936, 128]` uint32
+    - `indices`：`[1,12]` / `[1,1]`，`int32` 或 `uint32`
+    - `out`：`[*,*,1,W]`，行连续
+- 变更：
+  - 新增实验 shader：`gather_rows_words_i32_idx`（按“word copy”执行行采样）。
+  - 新增 kernel 注册与 gate：
+    - `MLX_VK_ENABLE_GATHER_ROWS_WORDS`（默认 `0`，OFF）
+  - 新增调试开关：`MLX_VK_DEBUG_GATHER_FALLBACK=1`。
+- A/B 结果（Qwen3 EN，实卡 Vulkan，串行）：
+  - 命中：开启后 `Gather fallback 126 -> 0`。
+  - 吞吐（ON vs OFF）：
+    - 40-token：`3.317 vs 3.595 tok/s`（`-7.7%`）
+  - profile_each（40-token）：
+    - `fallback_pct 0.62% -> 0.00%`
+    - 但 generation `3.163 vs 3.447 tok/s`（`-8.2%`）
+- 结论：
+  - 与 D-9.12 一致，独立 tiny gather kernel 受 dispatch 固定开销影响，端到端回退明显。
+  - 保留实验路径与诊断能力，默认关闭；后续方向改为“融合/减少 launch”，不做默认独立 gather 专核。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
 - 仍是端到端主耗时大头；`M1_REDUCE_SUBGROUP` 仅带来 `~1%` 级增益，说明需要更深层内核重构（访存与解量化融合策略）。
@@ -342,6 +367,7 @@
 3. 高频小算子 fallback 尾部  
 - `Gather` 目前是 decode 口径下最主要的剩余 fallback 尾部（profile_each 样本 `126` 次）。
 - `BitwiseBinary` 与 `fast::Quantize` 的高频回退已通过 D-9.13 从源头压降。
+- `Gather` 已验证独立专核会回退，后续应优先寻找融合路径而非继续堆叠 tiny kernel。
 
 4. SDPA 长上下文效率  
 - 当前 decode-unlimited + split-k 已稳定，但 `k=65+` 的 stage1/reduce 仍有进一步优化空间。

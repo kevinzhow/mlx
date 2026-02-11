@@ -1,0 +1,43 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufferSrc {
+  uint words[];
+} buffer_src;
+
+layout(set = 0, binding = 1) readonly buffer BufferIdx {
+  int values[];
+} buffer_idx;
+
+layout(set = 0, binding = 2) writeonly buffer BufferOut {
+  uint words[];
+} buffer_out;
+
+layout(push_constant) uniform PushConstants {
+  uint out_words;
+  uint src_rows;
+  uint src_row_words;
+} params;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= params.out_words) {
+    return;
+  }
+
+  uint row_word = gid % params.src_row_words;
+  uint idx_pos = gid / params.src_row_words;
+
+  int row = buffer_idx.values[idx_pos];
+  if (row < 0) {
+    row += int(params.src_rows);
+  }
+  if (row < 0 || row >= int(params.src_rows)) {
+    buffer_out.words[gid] = 0u;
+    return;
+  }
+
+  uint src_idx = uint(row) * params.src_row_words + row_word;
+  buffer_out.words[gid] = buffer_src.words[src_idx];
+}

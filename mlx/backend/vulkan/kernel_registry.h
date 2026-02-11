@@ -60,6 +60,7 @@ class KernelRegistry {
   static const char* LSHIFT_U32_SCALAR;
   static const char* RSHIFT_U32_SCALAR;
   static const char* AFFINE_DEQUANTIZE_BF16_G128_B4;
+  static const char* GATHER_ROWS_WORDS_I32_IDX;
   static const char* SILU_MUL_BF16;
   static const char* SUB_F32;
   static const char* SUB_F32_SCALAR;
