@@ -1553,14 +1553,32 @@ inline bool native_qmm_m8_enabled() {
 
 inline bool native_qmm_add_fuse_decode_enabled() {
   static const bool enabled = []() {
+    auto parse_flag = [](const char* v) -> int {
+      if (!v || v[0] == '\0') {
+        return -1;
+      }
+      if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+          std::strcmp(v, "off") == 0) {
+        return 0;
+      }
+      if (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+          std::strcmp(v, "on") == 0) {
+        return 1;
+      }
+      return 0;
+    };
+
     const char* decode_gate = std::getenv("MLX_VK_ENABLE_QMM_ADD_FUSE_DECODE");
-    if (decode_gate && decode_gate[0] != '\0') {
-      return std::strcmp(decode_gate, "0") != 0 &&
-          std::strcmp(decode_gate, "false") != 0 &&
-          std::strcmp(decode_gate, "off") != 0;
+    const int decode_value = parse_flag(decode_gate);
+    if (decode_value != -1) {
+      return decode_value == 1;
     }
-    // Keep legacy gate as compatibility alias.
-    return env_flag_default_false("MLX_VK_ENABLE_QMM_ADD_FUSE_G8");
+    const int legacy_value =
+        parse_flag(std::getenv("MLX_VK_ENABLE_QMM_ADD_FUSE_G8"));
+    if (legacy_value != -1) {
+      return legacy_value == 1;
+    }
+    return true;
   }();
   return enabled;
 }

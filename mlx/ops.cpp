@@ -90,7 +90,7 @@ bool qmm_add_fuse_decode_enabled() {
     if (legacy_gate != -1) {
       return legacy_gate == 1;
     }
-    return false;
+    return true;
   }();
   return enabled;
 }
