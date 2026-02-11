@@ -1,0 +1,163 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Decode-specialized QMM kernel for rows==1 and groups_per_col==8.
+// Compared with the generic subgroup kernel, this path removes dynamic
+// group-size loops and hard-codes two units per lane.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuffer {
+  uint words[];
+} x_buffer;
+
+layout(set = 0, binding = 1) readonly buffer WBuffer {
+  uint words[];
+} w_buffer;
+
+layout(set = 0, binding = 2) readonly buffer ScaleBuffer {
+  uint words[];
+} scale_buffer;
+
+layout(set = 0, binding = 3) readonly buffer BiasBuffer {
+  uint words[];
+} bias_buffer;
+
+layout(set = 0, binding = 4) writeonly buffer OutBuffer {
+  uint words[];
+} out_buffer;
+
+layout(push_constant) uniform PushConstants {
+  uint out_elems;
+  uint n;
+  uint k;
+  uint groups_per_col;
+  uint w_words_per_col;
+} params;
+
+shared float subgroup_reduce0[64];
+shared float subgroup_reduce1[64];
+shared float scale0_cache[8];
+shared float bias0_cache[8];
+shared float scale1_cache[8];
+shared float bias1_cache[8];
+
+float bf16_to_f32(uint bf16_bits) {
+  return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
+}
+
+uint f32_to_bf16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint lsb = (bits >> 16u) & 1u;
+  uint rounding_bias = 0x7FFFu + lsb;
+  return (bits + rounding_bias) >> 16u;
+}
+
+float load_bf16_from_packed(uint packed, uint elem_idx) {
+  uint bf16_bits = ((elem_idx & 1u) == 0u) ? (packed & 0xFFFFu)
+                                           : (packed >> 16u);
+  return bf16_to_f32(bf16_bits);
+}
+
+void accumulate_unit(
+    in uint unit,
+    in uint out_elem_0,
+    in bool has_out_1,
+    in uint out_elem_1,
+    inout float partial0,
+    inout float partial1) {
+  const uint g = unit >> 4u;
+  const uint ww = unit & 0xFu;
+
+  const float scale0 = scale0_cache[g];
+  const float bias0 = bias0_cache[g];
+  const float scale1 = has_out_1 ? scale1_cache[g] : 0.0;
+  const float bias1 = has_out_1 ? bias1_cache[g] : 0.0;
+
+  const uint w_word_idx0 = out_elem_0 * params.w_words_per_col + g * 16u + ww;
+  const uint wi0 = w_buffer.words[w_word_idx0];
+  uint wi1 = 0u;
+  if (has_out_1) {
+    const uint w_word_idx1 =
+        out_elem_1 * params.w_words_per_col + g * 16u + ww;
+    wi1 = w_buffer.words[w_word_idx1];
+  }
+
+  const uint x_word_base = g * 64u + ww * 4u;
+  for (uint t = 0u; t < 4u; ++t) {
+    const uint x_packed = x_buffer.words[x_word_base + t];
+    const uint q_idx = t * 2u;
+    const float x0 = load_bf16_from_packed(x_packed, 0u);
+    const float x1 = load_bf16_from_packed(x_packed, 1u);
+
+    const float q00 = float((wi0 >> (q_idx * 4u)) & 0xFu);
+    const float q01 = float((wi0 >> ((q_idx + 1u) * 4u)) & 0xFu);
+    partial0 += x0 * (scale0 * q00 + bias0);
+    partial0 += x1 * (scale0 * q01 + bias0);
+
+    if (has_out_1) {
+      const float q10 = float((wi1 >> (q_idx * 4u)) & 0xFu);
+      const float q11 = float((wi1 >> ((q_idx + 1u) * 4u)) & 0xFu);
+      partial1 += x0 * (scale1 * q10 + bias1);
+      partial1 += x1 * (scale1 * q11 + bias1);
+    }
+  }
+}
+
+void main() {
+  const uint out_word_idx = gl_WorkGroupID.x;
+  const uint lane = gl_LocalInvocationID.x;
+  const uint out_words = (params.out_elems + 1u) / 2u;
+  if (out_word_idx >= out_words) {
+    return;
+  }
+
+  const uint out_elem_0 = out_word_idx * 2u;
+  const uint out_elem_1 = out_elem_0 + 1u;
+  const bool has_out_1 = out_elem_1 < params.out_elems;
+
+  if (lane < 8u) {
+    const uint g = lane;
+    const uint scale_bias_idx0 = out_elem_0 * 8u + g;
+    scale0_cache[g] = load_bf16_from_packed(
+        scale_buffer.words[scale_bias_idx0 >> 1u], scale_bias_idx0);
+    bias0_cache[g] = load_bf16_from_packed(
+        bias_buffer.words[scale_bias_idx0 >> 1u], scale_bias_idx0);
+    if (has_out_1) {
+      const uint scale_bias_idx1 = out_elem_1 * 8u + g;
+      scale1_cache[g] = load_bf16_from_packed(
+          scale_buffer.words[scale_bias_idx1 >> 1u], scale_bias_idx1);
+      bias1_cache[g] = load_bf16_from_packed(
+          bias_buffer.words[scale_bias_idx1 >> 1u], scale_bias_idx1);
+    }
+  }
+  barrier();
+
+  float partial0 = 0.0;
+  float partial1 = 0.0;
+  accumulate_unit(lane, out_elem_0, has_out_1, out_elem_1, partial0, partial1);
+  accumulate_unit(
+      lane + 64u, out_elem_0, has_out_1, out_elem_1, partial0, partial1);
+
+  const float subgroup_sum0 = subgroupAdd(partial0);
+  const float subgroup_sum1 = subgroupAdd(partial1);
+  if (gl_SubgroupInvocationID == 0u) {
+    subgroup_reduce0[gl_SubgroupID] = subgroup_sum0;
+    subgroup_reduce1[gl_SubgroupID] = subgroup_sum1;
+  }
+  barrier();
+
+  if (gl_SubgroupID == 0u) {
+    const float seed0 = (lane < gl_NumSubgroups) ? subgroup_reduce0[lane] : 0.0;
+    const float seed1 = (lane < gl_NumSubgroups) ? subgroup_reduce1[lane] : 0.0;
+    const float total0 = subgroupAdd(seed0);
+    const float total1 = subgroupAdd(seed1);
+    if (gl_SubgroupInvocationID == 0u) {
+      uint packed = f32_to_bf16(total0) & 0xFFFFu;
+      if (has_out_1) {
+        packed |= (f32_to_bf16(total1) & 0xFFFFu) << 16u;
+      }
+      out_buffer.words[out_word_idx] = packed;
+    }
+  }
+}

@@ -116,6 +116,8 @@ set(SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_x2.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m2.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m4.comp
@@ -142,6 +144,8 @@ set(SHADER_FILES
 set(SUBGROUP_SHADER_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_x2.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g16.comp
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sdpa_bf16_decode_splitk_reduce_subgroup.comp
 )
 

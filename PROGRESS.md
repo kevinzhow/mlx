@@ -14,8 +14,8 @@
 - 流程约束（新增）：Qwen3 `mlx_lm generate` 正确性/性能口径需串行执行；任意 C++/Vulkan/shader 变更后，Python 侧验证前必须先执行 `python3 setup.py build_ext --inplace`，避免旧扩展产物导致误判。
 - 近期吞吐（实卡 Vulkan，串行口径）：
   - 10-token（EN）：约 `4.51 tok/s`（`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP=1`，默认 ON）
-  - 40-token（EN）：约 `3.58 tok/s`（同口径）
-  - 80-token（EN）：约 `2.89 tok/s`（同口径）
+  - 40-token（EN）：约 `3.67 tok/s`（新增 `M1+gpc8` 专核后）
+  - 80-token（EN）：约 `2.99 tok/s`（新增 `M1+gpc8` 专核后）
 - decode 主线 fallback 占比（同口径 profile）：
   - 由 `18.40%` 降到 `13.50%`（D-9.2），再降到 `3.98%`（D-9.11），当前进一步降到 `0.62%`（D-9.13）
 - RoPE 回退状态（Qwen3 EN 40-token 样本）：
@@ -384,9 +384,57 @@
   - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
   - Qwen3 EN 10-token 正确性通过，无乱码回归。
 
+### D-9.16：QMM `M1 + groups_per_col==8` 专核（已完成，默认 ON）
+- 背景（Metal/Ollama 对照）：
+  - Metal/Ollama 路线都强调“先命中分析，再对主形态做硬特化”。
+  - 本轮先扩展 QMM 统计，确认 decode `rows=1` 存在稳定高命中子形态（`groups_per_col==8`），再做专核。
+- 命中分析（`MLX_VK_QMM_STATS=1`）：
+  - `rows=1` 总命中：`8077`
+  - 新专核命中：`5781`（约 `71.6%`）
+  - 非 g8 子形态（继续走原 subgroup 核）：`2296`
+  - 说明：`rows=1` 内部并非单一形态，`gpc==8` 是当前 Qwen3 decode 的主桶。
+- 变更：
+  - QMM 统计增强：新增 `NativeShapeBucket/FallbackShapeBucket`（`rows + gpc + k + n` 桶），避免后续“优化错桶”。
+  - 新增 shader：`qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g8.comp`（固定 `groups_per_col==8`，去掉动态 group 循环）。
+  - 新增 kernel 注册：`QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8`。
+  - `QuantizedMatmul::eval_gpu` 增加派发与降级：
+    - gate：`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G8`（默认 ON）
+    - dispatch 异常时进程内自动关闭 g8 并回退到原 `M1_REDUCE_SUBGROUP`。
+  - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h`。
+- 吞吐 A/B（Qwen3 EN，实卡 Vulkan，串行）：
+  - 40-token：`3.635 vs 3.531 tok/s`（`+2.9%`）
+  - 80-token：`2.941 vs 2.880 tok/s`（`+2.1%`）
+- 验证：
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 ZH 10-token 正确性通过，无乱码回归。
+
+### D-9.17：QMM `M1 + groups_per_col==16` 专核实验（已完成，默认 OFF）
+- 背景（Metal/Ollama 对照）：
+  - 在 `g8` 主桶之外，`rows=1` 次桶中 `gpc=9-16` 仍有稳定命中，按“命中优先”策略继续试探第二梯队专核。
+- 变更：
+  - 新增 shader：`qmm_affine_bf16_t4_g128_m1_reduce_subgroup_g16.comp`。
+  - 新增 kernel 注册：`QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G16`。
+  - `QuantizedMatmul::eval_gpu` 增加 `groups_per_col==16` 派发与异常自动降级。
+  - gate：`MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G16`。
+  - 严格执行 shader 闭环：`.comp -> .spv -> *_spv.h`。
+- 结果（Qwen3 EN，实卡 Vulkan，串行）：
+  - 命中：`g16` 核可命中（`1148` 次/40-token 样本）。
+  - A/B（g16 ON vs OFF）：
+    - 40-token：`3.625 vs 3.643 tok/s`（`-0.5%`）
+    - 80-token：`2.927 vs 2.936 tok/s`（`-0.3%`）
+- 结论：
+  - g16 专核当前实现无稳定正收益，默认保持 OFF（实验路径保留，后续可继续重写）。
+- 验证：
+  - `python3 setup.py build_ext --inplace` 通过。
+  - `ctest --test-dir build_release_vulkan --output-on-failure --timeout 120`：`223/223` 通过。
+  - `PYTHONPATH=python python3 python/tests/test_fast_sdpa.py -v`：`20 passed, 1 skipped`。
+  - Qwen3 ZH 10-token 正确性通过，无乱码回归。
+
 ## 当前性能卡点（按优先级）
 1. `QuantizedMatmul`  
-- 仍是端到端主耗时大头；`M1_REDUCE_SUBGROUP` 仅带来 `~1%` 级增益，说明需要更深层内核重构（访存与解量化融合策略）。
+- 仍是端到端主耗时大头；虽然 `M1+gpc8` 专核新增 `~2-3%` 收益，但距离“架构级跃迁”仍远，需继续向更强特化（更高向量化/更少访存）推进。
 
 2. `fast::RMSNorm / fast::ScaledDotProductAttention`
 - 在 RoPE 回退清理后，二者成为次级原生耗时来源，需继续做 kernel 级效率优化。
@@ -403,6 +451,8 @@
 1. QMM decode 主核架构升级（对标 Metal/Ollama）  
 - 目标：从“微调归约”升级到“访存/解量化/归约一体化”内核，优先作用于 `rows=1` 主桶。
 - 方向：`uvec4`/向量化加载、scale/bias 访问复用、减少重复解包与无效算术、压缩指令路径。
+- 子目标：在 `gpc==8` 主桶之外，继续吃掉 `rows=1` 的次桶（当前约 `2296` 次）并维持统一降级护栏。
+- 已验证：`gpc==16` 当前实现收益不足（D-9.17）；下一步优先转向 `gpc==17-32`（当前 `~1148` 次）或更深层向量化，而不是继续复制同型专核。
 
 2. SDPA decode 次热点并行推进  
 - 对照 Metal/Ollama 的 decode attention 内核拆分策略，继续优化 `k=33~128` 区间的 stage1/reduce 配置与核形态。
