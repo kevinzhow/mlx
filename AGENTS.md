@@ -131,6 +131,9 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - `MLX_VK_SDPA_SPLITK_TARGET_CHUNK_DECODE=32`
   - `MLX_VK_SDPA_SPLITK_MAX_PARTS_DECODE=16`
   - `MLX_VK_SDPA_SPLITK_TARGET_WG_DECODE=128`
+- Command-buffer defaults (without env override):
+  - `MLX_VK_MAX_OPS_PER_BUFFER=100`
+  - `MLX_VK_MAX_MB_PER_BUFFER=50`
 
 ### Standard Qwen3 correctness checks
 
@@ -182,6 +185,9 @@ Build and harden the Vulkan backend with Kompute, aligned to Metal backend mecha
   - Global (backward-compatible): `MLX_VK_SDPA_MAX_K_LEN`
   - Decode override (`q_len==1`): `MLX_VK_SDPA_MAX_K_LEN_DECODE`
   - Prefill override (`q_len>1`): `MLX_VK_SDPA_MAX_K_LEN_PREFILL`
+- Command-buffer tuning knobs:
+  - `MLX_VK_MAX_OPS_PER_BUFFER`
+  - `MLX_VK_MAX_MB_PER_BUFFER`
 
 ### Benchmarking Notes
 

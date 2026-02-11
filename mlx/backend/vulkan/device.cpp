@@ -5,6 +5,7 @@
 #include "mlx/backend/vulkan/kernel_registry.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vulkan/vulkan.h>
@@ -80,6 +81,29 @@ inline kp::Tensor::TensorDataTypes to_kompute_dtype(Dtype dtype) {
 
 inline size_t tensor_element_count(const array& arr) {
   return arr.data_size() > 0 ? arr.data_size() : arr.size();
+}
+
+inline int parse_env_int_clamped(
+    const char* name,
+    int default_value,
+    int min_value,
+    int max_value) {
+  const char* value = std::getenv(name);
+  if (!value || value[0] == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  long parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0') {
+    return default_value;
+  }
+  if (parsed < static_cast<long>(min_value)) {
+    return min_value;
+  }
+  if (parsed > static_cast<long>(max_value)) {
+    return max_value;
+  }
+  return static_cast<int>(parsed);
 }
 
 } // namespace
@@ -289,6 +313,11 @@ void DeviceStream::reset_sequence() {
 // ============================================================================
 
 Device::Device() {
+  max_ops_per_buffer_ = parse_env_int_clamped(
+      "MLX_VK_MAX_OPS_PER_BUFFER", max_ops_per_buffer_, 1, 100000);
+  max_mb_per_buffer_ = parse_env_int_clamped(
+      "MLX_VK_MAX_MB_PER_BUFFER", max_mb_per_buffer_, 1, 4096);
+
   // Create Kompute manager with default GPU
   manager_ = std::make_shared<kp::Manager>();
 
