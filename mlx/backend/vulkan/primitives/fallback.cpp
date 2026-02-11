@@ -1180,6 +1180,8 @@ struct QmmStatsState {
   uint64_t native_dispatch_fail{0};
   uint64_t final_fallbacks{0};
   std::unordered_map<std::string, uint64_t> native_kernel_counts;
+  std::unordered_map<std::string, uint64_t> native_gpc_counts;
+  std::unordered_map<std::string, uint64_t> fallback_gpc_counts;
   std::unordered_map<std::string, uint64_t> native_rows_bucket_counts;
   std::unordered_map<std::string, uint64_t> fallback_rows_bucket_counts;
   std::unordered_map<std::string, uint64_t> native_shape_bucket_counts;
@@ -1209,11 +1211,14 @@ inline void qmm_stats_record_native_dispatch_success(
       (kernel && kernel[0] != '\0') ? kernel : "unknown";
   const std::string rows_key =
       std::string("rows=") + qmm_rows_bucket(rows);
+  const std::string gpc_key =
+      std::string("gpc=") + std::to_string(groups_per_col);
   const std::string shape_key =
       qmm_shape_bucket_key(rows, k, n, groups_per_col);
   std::lock_guard<std::mutex> lock(state.mtx);
   state.native_dispatch_success++;
   state.native_kernel_counts[kernel_name]++;
+  state.native_gpc_counts[gpc_key]++;
   state.native_rows_bucket_counts[rows_key]++;
   state.native_shape_bucket_counts[shape_key]++;
 }
@@ -1233,11 +1238,14 @@ inline void qmm_stats_record_native_dispatch_fail(
       (kernel && kernel[0] != '\0') ? kernel : "unknown";
   const std::string rows_key =
       std::string("rows=") + qmm_rows_bucket(rows);
+  const std::string gpc_key =
+      std::string("gpc=") + std::to_string(groups_per_col);
   const std::string shape_key =
       qmm_shape_bucket_key(rows, k, n, groups_per_col);
   std::lock_guard<std::mutex> lock(state.mtx);
   state.native_dispatch_fail++;
   state.native_kernel_counts[std::string("fail:") + kernel_name]++;
+  state.fallback_gpc_counts[gpc_key]++;
   state.fallback_rows_bucket_counts[rows_key]++;
   state.fallback_shape_bucket_counts[shape_key]++;
 }
@@ -1254,10 +1262,13 @@ inline void qmm_stats_record_final_fallback(
   (void)qmm_stats_reporter();
   const std::string rows_key =
       std::string("rows=") + qmm_rows_bucket(rows);
+  const std::string gpc_key =
+      std::string("gpc=") + std::to_string(groups_per_col);
   const std::string shape_key =
       qmm_shape_bucket_key(rows, k, n, groups_per_col);
   std::lock_guard<std::mutex> lock(state.mtx);
   state.final_fallbacks++;
+  state.fallback_gpc_counts[gpc_key]++;
   state.fallback_rows_bucket_counts[rows_key]++;
   state.fallback_shape_bucket_counts[shape_key]++;
 }
@@ -1278,6 +1289,8 @@ inline void qmm_stats_dump() {
             << " native_dispatch_fail=" << state.native_dispatch_fail
             << " final_fallbacks=" << state.final_fallbacks
             << " native_kernel_keys=" << state.native_kernel_counts.size()
+            << " native_gpc_keys=" << state.native_gpc_counts.size()
+            << " fallback_gpc_keys=" << state.fallback_gpc_counts.size()
             << " native_rows_bucket_keys="
             << state.native_rows_bucket_counts.size()
             << " fallback_rows_bucket_keys="
@@ -1299,8 +1312,18 @@ inline void qmm_stats_dump() {
               << " count=" << count << "\n";
   }
   for (const auto& [key, count] :
+       sort_stats_counts(state.native_gpc_counts)) {
+    std::cerr << "[VulkanQMMStats][NativeGPC] " << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
        sort_stats_counts(state.fallback_rows_bucket_counts)) {
     std::cerr << "[VulkanQMMStats][FallbackRowsBucket] " << key
+              << " count=" << count << "\n";
+  }
+  for (const auto& [key, count] :
+       sort_stats_counts(state.fallback_gpc_counts)) {
+    std::cerr << "[VulkanQMMStats][FallbackGPC] " << key
               << " count=" << count << "\n";
   }
   for (const auto& [key, count] :
@@ -1363,6 +1386,16 @@ inline std::atomic<bool>& native_qmm_m1_reduce_subgroup_g16_runtime_disabled() {
   return disabled;
 }
 
+inline std::atomic<bool>& native_qmm_m1_reduce_subgroup_g24_runtime_disabled() {
+  static std::atomic<bool> disabled{false};
+  return disabled;
+}
+
+inline std::atomic<bool>& native_qmm_m1_reduce_subgroup_g32_runtime_disabled() {
+  static std::atomic<bool> disabled{false};
+  return disabled;
+}
+
 inline bool native_qmm_m1_reduce_subgroup_enabled() {
   static const bool enabled = env_flag_default_true(
       "MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP");
@@ -1392,6 +1425,22 @@ inline bool native_qmm_m1_reduce_subgroup_g16_enabled() {
       "MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G16");
   return enabled &&
       !native_qmm_m1_reduce_subgroup_g16_runtime_disabled().load(
+          std::memory_order_relaxed);
+}
+
+inline bool native_qmm_m1_reduce_subgroup_g24_enabled() {
+  static const bool enabled = env_flag_default_false(
+      "MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G24");
+  return enabled &&
+      !native_qmm_m1_reduce_subgroup_g24_runtime_disabled().load(
+          std::memory_order_relaxed);
+}
+
+inline bool native_qmm_m1_reduce_subgroup_g32_enabled() {
+  static const bool enabled = env_flag_default_false(
+      "MLX_VK_ENABLE_QMM_NATIVE_M1_REDUCE_SUBGROUP_G32");
+  return enabled &&
+      !native_qmm_m1_reduce_subgroup_g32_runtime_disabled().load(
           std::memory_order_relaxed);
 }
 
@@ -1432,6 +1481,26 @@ inline void disable_native_qmm_m1_reduce_subgroup_g16_runtime() {
           expected, true, std::memory_order_relaxed)) {
     std::cerr
         << "[VulkanQMM] disable m1_reduce_subgroup_g16 after dispatch failure\n";
+  }
+}
+
+inline void disable_native_qmm_m1_reduce_subgroup_g24_runtime() {
+  auto& disabled = native_qmm_m1_reduce_subgroup_g24_runtime_disabled();
+  bool expected = false;
+  if (disabled.compare_exchange_strong(
+          expected, true, std::memory_order_relaxed)) {
+    std::cerr
+        << "[VulkanQMM] disable m1_reduce_subgroup_g24 after dispatch failure\n";
+  }
+}
+
+inline void disable_native_qmm_m1_reduce_subgroup_g32_runtime() {
+  auto& disabled = native_qmm_m1_reduce_subgroup_g32_runtime_disabled();
+  bool expected = false;
+  if (disabled.compare_exchange_strong(
+          expected, true, std::memory_order_relaxed)) {
+    std::cerr
+        << "[VulkanQMM] disable m1_reduce_subgroup_g32 after dispatch failure\n";
   }
 }
 
@@ -2870,9 +2939,17 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       const bool use_m1_reduce_subgroup_g16_kernel =
           use_m1_reduce_subgroup_kernel &&
           native_qmm_m1_reduce_subgroup_g16_enabled() && (groups_per_col == 16u);
+      const bool use_m1_reduce_subgroup_g24_kernel =
+          use_m1_reduce_subgroup_kernel &&
+          native_qmm_m1_reduce_subgroup_g24_enabled() && (groups_per_col == 24u);
+      const bool use_m1_reduce_subgroup_g32_kernel =
+          use_m1_reduce_subgroup_kernel &&
+          native_qmm_m1_reduce_subgroup_g32_enabled() && (groups_per_col == 32u);
       const bool use_m1_reduce_subgroup_x2_kernel =
           use_m1_reduce_subgroup_kernel && !use_m1_reduce_subgroup_g8_kernel &&
           !use_m1_reduce_subgroup_g16_kernel &&
+          !use_m1_reduce_subgroup_g24_kernel &&
+          !use_m1_reduce_subgroup_g32_kernel &&
           native_qmm_m1_reduce_subgroup_x2_enabled() && (out_words >= 2u);
       const bool use_m16_kernel =
           native_qmm_m16_enabled() && (rows > 8u) && (rows <= 16u);
@@ -2914,6 +2991,14 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       if (use_m1_reduce_subgroup_g16_kernel) {
         qmm_kernel =
             vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G16;
+      }
+      if (use_m1_reduce_subgroup_g24_kernel) {
+        qmm_kernel =
+            vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G24;
+      }
+      if (use_m1_reduce_subgroup_g32_kernel) {
+        qmm_kernel =
+            vulkan::KernelRegistry::QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G32;
       }
       if (use_m1_reduce_subgroup_x2_kernel) {
         qmm_kernel =
@@ -2994,6 +3079,22 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         }
         if (use_m1_reduce_subgroup_g16_kernel) {
           disable_native_qmm_m1_reduce_subgroup_g16_runtime();
+          qmm_kernel_for_stats = qmm_kernel_subgroup;
+          dispatch_qmm(qmm_kernel_subgroup, groups_x_default);
+          qmm_stats_record_native_dispatch_success(
+              rows, k, n, groups_per_col, qmm_kernel_subgroup);
+          return;
+        }
+        if (use_m1_reduce_subgroup_g24_kernel) {
+          disable_native_qmm_m1_reduce_subgroup_g24_runtime();
+          qmm_kernel_for_stats = qmm_kernel_subgroup;
+          dispatch_qmm(qmm_kernel_subgroup, groups_x_default);
+          qmm_stats_record_native_dispatch_success(
+              rows, k, n, groups_per_col, qmm_kernel_subgroup);
+          return;
+        }
+        if (use_m1_reduce_subgroup_g32_kernel) {
+          disable_native_qmm_m1_reduce_subgroup_g32_runtime();
           qmm_kernel_for_stats = qmm_kernel_subgroup;
           dispatch_qmm(qmm_kernel_subgroup, groups_x_default);
           qmm_stats_record_native_dispatch_success(

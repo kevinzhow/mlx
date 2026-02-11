@@ -206,6 +206,25 @@ void main() {
   const float subgroup_sum01 = subgroupAdd(partial01);
   const float subgroup_sum10 = subgroupAdd(partial10);
   const float subgroup_sum11 = subgroupAdd(partial11);
+  if (gl_NumSubgroups == 1u) {
+    if (gl_SubgroupInvocationID == 0u) {
+      uint packed0 = f32_to_bf16(subgroup_sum00) & 0xFFFFu;
+      if (has_out_01) {
+        packed0 |= (f32_to_bf16(subgroup_sum01) & 0xFFFFu) << 16u;
+      }
+      out_buffer.words[out_word_0] = packed0;
+
+      if (has_out_word_1) {
+        uint packed1 = f32_to_bf16(subgroup_sum10) & 0xFFFFu;
+        if (has_out_11) {
+          packed1 |= (f32_to_bf16(subgroup_sum11) & 0xFFFFu) << 16u;
+        }
+        out_buffer.words[out_word_1] = packed1;
+      }
+    }
+    return;
+  }
+
   if (gl_SubgroupInvocationID == 0u) {
     subgroup_reduce00[gl_SubgroupID] = subgroup_sum00;
     subgroup_reduce01[gl_SubgroupID] = subgroup_sum01;

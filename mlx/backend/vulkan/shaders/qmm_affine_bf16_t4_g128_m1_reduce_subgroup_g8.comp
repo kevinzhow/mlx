@@ -37,10 +37,8 @@ layout(push_constant) uniform PushConstants {
 
 shared float subgroup_reduce0[64];
 shared float subgroup_reduce1[64];
-shared float scale0_cache[8];
-shared float bias0_cache[8];
-shared float scale1_cache[8];
-shared float bias1_cache[8];
+shared float deq0_cache[8u * 16u];
+shared float deq1_cache[8u * 16u];
 
 float bf16_to_f32(uint bf16_bits) {
   return uintBitsToFloat((bf16_bits & 0xFFFFu) << 16u);
@@ -68,11 +66,7 @@ void accumulate_unit(
     inout float partial1) {
   const uint g = unit >> 4u;
   const uint ww = unit & 0xFu;
-
-  const float scale0 = scale0_cache[g];
-  const float bias0 = bias0_cache[g];
-  const float scale1 = has_out_1 ? scale1_cache[g] : 0.0;
-  const float bias1 = has_out_1 ? bias1_cache[g] : 0.0;
+  const uint deq_base = g * 16u;
 
   const uint w_word_idx0 = out_elem_0 * params.w_words_per_col + g * 16u + ww;
   const uint wi0 = w_buffer.words[w_word_idx0];
@@ -84,23 +78,57 @@ void accumulate_unit(
   }
 
   const uint x_word_base = g * 64u + ww * 4u;
-  for (uint t = 0u; t < 4u; ++t) {
-    const uint x_packed = x_buffer.words[x_word_base + t];
-    const uint q_idx = t * 2u;
-    const float x0 = load_bf16_from_packed(x_packed, 0u);
-    const float x1 = load_bf16_from_packed(x_packed, 1u);
+  const uvec4 x_words = uvec4(
+      x_buffer.words[x_word_base + 0u],
+      x_buffer.words[x_word_base + 1u],
+      x_buffer.words[x_word_base + 2u],
+      x_buffer.words[x_word_base + 3u]);
 
-    const float q00 = float((wi0 >> (q_idx * 4u)) & 0xFu);
-    const float q01 = float((wi0 >> ((q_idx + 1u) * 4u)) & 0xFu);
-    partial0 += x0 * (scale0 * q00 + bias0);
-    partial0 += x1 * (scale0 * q01 + bias0);
+  const uint q00_idx = (wi0 >> 0u) & 0xFu;
+  const uint q01_idx = (wi0 >> 4u) & 0xFu;
+  const uint q02_idx = (wi0 >> 8u) & 0xFu;
+  const uint q03_idx = (wi0 >> 12u) & 0xFu;
+  const uint q04_idx = (wi0 >> 16u) & 0xFu;
+  const uint q05_idx = (wi0 >> 20u) & 0xFu;
+  const uint q06_idx = (wi0 >> 24u) & 0xFu;
+  const uint q07_idx = (wi0 >> 28u) & 0xFu;
 
-    if (has_out_1) {
-      const float q10 = float((wi1 >> (q_idx * 4u)) & 0xFu);
-      const float q11 = float((wi1 >> ((q_idx + 1u) * 4u)) & 0xFu);
-      partial1 += x0 * (scale1 * q10 + bias1);
-      partial1 += x1 * (scale1 * q11 + bias1);
-    }
+  const float x00 = load_bf16_from_packed(x_words.x, 0u);
+  const float x01 = load_bf16_from_packed(x_words.x, 1u);
+  const float x02 = load_bf16_from_packed(x_words.y, 0u);
+  const float x03 = load_bf16_from_packed(x_words.y, 1u);
+  const float x04 = load_bf16_from_packed(x_words.z, 0u);
+  const float x05 = load_bf16_from_packed(x_words.z, 1u);
+  const float x06 = load_bf16_from_packed(x_words.w, 0u);
+  const float x07 = load_bf16_from_packed(x_words.w, 1u);
+
+  partial0 += x00 * deq0_cache[deq_base + q00_idx];
+  partial0 += x01 * deq0_cache[deq_base + q01_idx];
+  partial0 += x02 * deq0_cache[deq_base + q02_idx];
+  partial0 += x03 * deq0_cache[deq_base + q03_idx];
+  partial0 += x04 * deq0_cache[deq_base + q04_idx];
+  partial0 += x05 * deq0_cache[deq_base + q05_idx];
+  partial0 += x06 * deq0_cache[deq_base + q06_idx];
+  partial0 += x07 * deq0_cache[deq_base + q07_idx];
+
+  if (has_out_1) {
+    const uint q10_idx = (wi1 >> 0u) & 0xFu;
+    const uint q11_idx = (wi1 >> 4u) & 0xFu;
+    const uint q12_idx = (wi1 >> 8u) & 0xFu;
+    const uint q13_idx = (wi1 >> 12u) & 0xFu;
+    const uint q14_idx = (wi1 >> 16u) & 0xFu;
+    const uint q15_idx = (wi1 >> 20u) & 0xFu;
+    const uint q16_idx = (wi1 >> 24u) & 0xFu;
+    const uint q17_idx = (wi1 >> 28u) & 0xFu;
+
+    partial1 += x00 * deq1_cache[deq_base + q10_idx];
+    partial1 += x01 * deq1_cache[deq_base + q11_idx];
+    partial1 += x02 * deq1_cache[deq_base + q12_idx];
+    partial1 += x03 * deq1_cache[deq_base + q13_idx];
+    partial1 += x04 * deq1_cache[deq_base + q14_idx];
+    partial1 += x05 * deq1_cache[deq_base + q15_idx];
+    partial1 += x06 * deq1_cache[deq_base + q16_idx];
+    partial1 += x07 * deq1_cache[deq_base + q17_idx];
   }
 }
 
@@ -119,16 +147,23 @@ void main() {
   if (lane < 8u) {
     const uint g = lane;
     const uint scale_bias_idx0 = out_elem_0 * 8u + g;
-    scale0_cache[g] = load_bf16_from_packed(
+    const float scale0 = load_bf16_from_packed(
         scale_buffer.words[scale_bias_idx0 >> 1u], scale_bias_idx0);
-    bias0_cache[g] = load_bf16_from_packed(
+    const float bias0 = load_bf16_from_packed(
         bias_buffer.words[scale_bias_idx0 >> 1u], scale_bias_idx0);
+    const uint base = g * 16u;
+    for (uint q = 0u; q < 16u; ++q) {
+      deq0_cache[base + q] = scale0 * float(q) + bias0;
+    }
     if (has_out_1) {
       const uint scale_bias_idx1 = out_elem_1 * 8u + g;
-      scale1_cache[g] = load_bf16_from_packed(
+      const float scale1 = load_bf16_from_packed(
           scale_buffer.words[scale_bias_idx1 >> 1u], scale_bias_idx1);
-      bias1_cache[g] = load_bf16_from_packed(
+      const float bias1 = load_bf16_from_packed(
           bias_buffer.words[scale_bias_idx1 >> 1u], scale_bias_idx1);
+      for (uint q = 0u; q < 16u; ++q) {
+        deq1_cache[base + q] = scale1 * float(q) + bias1;
+      }
     }
   }
   barrier();
@@ -141,6 +176,17 @@ void main() {
 
   const float subgroup_sum0 = subgroupAdd(partial0);
   const float subgroup_sum1 = subgroupAdd(partial1);
+  if (gl_NumSubgroups == 1u) {
+    if (gl_SubgroupInvocationID == 0u) {
+      uint packed = f32_to_bf16(subgroup_sum0) & 0xFFFFu;
+      if (has_out_1) {
+        packed |= (f32_to_bf16(subgroup_sum1) & 0xFFFFu) << 16u;
+      }
+      out_buffer.words[out_word_idx] = packed;
+    }
+    return;
+  }
+
   if (gl_SubgroupInvocationID == 0u) {
     subgroup_reduce0[gl_SubgroupID] = subgroup_sum0;
     subgroup_reduce1[gl_SubgroupID] = subgroup_sum1;

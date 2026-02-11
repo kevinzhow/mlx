@@ -80,6 +80,8 @@ class KernelRegistry {
   static const char* QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_X2;
   static const char* QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G8;
   static const char* QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G16;
+  static const char* QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G24;
+  static const char* QMM_AFFINE_BF16_T4_G128_M1_REDUCE_SUBGROUP_G32;
   static const char* QMM_AFFINE_BF16_T4_G128_M16;
   static const char* QMM_AFFINE_BF16_T4_G128_M2;
   static const char* QMM_AFFINE_BF16_T4_G128_M4;

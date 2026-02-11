@@ -131,6 +131,17 @@ void main() {
 
   const float subgroup_sum0 = subgroupAdd(partial0);
   const float subgroup_sum1 = subgroupAdd(partial1);
+  if (gl_NumSubgroups == 1u) {
+    if (gl_SubgroupInvocationID == 0u) {
+      uint packed = f32_to_bf16(subgroup_sum0) & 0xFFFFu;
+      if (has_out_1) {
+        packed |= (f32_to_bf16(subgroup_sum1) & 0xFFFFu) << 16u;
+      }
+      out_buffer.words[out_word_idx] = packed;
+    }
+    return;
+  }
+
   if (gl_SubgroupInvocationID == 0u) {
     subgroup_reduce0[gl_SubgroupID] = subgroup_sum0;
     subgroup_reduce1[gl_SubgroupID] = subgroup_sum1;
